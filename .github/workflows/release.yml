@@ -67,7 +67,7 @@ jobs:
       # No `version:` here on purpose — `package.json`'s
       # `packageManager: "pnpm@9.12.0"` field is the source of truth.
       - name: Set up pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
 
       - name: Set up Node
         uses: actions/setup-node@v5

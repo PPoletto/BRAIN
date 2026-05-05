@@ -31,7 +31,7 @@ jobs:
       # exists at compile time. The Rust job therefore needs the frontend
       # built before `cargo clippy`/`cargo test` — without it the proc
       # macro panics with "path doesn't exist".
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v5
         with:
           node-version: 22
@@ -61,7 +61,7 @@ jobs:
       # `packageManager: "pnpm@9.12.0"` field is the source of truth and
       # the action picks it up via Corepack. Specifying both produced
       # `ERR_PNPM_BAD_PM_VERSION`.
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v5
         with:
           node-version: 22
