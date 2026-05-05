@@ -102,4 +102,8 @@ jobs:
             status bar.
           releaseDraft: true
           prerelease: false
+          # Belt-and-suspenders: even if a future tauri.conf.json regression
+          # re-enables MSI on Windows, latest.json should reference the NSIS
+          # bundle (the one we actually ship and sign for auto-update).
+          updaterJsonPreferNsis: true
           args: ${{ matrix.args }}
