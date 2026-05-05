@@ -383,9 +383,9 @@ BRAIN's `brain_write_page` and `brain_search` tools.
 
 ### File locations
 
-- **OS config dir** (`~/.config/com.ppoletto.brain/` on Linux,
-  `~/Library/Application Support/com.ppoletto.brain/` on macOS,
-  `%APPDATA%\com.ppoletto.brain\` on Windows): persistent settings,
+- **OS config dir** (`~/.config/eu.poletto.brain/` on Linux,
+  `~/Library/Application Support/eu.poletto.brain/` on macOS,
+  `%APPDATA%\eu.poletto.brain\` on Windows): persistent settings,
   pre-mount logs
 - **Vault root** (your SSD or chosen folder): everything else (pages, db,
   models, cache, logs)

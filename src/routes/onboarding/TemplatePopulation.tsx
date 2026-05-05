@@ -67,7 +67,7 @@ export function TemplatePopulation() {
           updateStep(name, "done");
         }
         navigate(
-          `/onboarding/connectors?path=${encodeURIComponent(path)}&action=${action}`,
+          `/onboarding/completion?path=${encodeURIComponent(path)}&action=${action}`,
         );
       } catch (e: unknown) {
         const message = String(e);
