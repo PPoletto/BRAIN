@@ -6,6 +6,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-05-05
+
+### Fixed
+
+- Status-bar version label is no longer the hardcoded literal `BRAIN
+  v0.1.0`. It now reads the running binary's version via Tauri's
+  `getVersion()` API, so a successful auto-update reflects in the UI
+  immediately instead of pretending nothing happened.
+
 ## [0.2.0] — 2026-05-05
 
 ### Fixed

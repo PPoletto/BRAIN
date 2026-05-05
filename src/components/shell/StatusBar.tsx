@@ -1,3 +1,5 @@
+import { useEffect, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { useAppState } from "../../lib/state";
 import { useUpdateStore } from "../../lib/updateStore";
 import { useToast } from "../ui/toast-context";
@@ -8,6 +10,17 @@ export function StatusBar() {
   const check = useUpdateStore((s) => s.check);
   const setDismissed = useUpdateStore((s) => s.setDismissed);
   const { push } = useToast();
+
+  // Pull the running binary's version from Tauri at mount instead of
+  // baking it into the JSX. The version comes from `tauri.conf.json` and
+  // is what the updater compares against — keeping the label in sync
+  // with the actual binary means a successful auto-update reflects
+  // immediately in the UI without a hardcoded string drifting out of
+  // date. Empty string while loading so we don't flash a stale value.
+  const [version, setVersion] = useState<string>("");
+  useEffect(() => {
+    void getVersion().then(setVersion);
+  }, []);
 
   async function handleCheckUpdate() {
     if (checking) return;
@@ -71,7 +84,7 @@ export function StatusBar() {
           title="Click to check for a newer BRAIN release"
           className="cursor-pointer rounded px-1 py-0.5 hover:bg-neutral-800 hover:text-neutral-300 disabled:cursor-default"
         >
-          {checking ? "Checking…" : "BRAIN v0.1.0"}
+          {checking ? "Checking…" : version ? `BRAIN v${version}` : "BRAIN"}
         </button>
       </span>
     </footer>
