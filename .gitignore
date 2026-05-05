@@ -17,9 +17,8 @@ src-tauri/WixTools/
 .vscode/
 *.iml
 
-# Claude Code per-machine settings (settings.json is committed, .local is not)
-.claude/settings.local.json
-.claude/.credentials.json
+# Claude Code project config — dev-time tooling, not for the public repo.
+.claude/
 
 # Signing keys — must NEVER be in the repo.
 *.key

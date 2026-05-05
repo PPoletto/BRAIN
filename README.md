@@ -229,7 +229,7 @@ Specs (NLSpec methodology) live at [`requirements/spec/`](requirements/spec).
 > workflow is documented in [`docs/RELEASE.md`](docs/RELEASE.md).
 
 Download the bundle for your platform from
-[Releases](https://github.com/dextradata/brain/releases) and run the
+[Releases](https://github.com/PPoletto/BRAIN/releases) and run the
 installer:
 
 - **Windows:** `BRAIN_<version>_x64-setup.exe`
@@ -423,7 +423,7 @@ No telemetry, no analytics, no error reporting beacon.
 ### Commands
 
 ```bash
-git clone https://github.com/dextradata/brain
+git clone https://github.com/PPoletto/BRAIN
 cd brain
 pnpm install
 
@@ -611,15 +611,19 @@ reasonable interim.
 
 ### Where do I get help?
 
-[Open an issue](https://github.com/dextradata/brain/issues) on GitHub.
+[Open an issue](https://github.com/PPoletto/BRAIN/issues) on GitHub.
 This is a one-person project; expect best-effort, not 24/7 support.
 
 ---
 
 ## License
 
-[License pending — add a `LICENSE` file before public release. Apache-2.0
-or MIT are reasonable defaults given the dependency tree.]
+[MIT](LICENSE) © 2026 Pascal Poletto / DextraData GRC Technologies GmbH.
+
+The bundled bge-m3 model weights are released by BAAI under the MIT
+License (separate copyright). Tauri, Rust, React, and the rest of the
+dependency tree are MIT or Apache-2.0 — both compatible with this
+project's MIT.
 
 ---
 

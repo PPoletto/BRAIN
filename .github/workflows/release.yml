@@ -95,7 +95,7 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "BRAIN ${{ github.ref_name }}"
           releaseBody: |
-            Release notes are in [`CHANGELOG.md`](https://github.com/dextradata/brain/blob/main/CHANGELOG.md).
+            Release notes are in [`CHANGELOG.md`](https://github.com/PPoletto/BRAIN/blob/main/CHANGELOG.md).
 
             Existing BRAIN installs will see this as an available update on
             the next 6-hour check, or when you click the version in the
