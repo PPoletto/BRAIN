@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" fill="none">
+  <!--
+    BRAIN tray + app icon. Hand-built simplified brain silhouette inspired
+    by the Font Awesome `brain` glyph, recoloured to BRAIN's emerald accent
+    so it reads at 16×16 in the system tray and at 1024×1024 in the
+    installer / Dock.
+
+    Two-tone outer hemisphere + inner sulci/gyri lines. Pure SVG so no
+    licensing weight from the FA family — and we can re-render PNGs at any
+    size from this single source via `node scripts/build-icons.mjs`.
+  -->
+  <defs>
+    <linearGradient id="brainGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#0d9488"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background tile so dark-on-dark trays still show the icon. The
+       app icon clips this to a rounded square via the bundler; for the
+       tray-icon variants we redraw with a transparent background. -->
+  <rect x="64" y="64" width="896" height="896" rx="160" ry="160" fill="#0a0a0a"/>
+
+  <!-- Outer brain silhouette: two hemispheres joined by a stem at the
+       bottom, with a soft groove down the centre. -->
+  <path
+    d="
+      M 512 192
+      C 380 192, 280 264, 256 364
+      C 200 372, 160 416, 160 480
+      C 160 528, 188 568, 232 588
+      C 220 628, 240 672, 280 696
+      C 272 740, 308 776, 352 780
+      C 372 808, 412 824, 460 820
+      C 480 840, 504 848, 512 848
+      L 512 192 Z
+    "
+    fill="url(#brainGradient)"
+    stroke="#0f766e"
+    stroke-width="16"
+    stroke-linejoin="round"/>
+  <path
+    d="
+      M 512 192
+      C 644 192, 744 264, 768 364
+      C 824 372, 864 416, 864 480
+      C 864 528, 836 568, 792 588
+      C 804 628, 784 672, 744 696
+      C 752 740, 716 776, 672 780
+      C 652 808, 612 824, 564 820
+      C 544 840, 520 848, 512 848
+      L 512 192 Z
+    "
+    fill="url(#brainGradient)"
+    stroke="#0f766e"
+    stroke-width="16"
+    stroke-linejoin="round"/>
+
+  <!-- Sulci (the brain's signature folds). Dark teal lines on top of the
+       gradient. Tuned to read even when the icon is downscaled. -->
+  <g stroke="#065f46" stroke-width="12" stroke-linecap="round" fill="none" opacity="0.75">
+    <path d="M 320 360 Q 380 380 360 440"/>
+    <path d="M 280 480 Q 360 500 340 560"/>
+    <path d="M 360 600 Q 420 620 400 680"/>
+    <path d="M 704 360 Q 644 380 664 440"/>
+    <path d="M 744 480 Q 664 500 684 560"/>
+    <path d="M 664 600 Q 604 620 624 680"/>
+  </g>
+
+  <!-- Centre groove: visual divider between hemispheres. -->
+  <line x1="512" y1="208" x2="512" y2="836" stroke="#0f766e" stroke-width="14" stroke-linecap="round" opacity="0.85"/>
+</svg>

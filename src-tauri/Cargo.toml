@@ -1,0 +1,107 @@
+[package]
+name = "brain"
+version = "0.1.0"
+description = "BRAIN — personal knowledge system"
+authors = ["Pascal Poletto"]
+edition = "2024"
+rust-version = "1.85"
+
+[lib]
+name = "brain_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+
+[dependencies]
+tauri = { version = "2.1", features = ["tray-icon", "image-png"] }
+tauri-plugin-dialog = "2.0"
+tauri-plugin-notification = "2.0"
+tauri-plugin-shell = "2.0"
+tauri-plugin-store = "2.1"
+tauri-plugin-updater = "2.0"
+# Cross-platform "Launch BRAIN at login" implementation. Uses the
+# Windows registry (Run key), macOS LaunchAgents, and `~/.config/autostart/`
+# on Linux. Wired into the Settings → General toggle.
+tauri-plugin-autostart = "2.0"
+
+# Async + concurrency
+tokio = { version = "1.40", features = ["full"] }
+
+# Serde
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# Errors
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# Storage
+rusqlite = { version = "0.32", features = ["bundled", "trace", "load_extension"] }
+sqlite-vec = "0.1"
+zerocopy = "0.8"
+
+# ML (bge-m3 embeddings via candle, XLM-RoBERTa architecture).
+# CPU-only — no CUDA/MKL/Accelerate dependency to keep portable. Loading the
+# 1024-d model adds ~2.3 GB on disk and ~1 GB RAM; the embedder gracefully
+# falls back to the deterministic HashedEmbedder when model files are absent
+# (see src/embedding/mod.rs::for_vault).
+candle-core = { version = "0.10", default-features = false }
+candle-nn = { version = "0.10", default-features = false }
+candle-transformers = { version = "0.10", default-features = false }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+# 0.4+ fixes a redirect-handling bug that broke
+# `RelativeUrlWithoutBase` when HuggingFace's CDN returns a relative
+# `Location` header. Sync flavour only — we don't want a second tokio.
+hf-hub = { version = "0.4", default-features = false, features = ["ureq", "native-tls"] }
+
+# Wiki / Git
+git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
+notify = "6.1"
+notify-debouncer-full = "0.3"
+
+# Update verification
+minisign-verify = "0.2"
+
+# Platform paths and disk-info
+directories = "5.0"
+sysinfo = "0.32"
+
+# Markdown / parsing
+pulldown-cmark = { version = "0.12", default-features = false }
+
+# IDs
+uuid = { version = "1.10", features = ["v4", "serde"] }
+ulid = { version = "1.1", features = ["serde"] }
+
+# Misc
+regex = "1.11"
+unicode-segmentation = "1.12"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+hex = "0.4"
+sha2 = "0.10"
+
+# HTTP server for MCP
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }
+tower = "0.5"
+
+# Random (bearer token)
+rand = "0.8"
+
+# External editor
+open = "5.3"
+
+[dev-dependencies]
+tempfile = "3.13"
+mockall = "0.13"
+serial_test = "3.1"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

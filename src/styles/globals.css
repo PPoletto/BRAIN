@@ -1,0 +1,123 @@
+@import "tailwindcss";
+
+@theme {
+  --color-tray-disconnected: #6b7280;
+  --color-tray-idle: #22c55e;
+  --color-tray-busy: #eab308;
+  --color-tray-error: #ef4444;
+
+  --color-brain-bg: #0a0a0a;
+  --color-brain-panel: #171717;
+  --color-brain-elevated: #1f1f1f;
+  --color-brain-border: #262626;
+  --color-brain-border-strong: #404040;
+
+  --color-brain-text: #e5e5e5;
+  --color-brain-text-muted: #a3a3a3;
+  --color-brain-text-dim: #737373;
+
+  --color-brain-accent: #10b981;
+  --color-brain-accent-hover: #059669;
+  --color-brain-danger: #dc2626;
+  --color-brain-warning: #d97706;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  background-color: var(--color-brain-bg);
+  color: var(--color-brain-text);
+}
+
+body {
+  font-family:
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    Roboto,
+    sans-serif;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  overflow: hidden;
+}
+
+/* Scrollbar styling consistent across panels */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-brain-border-strong);
+  border-radius: 5px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-brain-text-dim);
+}
+
+/* Prose tweaks for the markdown reader */
+.prose-brain {
+  color: var(--color-brain-text);
+  max-width: none;
+}
+.prose-brain h1,
+.prose-brain h2,
+.prose-brain h3 {
+  color: var(--color-brain-text);
+  font-weight: 600;
+}
+.prose-brain h1 { font-size: 1.875rem; margin-top: 0; margin-bottom: 1rem; }
+.prose-brain h2 { font-size: 1.5rem; margin-top: 2rem; margin-bottom: 0.75rem; }
+.prose-brain h3 { font-size: 1.25rem; margin-top: 1.5rem; margin-bottom: 0.5rem; }
+.prose-brain p { margin: 0.75rem 0; line-height: 1.65; }
+.prose-brain code { background: var(--color-brain-elevated); padding: 0.125rem 0.375rem; border-radius: 0.25rem; font-size: 0.875em; }
+.prose-brain pre { background: var(--color-brain-elevated); padding: 1rem; border-radius: 0.5rem; overflow-x: auto; }
+.prose-brain pre code { background: none; padding: 0; }
+.prose-brain a { color: var(--color-brain-accent); text-decoration: underline; }
+.prose-brain a:hover { color: var(--color-brain-accent-hover); }
+
+/* Wiki-links (internal page references) read in BRAIN's accent green;
+ * external links get a subtle "↗" trailing glyph and a slightly cooler
+ * blue tint so the user can tell at a glance which links stay in-app
+ * and which open the browser. */
+.prose-brain a[href^="wikilink://"] {
+  color: var(--color-brain-accent);
+  text-decoration-style: solid;
+}
+.prose-brain a[href^="http://"],
+.prose-brain a[href^="https://"],
+.prose-brain a[href^="mailto:"] {
+  color: #93c5fd;
+  text-decoration-style: dotted;
+  text-underline-offset: 2px;
+}
+.prose-brain a[href^="http://"]::after,
+.prose-brain a[href^="https://"]::after,
+.prose-brain a[href^="mailto:"]::after {
+  content: "↗";
+  display: inline-block;
+  margin-left: 0.15em;
+  font-size: 0.85em;
+  opacity: 0.7;
+}
+.prose-brain ul, .prose-brain ol { margin: 0.75rem 0; padding-left: 1.5rem; }
+.prose-brain li { margin: 0.25rem 0; }
+.prose-brain blockquote { border-left: 3px solid var(--color-brain-border-strong); padding-left: 1rem; color: var(--color-brain-text-muted); margin: 1rem 0; }
+.prose-brain table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+.prose-brain th, .prose-brain td { border: 1px solid var(--color-brain-border); padding: 0.5rem 0.75rem; text-align: left; }
+.prose-brain th { background: var(--color-brain-elevated); font-weight: 600; }
+
+/* BrainIcon heartbeat — slow scale animation used as a loading affordance
+ * on splash screens (Bootstrap, "checking for updates", etc.). 1 cycle/sec
+ * is gentle enough not to feel frantic. */
+@keyframes brain-pulse {
+  0%, 100% { transform: scale(1); filter: drop-shadow(0 0 0 rgba(52, 211, 153, 0)); }
+  50%      { transform: scale(1.06); filter: drop-shadow(0 0 14px rgba(52, 211, 153, 0.45)); }
+}
+.brain-pulse {
+  animation: brain-pulse 1.4s ease-in-out infinite;
+  transform-origin: center;
+}

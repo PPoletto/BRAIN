@@ -5,3 +5,35 @@ dist/
 *.log
 .env
 .env.*
+
+# Tauri / Rust
+src-tauri/target/
+src-tauri/gen/
+src-tauri/WixTools/
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Claude Code per-machine settings (settings.json is committed, .local is not)
+.claude/settings.local.json
+.claude/.credentials.json
+
+# Signing keys — must NEVER be in the repo.
+*.key
+*.pem
+brain.pub
+brain.key
+
+# OS
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Build artefacts
+.parcel-cache/
+.turbo/
+*.tsbuildinfo
+coverage/

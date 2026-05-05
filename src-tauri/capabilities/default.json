@@ -1,0 +1,27 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capabilities for the Brain main window",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:default",
+    "core:event:default",
+    "core:webview:default",
+    "core:app:default",
+    "dialog:default",
+    "notification:default",
+    "shell:default",
+    "store:default",
+    "updater:default",
+    "autostart:default",
+    {
+      "identifier": "shell:allow-open",
+      "comment": "Whitelist external link schemes for the Markdown renderer's external-link handler. Limited to web + email URLs — file://, tel:, javascript: stay blocked.",
+      "allow": [
+        { "url": "^https?://" },
+        { "url": "^mailto:" }
+      ]
+    }
+  ]
+}
