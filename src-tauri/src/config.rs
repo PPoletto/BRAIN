@@ -97,7 +97,7 @@ impl Default for ConfigStore {
 }
 
 fn config_path() -> PathBuf {
-    if let Some(proj) = ProjectDirs::from("dev", "dextradata", "brain") {
+    if let Some(proj) = ProjectDirs::from("com", "ppoletto", "brain") {
         return proj.config_dir().join(CONFIG_FILENAME);
     }
     PathBuf::from(CONFIG_FILENAME)

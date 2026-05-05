@@ -383,9 +383,9 @@ BRAIN's `brain_write_page` and `brain_search` tools.
 
 ### File locations
 
-- **OS config dir** (`~/.config/dev.dextradata.brain/` on Linux,
-  `~/Library/Application Support/dev.dextradata.brain/` on macOS,
-  `%APPDATA%\dev.dextradata.brain\` on Windows): persistent settings,
+- **OS config dir** (`~/.config/com.ppoletto.brain/` on Linux,
+  `~/Library/Application Support/com.ppoletto.brain/` on macOS,
+  `%APPDATA%\com.ppoletto.brain\` on Windows): persistent settings,
   pre-mount logs
 - **Vault root** (your SSD or chosen folder): everything else (pages, db,
   models, cache, logs)
@@ -618,7 +618,7 @@ This is a one-person project; expect best-effort, not 24/7 support.
 
 ## License
 
-[MIT](LICENSE) © 2026 Pascal Poletto / DextraData GRC Technologies GmbH.
+[MIT](LICENSE) © 2026 Pascal Poletto.
 
 The bundled bge-m3 model weights are released by BAAI under the MIT
 License (separate copyright). Tauri, Rust, React, and the rest of the
@@ -629,7 +629,7 @@ project's MIT.
 
 <div align="center">
 
-Built by **Pascal Poletto** at **DextraData GRC Technologies GmbH**.
+Built by **Pascal Poletto**.
 A personal tool, released under the principle that the best knowledge
 systems are the ones you fully own.
 

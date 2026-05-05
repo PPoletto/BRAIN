@@ -33,17 +33,17 @@ jobs:
             args: "--target aarch64-apple-darwin"
           - platform: macos-latest
             args: "--target x86_64-apple-darwin"
-          - platform: ubuntu-22.04
+          - platform: ubuntu-24.04
             args: ""
           - platform: windows-latest
             args: ""
     runs-on: ${{ matrix.platform }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Linux build deps
-        if: matrix.platform == 'ubuntu-22.04'
+        if: matrix.platform == 'ubuntu-24.04'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -64,15 +64,15 @@ jobs:
         with:
           workspaces: ./src-tauri -> target
 
+      # No `version:` here on purpose — `package.json`'s
+      # `packageManager: "pnpm@9.12.0"` field is the source of truth.
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
-        with:
-          version: 9
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 22
           cache: pnpm
 
       - name: Install JS dependencies

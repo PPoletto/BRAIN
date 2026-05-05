@@ -6,28 +6,6 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.2.0] — 2026-05-05
-
-First publicly tagged release with auto-update support. Everything in
-the repo at the v0.1.0 cut, plus the items below that landed during
-the polish pass after the first install:
-
-### Added
-
-- Live data refresh across all viewer tabs — new pages, edits, and
-  disk reconnects propagate without tab-switching
-- MIT LICENSE
-- Auto-reconnect when the BRAIN disk is plugged back in after an
-  unclean disconnect
-- `.gitignore` excludes dev-only docs, requirements specs, signing keys
-
-### Changed
-
-- README rewritten in English with comprehensive sections
-- Connectors UI removed — connector status was redundant with what
-  Claude Desktop / Codex / Continue.dev show natively
-- Updater endpoint points at `github.com/PPoletto/BRAIN`
-
 ### Added
 
 - BRAIN-themed app + tray icons in all four state colours
