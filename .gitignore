@@ -37,3 +37,15 @@ Desktop.ini
 .turbo/
 *.tsbuildinfo
 coverage/
+
+# Dev-only documents — used during development, not for end users.
+# Leading "/" anchors these to the repo root, so the runtime template
+# files at src-tauri/src/onboarding/templates/{CLAUDE,AGENTS}.md stay
+# tracked (those get copied into the user's vault at onboarding time).
+/CLAUDE.md
+/AGENTS.md
+/requirements/
+/docs/architecture.md
+/docs/implementation-plan.md
+/docs/post-mvp-roadmap.md
+/docs/adr/
