@@ -6,6 +6,29 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-05-05
+
+### Fixed
+
+- Onboarding flow no longer crashes with a React Router 404 right after
+  the model-download step on "Open existing vault" runs — stale
+  `navigate("/onboarding/connectors")` pointed at a route that was
+  removed during the connectors-tab cleanup
+
+### Changed
+
+- Bundle identifier moved from `com.ppoletto.brain` to `eu.poletto.brain`
+  to reflect the actual domain. Existing 0.1.0 Tauri data at
+  `%LOCALAPPDATA%\com.ppoletto.brain\` becomes orphaned after upgrade and
+  is safe to delete manually
+- `bundle.targets` back to `"all"` so MSI is built alongside NSIS;
+  `updaterJsonPreferNsis: true` keeps `latest.json` pointing at the NSIS
+  variant for seamless per-user auto-updates
+
+## [0.1.0] — 2026-05-05
+
+First public release on GitHub.
+
 ### Added
 
 - BRAIN-themed app + tray icons in all four state colours
@@ -23,6 +46,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Onboarding splash screens
 - Release playbook: `docs/RELEASE.md` with the minisign + GitHub Actions
   flow
+- Tauri 2 updater plugin wired to GitHub Releases with `latest.json` +
+  minisign signatures (`createUpdaterArtifacts: true`)
 
 ### Changed
 
@@ -64,7 +89,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [0.1.0] — 2026-04-30
+## [0.0.1] — 2026-04-30
 
 Initial private build. The bones of the system: Tauri 2 tray app,
 Cryptomator-format-ready vault layout, MCP auto-registration in five
