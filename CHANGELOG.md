@@ -6,6 +6,23 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.5] — 2026-05-06
+
+### Fixed
+
+- `brain_write_page`'s auto-normalisation no longer corrupts markdown
+  tables. Pre-0.2.5, a markdown-style link inside a table cell —
+  `| [Dan](entities/dan-shapiro) | CEO |` — was rewritten to pipe-form
+  wiki-link `[[entities/dan-shapiro|Dan]]`, and the resulting `|Dan]]`
+  collided with the table's column separator, silently breaking the
+  rendered row in the viewer (and in every standard GFM renderer).
+  `normalize_internal_links` now detects markdown table rows
+  (line-by-line, leading-and-trailing `|` heuristic) and leaves their
+  content verbatim. The original markdown-style link still renders
+  correctly and `extract_wiki_links` still picks it up as a graph
+  edge — only the unsafe rewrite-to-pipe-form is suppressed inside
+  table rows. Idempotent, prose before/after tables stays unaffected.
+
 ## [0.2.4] — 2026-05-06
 
 ### Fixed

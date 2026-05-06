@@ -258,27 +258,55 @@ pub fn normalize_internal_links(body: &str) -> String {
 }
 
 fn rewrite_md_links_in(chunk: &str, re: &Regex) -> String {
-    re.replace_all(chunk, |caps: &regex::Captures<'_>| {
-        let text = &caps["text"]; // includes the brackets, e.g. "[Dan]"
-        let target = caps["target"].trim();
-        let Some(page_id) = page_id_from_markdown_target(target) else {
-            // Not a wiki page — keep the original markdown link verbatim.
-            return caps[0].to_string();
-        };
-        // text is `[<label>]`; pull the inside.
-        let label = text.trim_start_matches('[').trim_end_matches(']');
-        // Use the slug's last segment for the "natural" comparison so
-        // [Dan](entities/dan-shapiro) keeps the alias `Dan` rather than
-        // collapsing to `[[entities/dan-shapiro]]` (which would render
-        // as "entities/dan-shapiro").
-        let slug_tail = page_id.rsplit('/').next().unwrap_or(&page_id);
-        if label == slug_tail || label == page_id {
-            format!("[[{page_id}]]")
-        } else {
-            format!("[[{page_id}|{label}]]")
+    // Walk line-by-line so we can defensively skip markdown table rows.
+    // Reason: pipe-form wiki links `[[id|alias]]` collide with the
+    // table column separator `|`. If we'd rewrite a `[Foo](entities/foo)`
+    // inside a `| … |` row, the resulting `[[entities/foo|Foo]]`
+    // contains a literal `|` that the GFM table parser interprets as
+    // a new column boundary — silently corrupts the rendered table.
+    // Leaving the markdown-style link verbatim inside table cells is
+    // safe (renderer handles it, extract_wiki_links still picks it up
+    // as a graph edge) and avoids the breakage.
+    let mut out = String::with_capacity(chunk.len());
+    for line in chunk.split_inclusive('\n') {
+        if is_markdown_table_row(line) {
+            out.push_str(line);
+            continue;
         }
-    })
-    .into_owned()
+        let rewritten = re.replace_all(line, |caps: &regex::Captures<'_>| {
+            let text = &caps["text"]; // includes the brackets, e.g. "[Dan]"
+            let target = caps["target"].trim();
+            let Some(page_id) = page_id_from_markdown_target(target) else {
+                // Not a wiki page — keep the original markdown link verbatim.
+                return caps[0].to_string();
+            };
+            // text is `[<label>]`; pull the inside.
+            let label = text.trim_start_matches('[').trim_end_matches(']');
+            // Use the slug's last segment for the "natural" comparison so
+            // [Dan](entities/dan-shapiro) keeps the alias `Dan` rather than
+            // collapsing to `[[entities/dan-shapiro]]` (which would render
+            // as "entities/dan-shapiro").
+            let slug_tail = page_id.rsplit('/').next().unwrap_or(&page_id);
+            if label == slug_tail || label == page_id {
+                format!("[[{page_id}]]")
+            } else {
+                format!("[[{page_id}|{label}]]")
+            }
+        });
+        out.push_str(&rewritten);
+    }
+    out
+}
+
+/// Heuristic: a markdown table row starts AND ends with `|` (after
+/// trimming whitespace and the trailing newline). Both anchors are
+/// required so legitimate non-table lines that happen to start with
+/// `|` (e.g. text wrapping in a quote block) don't accidentally
+/// trigger the skip. The trailing-newline trim handles
+/// `split_inclusive` keeping the `\n` glued to the line.
+fn is_markdown_table_row(line: &str) -> bool {
+    let trimmed = line.trim_end_matches('\n').trim();
+    !trimmed.is_empty() && trimmed.starts_with('|') && trimmed.ends_with('|')
 }
 
 #[cfg(test)]
@@ -447,5 +475,88 @@ mod tests {
         let body = "[A](entities/a) met [B](entities/b)";
         let out = normalize_internal_links(body);
         assert_eq!(out, "[[entities/a|A]] met [[entities/b|B]]");
+    }
+
+    #[test]
+    fn normalize_does_not_rewrite_links_inside_markdown_table_rows() {
+        // Regression for the silent table-corruption bug. Pre-fix the
+        // normalizer would rewrite [Dan](entities/dan-shapiro) to
+        // [[entities/dan-shapiro|Dan]] EVEN inside a table cell — and
+        // the resulting `|Dan]]` collides with the table's column
+        // separator, breaking the row's rendering in the viewer (and in
+        // every standard GFM renderer). Inside a `| … | … |` row we now
+        // leave the line verbatim so the markdown link stays as the
+        // safe alias-free form. The graph view still picks up the edge
+        // because extract_wiki_links recognises markdown-style links.
+        let body = "\
+| Person | Role |
+|--------|------|
+| [Dan](entities/dan-shapiro) | CEO |
+";
+        let out = normalize_internal_links(body);
+        assert!(
+            !out.contains("[[entities/dan-shapiro|Dan]]"),
+            "table-cell link must NOT be rewritten to pipe-form, got:\n{out}"
+        );
+        // The original markdown form is preserved inside the table cell.
+        assert!(
+            out.contains("[Dan](entities/dan-shapiro)"),
+            "markdown-style link inside table must be left verbatim, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn normalize_still_rewrites_links_in_prose_after_a_table() {
+        // Defensive: the table-row skip must be local to the table — a
+        // paragraph that comes after the table must continue to be
+        // normalized so the rest of the page benefits from the
+        // canonical `[[…]]` form everywhere it's safe.
+        let body = "\
+| Header |
+|--------|
+| cell |
+
+Then [Dan](entities/dan-shapiro) appears in prose.
+";
+        let out = normalize_internal_links(body);
+        assert!(
+            out.contains("[[entities/dan-shapiro|Dan]]"),
+            "post-table prose must still be normalized, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn normalize_still_rewrites_links_in_prose_before_a_table() {
+        // Mirror of the above: prose BEFORE a table must also continue
+        // to be normalized. Tables shouldn't poison adjacent content
+        // in either direction.
+        let body = "\
+Intro mentions [Dan](entities/dan-shapiro).
+
+| Header |
+|--------|
+| cell |
+";
+        let out = normalize_internal_links(body);
+        assert!(
+            out.contains("[[entities/dan-shapiro|Dan]]"),
+            "pre-table prose must still be normalized, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn normalize_leaves_existing_pipe_form_inside_table_cells_unchanged() {
+        // If the user / a prior write already used [[id|alias]] inside
+        // a table cell (manually, perhaps relying on a renderer that
+        // tolerates it, or via a cell that escapes pipes upstream),
+        // the normalizer must not touch it on a re-write — same
+        // idempotency contract as for normal text.
+        let body = "\
+| Person | Role |
+|--------|------|
+| [[entities/dan-shapiro|Dan]] | CEO |
+";
+        let out = normalize_internal_links(body);
+        assert_eq!(out, body);
     }
 }
