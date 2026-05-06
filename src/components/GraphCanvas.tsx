@@ -278,9 +278,15 @@ export function GraphCanvas({
     const cy = cytoscape({
       container: ref.current,
       elements,
-      // Pinned the wheelSensitivity so trackpad scroll on macOS doesn't jump
-      // by 50% per tick — Cytoscape's default is calibrated for mice.
-      wheelSensitivity: 0.2,
+      // Disable Cytoscape's built-in wheel zoom — a single
+      // `wheelSensitivity` value can't simultaneously feel right
+      // on a discrete mouse wheel (deltaY ≈ 100 per click) and a
+      // continuous trackpad scroll (deltaY ≈ 5 per event, dozens
+      // of events per gesture). The custom wheel handler attached
+      // below adapts the zoom step per event based on |deltaY|
+      // (mouse vs trackpad) and respects ctrlKey wheel events
+      // (browser-normalised pinch-to-zoom on macOS trackpads).
+      userZoomingEnabled: false,
       style: [
         {
           selector: "node",
@@ -468,6 +474,69 @@ export function GraphCanvas({
       onClustersChangeRef.current?.(clusters);
     });
 
+    // Custom wheel-zoom handler. Replaces Cytoscape's built-in
+    // wheel zoom (which we disabled with `userZoomingEnabled:
+    // false` above) with one that adapts the per-event step to
+    // the input device:
+    //
+    //   - Mouse wheel: |deltaY| ≥ 50 (one discrete click). One
+    //     tick = ~15% zoom change, which feels like a meaningful
+    //     step without overshooting.
+    //   - Trackpad scroll: |deltaY| < 50, but events fire dozens
+    //     of times per gesture. Each event = ~2% zoom; the
+    //     gesture as a whole feels smooth and responsive.
+    //   - Trackpad pinch (browsers report this as a wheel event
+    //     with `ctrlKey: true` and pre-scaled deltaY): ~5% per
+    //     event so the pinch feels natural without amplifying
+    //     the browser's pre-scaling.
+    //
+    // Zoom is centred on the cursor — standard Map-/Graph-UI
+    // expectation, much nicer than zooming around the canvas
+    // centre when the user is hovering over a specific node.
+    // AbortController owns the wheel-listener lifecycle: registering
+    // and removing it via the same signal keeps the inline listener
+    // closure tidy, and means TypeScript can infer WheelEvent from
+    // the addEventListener overload without ESLint complaining about
+    // an undefined `WheelEvent` global (DOM lib types ARE in scope
+    // for tsc, but ESLint's no-undef rule doesn't read them).
+    const container = ref.current;
+    const wheelAbort = new AbortController();
+    container.addEventListener(
+      "wheel",
+      (e) => {
+        e.preventDefault();
+        let factor: number;
+        if (e.ctrlKey) {
+          // Browser-normalised pinch on a trackpad. The browser's
+          // already pre-scaled deltaY, so we use a small step.
+          const PINCH_STEP = 1.05;
+          factor = e.deltaY < 0 ? PINCH_STEP : 1 / PINCH_STEP;
+        } else if (Math.abs(e.deltaY) >= 50) {
+          // Discrete mouse-wheel click — ~15% per tick is a useful
+          // step size that doesn't overshoot.
+          const MOUSE_WHEEL_STEP = 1.15;
+          factor = e.deltaY < 0 ? MOUSE_WHEEL_STEP : 1 / MOUSE_WHEEL_STEP;
+        } else {
+          // Continuous trackpad scroll — ~2% per event. Trackpads
+          // fire dozens of events per gesture, so the gesture as a
+          // whole still feels responsive.
+          const TRACKPAD_STEP = 1.02;
+          factor = e.deltaY < 0 ? TRACKPAD_STEP : 1 / TRACKPAD_STEP;
+        }
+        const rect = container.getBoundingClientRect();
+        cy.zoom({
+          level: cy.zoom() * factor,
+          renderedPosition: {
+            x: e.clientX - rect.left,
+            y: e.clientY - rect.top,
+          },
+        });
+      },
+      // `passive: false` so preventDefault actually stops the page
+      // from scrolling when the user wheels over the graph.
+      { passive: false, signal: wheelAbort.signal },
+    );
+
     // Persist hand-tuning. When the user drops a node, save just its
     // new coordinates — but only in force mode, so dragging a node
     // around in the hierarchical view doesn't pollute the persisted
@@ -550,6 +619,7 @@ export function GraphCanvas({
     return () => {
       observer.disconnect();
       if (debounce !== null) clearTimeout(debounce);
+      wheelAbort.abort();
       nav?.destroy();
       cy.destroy();
       cyRef.current = null;

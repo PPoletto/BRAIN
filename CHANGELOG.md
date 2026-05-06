@@ -6,6 +6,31 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.12] — 2026-05-06
+
+### Changed
+
+- Graph zoom now adapts to the input device. Cytoscape's built-in
+  wheel zoom uses a single `wheelSensitivity` constant which can't
+  feel right on both a discrete mouse-wheel (deltaY ≈ 100 per
+  click) and a continuous trackpad scroll (deltaY ≈ 5 per event,
+  dozens of events per gesture). Pre-0.2.12 we'd pinned it at 0.2
+  to keep macOS trackpad zoom from jumping by 50 % per tick — at
+  the cost of the mouse-wheel feeling glacial. Replaced with a
+  custom wheel handler that picks a per-event zoom step from the
+  event's |deltaY|:
+  - **Mouse wheel** (|deltaY| ≥ 50): 15 % per tick — meaningful
+    step without overshooting.
+  - **Trackpad scroll** (|deltaY| < 50): 2 % per event — feels
+    smooth across the gesture.
+  - **Trackpad pinch** (browsers report this as a wheel event
+    with `ctrlKey: true` and pre-scaled deltaY): 5 % per event so
+    the pinch feels natural without amplifying the browser's
+    pre-scaling.
+  Zoom is also now centred on the cursor instead of the canvas
+  centre — standard Map-/Graph-UI expectation, much nicer when
+  hovering over a specific node before zooming in.
+
 ## [0.2.11] — 2026-05-06
 
 ### Fixed

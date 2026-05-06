@@ -36,11 +36,13 @@ export default [
         HTMLButtonElement: "readonly",
         KeyboardEvent: "readonly",
         MouseEvent: "readonly",
+        WheelEvent: "readonly",
         URLSearchParams: "readonly",
         ResizeObserver: "readonly",
         requestAnimationFrame: "readonly",
         cancelAnimationFrame: "readonly",
         EventTarget: "readonly",
+        AbortController: "readonly",
       },
     },
     plugins: {
