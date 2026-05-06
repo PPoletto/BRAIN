@@ -78,6 +78,40 @@ jobs:
       - name: Install JS dependencies
         run: pnpm install --frozen-lockfile
 
+      # Pull the matching `## [X.Y.Z]` section out of CHANGELOG.md so
+      # the GitHub release page shows the actual changes — not just a
+      # generic "see CHANGELOG.md" link the user has to click.
+      # awk is GNU/BSD-portable; explicit `shell: bash` ensures we use
+      # Git-for-Windows bash on the Windows runner instead of pwsh.
+      # Falls back to a "see CHANGELOG.md" line if the section is
+      # missing (forgot to update CHANGELOG before tagging) so the
+      # release still publishes instead of failing the workflow.
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        shell: bash
+        run: |
+          set -eo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          NOTES=$(awk -v target="$VERSION" '
+            /^## \[/ {
+              if (in_target) { exit }
+              if (index($0, "[" target "]") > 0) { in_target = 1; next }
+            }
+            in_target { print }
+          ' CHANGELOG.md)
+          if [ -z "$(printf "%s" "$NOTES" | tr -d "[:space:]")" ]; then
+            NOTES="Release notes are in [\`CHANGELOG.md\`](https://github.com/PPoletto/BRAIN/blob/main/CHANGELOG.md) — no \`## [$VERSION]\` section was found at tag time."
+          fi
+          {
+            echo "body<<RELEASE_NOTES_EOF"
+            echo "$NOTES"
+            echo ""
+            echo "---"
+            echo ""
+            echo "Existing BRAIN installs will see this as an available update on the next 6-hour check, or when you click the version in the status bar."
+            echo "RELEASE_NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build, sign, upload
         uses: tauri-apps/tauri-action@v0
         env:
@@ -94,12 +128,7 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "BRAIN ${{ github.ref_name }}"
-          releaseBody: |
-            Release notes are in [`CHANGELOG.md`](https://github.com/PPoletto/BRAIN/blob/main/CHANGELOG.md).
-
-            Existing BRAIN installs will see this as an available update on
-            the next 6-hour check, or when you click the version in the
-            status bar.
+          releaseBody: ${{ steps.notes.outputs.body }}
           releaseDraft: true
           prerelease: false
           # Belt-and-suspenders: even if a future tauri.conf.json regression
