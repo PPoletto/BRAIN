@@ -7,6 +7,11 @@ import fcose from "cytoscape-fcose";
 // .d.ts shim. The runtime APIs are stable and well-documented.
 import dagre from "cytoscape-dagre";
 import navigator from "cytoscape-navigator";
+// The navigator package ships its own stylesheet for the viewport
+// rectangle and thumbnail canvas — without this import the mini-map
+// container renders empty (no draggable rectangle, just a static
+// background).
+import "cytoscape-navigator/cytoscape.js-navigator.css";
 import { commands } from "../lib/commands";
 
 cytoscape.use(fcose);
@@ -352,13 +357,13 @@ export function GraphCanvas({
       }
 
       // Sync the just-computed coordinates back to the parent so it
-      // can persist them. We only emit when we actually ran a layout
-      // pass (preset re-emits its inputs verbatim, which is harmless
-      // but wasteful) — guarded below by the layoutChoice name.
-      if (
-        layoutChoice.name === "fcose" ||
-        layoutChoice.name === "dagre"
-      ) {
+      // can persist them — but **only** for the force-directed pass.
+      // Persisting dagre's hierarchical positions and then toggling
+      // back to force mode would let preset rebuild the graph with
+      // the tree-shaped coordinates, which is not what the user
+      // hand-tuned in force mode. Hierarchical is recomputed on each
+      // open and intentionally non-persistent.
+      if (layoutChoice.name === "fcose") {
         const positions: SavedPosition[] = ns.toArray().map((n) => {
           const p = n.position();
           return { page_id: n.id(), x: p.x, y: p.y };
@@ -389,10 +394,12 @@ export function GraphCanvas({
     });
 
     // Persist hand-tuning. When the user drops a node, save just its
-    // new coordinates. The parent's onPositionsChange handler is
-    // responsible for any debouncing / batching it wants — we send
-    // one position per drop, which is what the user observably did.
+    // new coordinates — but only in force mode, so dragging a node
+    // around in the hierarchical view doesn't pollute the persisted
+    // force-mode layout. The parent's onPositionsChange handler is
+    // responsible for any debouncing / batching it wants.
     cy.on("dragfree", "node", (event) => {
+      if (layoutMode !== "force") return;
       const node = event.target as cytoscape.NodeSingular;
       const p = node.position();
       onPositionsChangeRef.current?.([

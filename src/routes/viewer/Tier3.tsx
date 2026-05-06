@@ -329,7 +329,7 @@ export function Tier3() {
             description="Loosen your filters or clear them to see the full graph."
           />
         )}
-        {graph && graph.nodes.length > 0 && (
+        {graph && graph.nodes.length > 0 && savedPositions !== null && (
           <>
             {graph.edges.length === 0 && (
               <div className="absolute left-1/2 top-3 z-10 -translate-x-1/2 rounded-md border border-amber-900 bg-amber-950/80 px-3 py-1.5 text-xs text-amber-200 shadow-lg">
@@ -338,6 +338,13 @@ export function Tier3() {
                 in your Markdown to draw connections.
               </div>
             )}
+            {/*
+              GraphCanvas only mounts after savedPositions is loaded
+              (initial null → resolved array, possibly empty). This
+              avoids the "fcose runs, then preset re-runs because
+              savedPositions just arrived" double-layout flicker on
+              first open of the Graph tab in a session.
+            */}
             <GraphCanvas
               nodes={graph.nodes}
               edges={graph.edges}
@@ -358,6 +365,13 @@ export function Tier3() {
           </>
         )}
         {!graph && <p className="p-6 text-sm text-neutral-500">Loading graph…</p>}
+        {graph &&
+          graph.nodes.length > 0 &&
+          savedPositions === null && (
+            <p className="p-6 text-sm text-neutral-500">
+              Loading layout…
+            </p>
+          )}
       </div>
     </div>
   );
