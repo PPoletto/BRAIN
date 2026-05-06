@@ -446,7 +446,18 @@ export function GraphCanvas({
         thumbnailEventFramerate: 30,
         thumbnailLiveFramerate: false,
         dblClickDelay: 200,
-        removeCustomContainer: true,
+        // CRITICAL: must be false. With true, the plugin's destroy()
+        // calls `this.$panel.parentElement.removeChild(this.$panel)`
+        // — but by the time React's effect cleanup runs, our
+        // container is already detached from the DOM (React's commit
+        // phase removed the conditionally-rendered `{showMinimap &&
+        // <div…>}` element BEFORE the cleanup fires), so
+        // `parentElement` is null and the .removeChild call throws
+        // "Cannot read properties of null". With false the destroy
+        // path takes `this.$panel.innerHTML = ''` which is safe on
+        // a detached element. React then garbage-collects the now-
+        // empty container as part of its normal unmount.
+        removeCustomContainer: false,
         rerenderDelay: 100,
       });
     }
