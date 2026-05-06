@@ -6,6 +6,37 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.11] — 2026-05-06
+
+### Fixed
+
+- Mini-map toggle truly no longer rotates the graph. The v0.2.10
+  attempt fixed one half of the race (synchronous
+  `setSavedPositions`) but missed two more sources of remount-with-
+  stale-positions:
+  - **`positionMap` was a `useMemo` keyed off `savedPositions`**
+    and listed in the create-effect's dependency array. Even with
+    a synchronous state update, React's re-render is asynchronous;
+    a user click that landed before the next commit caused the
+    effect to re-run with the prior positionMap (still empty),
+    and fcose ran again with `randomize: true`.
+  - **`onNodeClick` was an inline arrow function in Tier3** with no
+    `useCallback`, so every Tier3 state change (including
+    `setShowMinimap`) created a new function identity, the
+    create-effect saw a "changed" dependency, and the cy instance
+    was destroyed and rebuilt — even though nothing meaningful
+    about the graph had changed.
+  Fix: GraphCanvas now keeps a `positionMapRef` that the cy
+  `layoutstop` and `dragfree` callbacks update synchronously (so
+  the freshest layout is always available even before React
+  commits a render), `onNodeClick` is captured into a ref like the
+  other callbacks, and the create-effect's dependency list drops
+  both. Re-layouts go through a new `layoutResetSignal` prop —
+  Tier3 bumps it on the "Re-layout" button so the explicit-reset
+  path still works. Net effect: toggling the mini-map (or any
+  other Tier3 state) preserves the on-screen layout exactly as
+  it was, the way the user wanted.
+
 ## [0.2.10] — 2026-05-06
 
 ### Fixed

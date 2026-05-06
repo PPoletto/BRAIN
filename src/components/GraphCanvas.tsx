@@ -57,11 +57,15 @@ type Props = {
   /// Controls the cytoscape-navigator overlay. Default `false` so
   /// users who don't need pan-by-thumbnail aren't shown a permanent
   /// thumbnail eating screen real-estate. Tier3 wires this to a
-  /// toolbar toggle. Toggling causes a Cytoscape remount — the
-  /// navigator extension is tied to the cy lifecycle, so flipping
-  /// it on/off without a remount would leave a half-attached
-  /// thumbnail listener. The remount is cheap thanks to preset.
+  /// toolbar toggle.
   showMinimap?: boolean;
+  /// Bumped by the parent when the user explicitly asks for a fresh
+  /// auto-layout (the "Re-layout" button). Without this signal the
+  /// graph never re-runs fcose for the lifetime of a Tier3 mount —
+  /// `savedPositions` changes (from drags or the post-fcose
+  /// auto-save) deliberately do *not* cause a relayout, otherwise
+  /// every save would reshuffle the graph the user just settled on.
+  layoutResetSignal?: number;
 };
 
 const TYPE_COLORS: Record<string, string> = {
@@ -96,6 +100,7 @@ export function GraphCanvas({
   onClustersChange,
   focusedSubset = null,
   showMinimap = false,
+  layoutResetSignal = 0,
 }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   // Separate container for the cytoscape-navigator overlay (mini-map).
@@ -111,15 +116,23 @@ export function GraphCanvas({
 
   // Latest callbacks captured in refs so the create-effect doesn't
   // need them in its dependency list — otherwise every parent
-  // re-render would tear Cytoscape down and re-mount it.
+  // re-render would tear Cytoscape down and re-mount it. Tier3's
+  // `onNodeClick` is an inline arrow that receives a new identity
+  // each render, so without ref'ing it every Tier3 state change
+  // would force a full cy rebuild — the most subtle source of
+  // "graph randomly relayouts on minimap toggle" before the fix.
   const onPositionsChangeRef = useRef(onPositionsChange);
   const onClustersChangeRef = useRef(onClustersChange);
+  const onNodeClickRef = useRef(onNodeClick);
   useEffect(() => {
     onPositionsChangeRef.current = onPositionsChange;
   }, [onPositionsChange]);
   useEffect(() => {
     onClustersChangeRef.current = onClustersChange;
   }, [onClustersChange]);
+  useEffect(() => {
+    onNodeClickRef.current = onNodeClick;
+  }, [onNodeClick]);
 
   // Render-key bump = full Cytoscape remount. Used by the auto-recover
   // path when we detect that the canvas didn't actually paint (all
@@ -174,20 +187,52 @@ export function GraphCanvas({
     return map;
   }, [edges]);
 
-  // Index saved positions by id for O(1) attachment to elements.
-  // When the saved set covers every visible node we can use the
-  // `preset` layout (zero iterations, instant render) — otherwise
-  // we fall back to fcose so newly added pages get arranged.
-  const positionMap = useMemo(() => {
-    const m = new Map<string, { x: number; y: number }>();
-    if (savedPositions) {
-      for (const p of savedPositions) m.set(p.page_id, { x: p.x, y: p.y });
-    }
-    return m;
-  }, [savedPositions]);
+  // Position map lives in a ref instead of a `useMemo(savedPositions)`
+  // for a critical reason: we want the create-effect *not* to re-run
+  // every time `savedPositions` changes, but we still want the
+  // create-effect to read the *latest* positions when it does run for
+  // some other reason (showMinimap toggle, layoutMode change, etc.).
+  // useMemo + dep on savedPositions would force the effect to re-run
+  // on every save, producing the visible "rotates on toggle" bug:
+  // (a) the user toggles minimap mid-fcose, (b) React re-renders, the
+  // closure captures positionMap from BEFORE the just-finished fcose's
+  // setSavedPositions had time to commit, (c) effect re-runs, sees an
+  // empty positionMap, runs fcose again with a fresh randomization.
+  // A ref updated synchronously by both the initial prop hydration
+  // AND the cy `layoutstop` callback closes that race: by the time
+  // any effect reads `positionMapRef.current`, it always has the
+  // latest coordinates regardless of where they came from.
+  const positionMapRef = useRef<Map<string, { x: number; y: number }>>(
+    new Map(),
+  );
+
+  // Initial hydration from the savedPositions prop. Runs exactly
+  // once per `savedPositions` *first non-null* delivery and once per
+  // `layoutResetSignal` bump. Crucially does NOT re-hydrate on
+  // subsequent savedPositions changes (e.g. the post-fcose save) —
+  // the cy layoutstop callback owns the ref from that point on and
+  // a re-hydration would fight against it.
+  const lastResetSignalRef = useRef<number | null>(null);
+  const hydratedRef = useRef(false);
+  if (
+    savedPositions !== null &&
+    (!hydratedRef.current ||
+      lastResetSignalRef.current !== layoutResetSignal)
+  ) {
+    const fresh = new Map<string, { x: number; y: number }>();
+    for (const p of savedPositions) fresh.set(p.page_id, { x: p.x, y: p.y });
+    positionMapRef.current = fresh;
+    hydratedRef.current = true;
+    lastResetSignalRef.current = layoutResetSignal;
+  }
 
   useEffect(() => {
     if (!ref.current) return;
+    // Snapshot the position map *now*, at effect-run time. Any
+    // updates from prior cy layouts (in this same component
+    // mount) live in `positionMapRef.current` thanks to the
+    // sync-write in the layoutstop handler below.
+    const positionMap = positionMapRef.current;
     const elements: ElementDefinition[] = [
       ...nodes.map((n) => {
         const saved = positionMap.get(n.id);
@@ -215,8 +260,7 @@ export function GraphCanvas({
     //     appeared since the last save) → fcose with
     //     `randomize: false`, so saved nodes start at their
     //     persisted coordinates and only the new ones get
-    //     force-placed. Avoids the "every reopen rotates the
-    //     whole graph" feel that randomize-true produces.
+    //     force-placed.
     //   - no positions known → fcose with `randomize: true` so
     //     nodes don't all collapse onto (0,0) for a degenerate
     //     "comic row" layout (the v0.2.6 bug).
@@ -306,7 +350,7 @@ export function GraphCanvas({
 
     cy.on("tap", "node", (event) => {
       const id = event.target.id();
-      onNodeClick?.(id);
+      onNodeClickRef.current?.(id);
     });
 
     // Hover-tooltip wiring. We rely on Cytoscape's renderedPosition for
@@ -389,6 +433,16 @@ export function GraphCanvas({
           const p = n.position();
           return { page_id: n.id(), x: p.x, y: p.y };
         });
+        // Update our local ref synchronously, BEFORE notifying the
+        // parent. If the parent's setSavedPositions schedules a
+        // re-render and a subsequent re-mount of this effect (e.g.
+        // user toggles minimap before the next React commit), the
+        // re-mount reads `positionMapRef.current` and finds these
+        // fresh positions — no race window where it could fall
+        // back to fcose with `randomize: true`.
+        for (const p of positions) {
+          positionMapRef.current.set(p.page_id, { x: p.x, y: p.y });
+        }
         onPositionsChangeRef.current?.(positions);
       }
 
@@ -423,6 +477,10 @@ export function GraphCanvas({
       if (layoutMode !== "force") return;
       const node = event.target as cytoscape.NodeSingular;
       const p = node.position();
+      // Same sync-write to the ref as in layoutstop — if the user
+      // drags then immediately toggles minimap, the remount reads
+      // the dropped position from the ref, not a stale one.
+      positionMapRef.current.set(node.id(), { x: p.x, y: p.y });
       onPositionsChangeRef.current?.([
         { page_id: node.id(), x: p.x, y: p.y },
       ]);
@@ -496,7 +554,16 @@ export function GraphCanvas({
       cy.destroy();
       cyRef.current = null;
     };
-  }, [nodes, edges, onNodeClick, renderKey, layoutMode, positionMap, showMinimap]);
+    // Effect-dependencies — note carefully what's NOT here:
+    //   - `positionMap` / `savedPositions` are intentionally read
+    //     via `positionMapRef.current` so a save (after fcose or
+    //     drag) doesn't trigger a remount. Re-layouts go through
+    //     `layoutResetSignal`.
+    //   - `onNodeClick`, `onPositionsChange`, `onClustersChange`
+    //     go through their respective refs so a parent re-render
+    //     (e.g. setShowMinimap → Tier3 re-renders → fresh callback
+    //     identities) does not destroy and recreate cy.
+  }, [nodes, edges, renderKey, layoutMode, showMinimap, layoutResetSignal]);
 
   // Focus subset: when the parent (cluster sidebar click) hands us
   // a list of node ids, fit the viewport to just those nodes. Null

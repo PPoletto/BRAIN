@@ -42,6 +42,15 @@ export function Tier3() {
   // for the session only.
   const [showMinimap, setShowMinimap] = useState(false);
 
+  // Counter that bumps when the user explicitly asks for a fresh
+  // auto-layout (the "Re-layout" button). GraphCanvas keys its
+  // positionMapRef hydration off this — without it, clearing
+  // saved positions would leave the GraphCanvas's internal ref
+  // populated with the old positions (because we deliberately
+  // ignore non-reset savedPositions changes in the ref to prevent
+  // toggle-rotation races).
+  const [layoutResetSignal, setLayoutResetSignal] = useState(0);
+
   // Persistent layout. `null` = haven't loaded yet; `[]` = loaded,
   // empty (first time the user opens the graph). Both behave the
   // same way at render time — fcose runs and saves its output.
@@ -166,7 +175,15 @@ export function Tier3() {
     }
     commands
       .clearGraphPositions()
-      .then(() => setSavedPositions([]))
+      .then(() => {
+        // Two state updates batched into one re-render. The
+        // GraphCanvas effect re-runs because `layoutResetSignal`
+        // changed, sees the (now-empty) `savedPositions`, drops
+        // its position-map, and falls through to fcose with
+        // randomize:true for a fresh auto-layout.
+        setSavedPositions([]);
+        setLayoutResetSignal((n) => n + 1);
+      })
       .catch((e: unknown) => setError(String(e)));
   }, []);
 
@@ -394,6 +411,7 @@ export function Tier3() {
                   : null
               }
               showMinimap={showMinimap}
+              layoutResetSignal={layoutResetSignal}
             />
           </>
         )}
