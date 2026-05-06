@@ -24,6 +24,12 @@ use crate::state::AppState;
 /// spawned by Claude Code, Codex, and other MCP clients. Reads the vault
 /// path from the `BRAIN_VAULT_PATH` env var.
 pub fn run_mcp_stdio() -> std::io::Result<()> {
+    // Init logging FIRST so configure_libgit2's `tracing::warn!` and any
+    // panics caught by the dispatch loop have somewhere to land —
+    // otherwise the subprocess goes dark on errors, which is what made
+    // the disconnect bug invisible. Writes to stderr so stdout stays a
+    // pure JSON-RPC stream Claude Desktop can parse.
+    logging::init_for_mcp();
     configure_libgit2();
     db::vec_loader::ensure_loaded();
     mcp::server::run_stdio()

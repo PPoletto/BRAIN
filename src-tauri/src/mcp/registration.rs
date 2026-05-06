@@ -107,9 +107,19 @@ pub struct RegistrationReport {
     /// Distinct from Claude Code — they share a name but ship as separate
     /// products with separate config files.
     pub claude_desktop: Option<ClientStatus>,
+    /// OpenAI Codex CLI (`~/.codex/config.toml`). Codex moved to TOML
+    /// in 2025 with `[mcp_servers.<name>]` sections — registration goes
+    /// through `register_codex_toml`, not the generic JSON path.
     pub codex: Option<ClientStatus>,
+    /// Continue.dev (`~/.continue/config.json`).
     pub continue_dev: Option<ClientStatus>,
-    pub chatgpt_desktop: Option<ClientStatus>,
+    // NOTE: ChatGPT Desktop intentionally absent. As of late 2025 the
+    // Windows Store and macOS ChatGPT clients only support remote
+    // HTTPS-based connectors registered server-side via Settings →
+    // Connectors → Developer Mode. They do not read a local
+    // `claude_desktop_config.json`-style file, so writing one was a
+    // no-op. Local stdio MCP would require the user to expose BRAIN
+    // through `mcp-remote`, which conflicts with C-04 (local-only).
 }
 
 /// Registers the Brain MCP server in every supported client. Returns a
@@ -117,6 +127,14 @@ pub struct RegistrationReport {
 /// integration succeeded and which fell back. Best-effort: a single client
 /// failure does not abort the others.
 pub fn register_brain_in_supported_clients(vault_path: &Path) -> McpResult<RegistrationReport> {
+    // Best-effort: clean up files pre-0.2.2 BRAIN wrote to paths the
+    // target client doesn't actually read (legacy Codex JSON, orphan
+    // ChatGPT Desktop mcp.json). Each path is only deleted when its
+    // contents are provably BRAIN-only — see
+    // `cleanup_orphan_json_if_brain_only`.
+    for orphan in legacy_orphan_paths() {
+        let _ = cleanup_orphan_json_if_brain_only(&orphan);
+    }
     Ok(RegistrationReport {
         // Claude Code: prefer the official `claude mcp add` CLI because its
         // storage format and on-disk location may evolve and is non-trivial.
@@ -129,22 +147,36 @@ pub fn register_brain_in_supported_clients(vault_path: &Path) -> McpResult<Regis
         // We write to every active install we can detect so whichever
         // variant the user actually launches finds Brain.
         claude_desktop: Some(register_claude_desktop_anywhere(vault_path)),
-        codex: Some(register_simple_client(
-            codex_config_path(),
-            vault_path,
-            "Codex",
-        )),
+        codex: Some(register_codex(vault_path)),
         continue_dev: Some(register_simple_client(
             continue_dev_config_path(),
             vault_path,
             "Continue.dev",
         )),
-        chatgpt_desktop: Some(register_simple_client(
-            chatgpt_desktop_config_path(),
-            vault_path,
-            "ChatGPT Desktop",
-        )),
     })
+}
+
+/// Codex-specific registration. Path is `~/.codex/config.toml` on every
+/// OS; the file format is TOML with `[mcp_servers.<name>]` sections.
+/// We treat the parent dir's existence as the "Codex installed?" probe
+/// — same heuristic as `register_simple_client` but with the right
+/// writer. The dir is created on first `codex` CLI invocation.
+fn register_codex(vault_path: &Path) -> ClientStatus {
+    let Some(path) = codex_config_path() else {
+        return ClientStatus::NotInstalled;
+    };
+    if !path.exists()
+        && path
+            .parent()
+            .map(|p| !p.exists())
+            .unwrap_or(false)
+    {
+        return ClientStatus::NotInstalled;
+    }
+    match register_codex_toml(&path, &brain_server_entry(vault_path)) {
+        Ok(()) => ClientStatus::Registered(format!("via {}", path.display())),
+        Err(err) => ClientStatus::Failed(err.to_string()),
+    }
 }
 
 /// Like `register_simple_client` but skips the "is-the-app-installed?"
@@ -279,12 +311,16 @@ pub fn unregister_brain_from_supported_clients() -> McpResult<()> {
                 .output();
         }
     }
+    // Codex uses TOML — handled by its own unregister to keep the
+    // user's other `mcp_servers` entries intact.
+    if let Some(path) = codex_config_path() {
+        let _ = unregister_codex_toml(&path);
+    }
+    // The remaining clients all use a JSON `mcpServers` map.
     let candidates = [
         claude_code_config_path(),
         claude_desktop_config_path(),
-        codex_config_path(),
         continue_dev_config_path(),
-        chatgpt_desktop_config_path(),
     ];
     for path in candidates.into_iter().flatten() {
         let _ = unregister_from_client(&path);
@@ -475,42 +511,24 @@ fn claude_desktop_candidates(home: &Path) -> Vec<PathBuf> {
     paths
 }
 
+/// OpenAI Codex CLI config. Codex stores its TOML config under
+/// `~/.codex/config.toml` on all three desktop OSes; the path can be
+/// overridden via the `CODEX_HOME` env var (set by power users who run
+/// Codex out of a non-default directory). Same path logic on macOS,
+/// Linux and Windows — Codex deliberately does not use the OS-native
+/// config-dir conventions because it ships as a single Rust CLI that
+/// expects users to find the file via shell glob.
 pub fn codex_config_path() -> Option<PathBuf> {
+    if let Ok(custom) = std::env::var("CODEX_HOME") {
+        return Some(PathBuf::from(custom).join("config.toml"));
+    }
     let home = UserDirs::new()?.home_dir().to_path_buf();
-    Some(home.join(".codex").join("config.json"))
+    Some(home.join(".codex").join("config.toml"))
 }
 
 pub fn continue_dev_config_path() -> Option<PathBuf> {
     let home = UserDirs::new()?.home_dir().to_path_buf();
     Some(home.join(".continue").join("config.json"))
-}
-
-pub fn chatgpt_desktop_config_path() -> Option<PathBuf> {
-    let home = UserDirs::new()?.home_dir().to_path_buf();
-    #[cfg(target_os = "macos")]
-    {
-        return Some(
-            home.join("Library")
-                .join("Application Support")
-                .join("ChatGPT")
-                .join("mcp.json"),
-        );
-    }
-    #[cfg(target_os = "windows")]
-    {
-        return Some(
-            home.join("AppData")
-                .join("Roaming")
-                .join("ChatGPT")
-                .join("mcp.json"),
-        );
-    }
-    #[cfg(target_os = "linux")]
-    {
-        return Some(home.join(".config").join("chatgpt").join("mcp.json"));
-    }
-    #[allow(unreachable_code)]
-    None
 }
 
 /// Writes (or merges) the Brain entry into a client's config file under the
@@ -578,6 +596,201 @@ fn atomic_write(target: &Path, data: &[u8]) -> std::io::Result<()> {
     }
 }
 
+/// Writes (or merges) the BRAIN entry into the user's Codex config at
+/// `~/.codex/config.toml`. Codex moved from JSON to TOML in 2025 and
+/// expects a `[mcp_servers.<name>]` table per server, with optional
+/// `[mcp_servers.<name>.env]` sub-table for environment variables.
+///
+/// We use `toml_edit` so the user's existing keys, comments and ordering
+/// stay intact — only the `mcp_servers.BRAIN` (and any legacy
+/// `mcp_servers.brain`) entries are touched.
+pub fn register_codex_toml(config_path: &Path, entry: &McpServerEntry) -> McpResult<()> {
+    use toml_edit::{Array, DocumentMut, Item, Table, Value as TomlValue};
+
+    let mut doc: DocumentMut = if config_path.exists() {
+        let raw = std::fs::read_to_string(config_path)?;
+        if raw.trim().is_empty() {
+            DocumentMut::new()
+        } else {
+            raw.parse().map_err(|e: toml_edit::TomlError| {
+                super::McpError::Json(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid TOML in Codex config: {e}"),
+                )))
+            })?
+        }
+    } else {
+        DocumentMut::new()
+    };
+
+    // Ensure the top-level `mcp_servers` table exists. We use a regular
+    // table (not implicit) so it's pretty-printed as `[mcp_servers.BRAIN]`
+    // sections rather than inlined.
+    if !doc.contains_key("mcp_servers") {
+        let mut t = Table::new();
+        t.set_implicit(true);
+        doc.insert("mcp_servers", Item::Table(t));
+    }
+    let servers = doc["mcp_servers"]
+        .as_table_mut()
+        .ok_or_else(|| {
+            super::McpError::Json(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "mcp_servers is not a TOML table",
+            )))
+        })?;
+
+    // Strip legacy lowercase aliases so post-upgrade users don't see two
+    // duplicate Codex entries pointing at the same binary.
+    for legacy in LEGACY_BRAIN_SERVER_KEYS {
+        servers.remove(legacy);
+    }
+
+    // Build the `[mcp_servers.BRAIN]` table from scratch — overwrite any
+    // existing entry so a stale `command` path from an old install gets
+    // refreshed.
+    let mut brain = Table::new();
+    brain.insert("command", toml_edit::value(entry.command.clone()));
+
+    let mut args_arr = Array::new();
+    for a in &entry.args {
+        args_arr.push(TomlValue::from(a.clone()));
+    }
+    brain.insert("args", Item::Value(TomlValue::Array(args_arr)));
+
+    if !entry.env.is_empty() {
+        let mut env_table = Table::new();
+        for (k, v) in &entry.env {
+            // Codex env values are TOML strings. JSON envs in our entry
+            // are always strings (we control the producer), but we
+            // defensively coerce non-string values to their string form.
+            let s = v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string());
+            env_table.insert(k, toml_edit::value(s));
+        }
+        brain.insert("env", Item::Table(env_table));
+    }
+
+    servers.insert(BRAIN_SERVER_KEY, Item::Table(brain));
+
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    atomic_write(config_path, doc.to_string().as_bytes())?;
+    Ok(())
+}
+
+/// Deletes a JSON file iff it is provably 100% BRAIN's leftover —
+/// i.e. its root contains exactly one key (`mcpServers`) and that map
+/// contains nothing but the canonical `BRAIN` key plus optional legacy
+/// aliases. Used to clean up orphan paths pre-0.2.2 BRAIN wrote to but
+/// no LLM client actually reads (the obsolete Codex JSON path, the
+/// ChatGPT Desktop `mcp.json` whose target client doesn't support
+/// stdio MCP at all). Defensive about every shape we don't recognise:
+/// missing file, non-JSON, foreign top-level keys, or any non-BRAIN
+/// `mcpServers` entry → leave the file untouched. Better to keep
+/// dead bytes than delete a user file we don't understand.
+fn cleanup_orphan_json_if_brain_only(path: &Path) -> McpResult<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let raw = std::fs::read_to_string(path)?;
+    let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return Ok(()), // hand-edited / not JSON — preserve
+    };
+    let Some(root) = parsed.as_object() else {
+        return Ok(());
+    };
+    // Root must be exactly `{"mcpServers": …}` and nothing else.
+    if root.len() != 1 || !root.contains_key("mcpServers") {
+        return Ok(());
+    }
+    let Some(map) = root["mcpServers"].as_object() else {
+        return Ok(());
+    };
+    // Every server key must be a BRAIN-owned name (canonical or legacy).
+    let known: std::collections::HashSet<&str> = std::iter::once(BRAIN_SERVER_KEY)
+        .chain(LEGACY_BRAIN_SERVER_KEYS.iter().copied())
+        .collect();
+    for key in map.keys() {
+        if !known.contains(key.as_str()) {
+            return Ok(());
+        }
+    }
+    // Provably ours — safe to delete.
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+/// Returns the per-platform paths that pre-0.2.2 BRAIN wrote to but
+/// that the target client doesn't actually read. Called from
+/// `register_brain_in_supported_clients` so that the next mount after
+/// an upgrade silently tidies them up. Idempotent: paths that don't
+/// exist or contain user-owned entries are left alone.
+fn legacy_orphan_paths() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let Some(home) = UserDirs::new().map(|d| d.home_dir().to_path_buf()) else {
+        return out;
+    };
+
+    // Codex stored its config as JSON at `~/.codex/config.json` in
+    // pre-2025 versions. The 2025+ TOML format lives in `config.toml`
+    // alongside it. The JSON file is now never read; if it's a
+    // BRAIN-only leftover, it can go.
+    out.push(home.join(".codex").join("config.json"));
+
+    // ChatGPT Desktop never reads a local `mcp.json` (only remote
+    // HTTPS connectors registered server-side). The file we used to
+    // write is pure landfill.
+    #[cfg(target_os = "macos")]
+    {
+        out.push(
+            home.join("Library")
+                .join("Application Support")
+                .join("ChatGPT")
+                .join("mcp.json"),
+        );
+    }
+    #[cfg(target_os = "windows")]
+    {
+        out.push(
+            home.join("AppData")
+                .join("Roaming")
+                .join("ChatGPT")
+                .join("mcp.json"),
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        out.push(home.join(".config").join("chatgpt").join("mcp.json"));
+    }
+
+    out
+}
+
+/// Removes the BRAIN entry (plus legacy lowercase aliases) from the
+/// Codex TOML config. No-op if the file or section is missing.
+pub fn unregister_codex_toml(config_path: &Path) -> McpResult<()> {
+    use toml_edit::DocumentMut;
+
+    if !config_path.exists() {
+        return Ok(());
+    }
+    let raw = std::fs::read_to_string(config_path)?;
+    let mut doc: DocumentMut = match raw.parse() {
+        Ok(d) => d,
+        Err(_) => return Ok(()), // hand-corrupted file — leave it alone
+    };
+    if let Some(servers) = doc.get_mut("mcp_servers").and_then(|i| i.as_table_mut()) {
+        servers.remove(BRAIN_SERVER_KEY);
+        for legacy in LEGACY_BRAIN_SERVER_KEYS {
+            servers.remove(legacy);
+        }
+    }
+    std::fs::write(config_path, doc.to_string())?;
+    Ok(())
+}
+
 /// Removes only the Brain entry from a client's config; other entries stay.
 pub fn unregister_from_client(config_path: &Path) -> McpResult<()> {
     if !config_path.exists() {
@@ -611,6 +824,181 @@ mod tests {
             args: vec!["mcp".into()],
             env: serde_json::Map::new(),
         }
+    }
+
+    fn brain_entry_for(vault: &Path) -> McpServerEntry {
+        let mut env = serde_json::Map::new();
+        env.insert(
+            "BRAIN_VAULT_PATH".to_string(),
+            serde_json::Value::String(normalise_path(&vault.to_string_lossy())),
+        );
+        McpServerEntry {
+            command: "brain".into(),
+            args: vec!["mcp".into()],
+            env,
+        }
+    }
+
+    #[test]
+    fn register_codex_writes_toml_with_mcp_servers_brain_section() {
+        // Codex (since the OpenAI CLI moved to TOML in 2025) reads
+        // `~/.codex/config.toml` and looks for `[mcp_servers.<name>]`
+        // sections. Writing JSON to `config.json` (the old behaviour)
+        // means Codex's `/mcp` UI never sees the entry. The fix must
+        // produce parseable TOML.
+        let tmp = TempDir::new().unwrap();
+        let config = tmp.path().join("config.toml");
+        register_codex_toml(&config, &brain_entry_for(tmp.path())).unwrap();
+        let raw = std::fs::read_to_string(&config).unwrap();
+        // Section header must use the snake_case `mcp_servers`, not the
+        // camelCase Claude variant. The server key is uppercase BRAIN to
+        // match BRAIN_SERVER_KEY.
+        assert!(
+            raw.contains("[mcp_servers.BRAIN]"),
+            "expected [mcp_servers.BRAIN] section, got:\n{raw}"
+        );
+        assert!(raw.contains("command ="), "expected command key, got:\n{raw}");
+        assert!(raw.contains("args ="), "expected args key, got:\n{raw}");
+        // The env block lives in a sub-table per Codex's TOML schema.
+        assert!(
+            raw.contains("[mcp_servers.BRAIN.env]"),
+            "expected [mcp_servers.BRAIN.env] sub-table, got:\n{raw}"
+        );
+        assert!(
+            raw.contains("BRAIN_VAULT_PATH"),
+            "vault path env var must be present, got:\n{raw}"
+        );
+    }
+
+    #[test]
+    fn register_codex_preserves_other_mcp_servers_already_configured() {
+        // Idempotent rewrite must keep the user's existing Codex config
+        // intact. We use `toml_edit` to modify just our section.
+        let tmp = TempDir::new().unwrap();
+        let config = tmp.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "[mcp_servers.github]\ncommand = \"gh-mcp\"\nargs = []\n\n[mcp_servers.github.env]\nGH_TOKEN = \"secret\"\n",
+        )
+        .unwrap();
+        register_codex_toml(&config, &brain_entry_for(tmp.path())).unwrap();
+        let raw = std::fs::read_to_string(&config).unwrap();
+        assert!(raw.contains("[mcp_servers.github]"), "github entry lost");
+        assert!(raw.contains("gh-mcp"), "github command lost");
+        assert!(raw.contains("GH_TOKEN"), "github env lost");
+        assert!(raw.contains("[mcp_servers.BRAIN]"), "brain entry not added");
+    }
+
+    #[test]
+    fn register_codex_drops_legacy_lowercase_brain_section_on_upgrade() {
+        // Mirrors the JSON path's behaviour: if a legacy `brain` (lowercase)
+        // entry is present from a pre-0.2.0 install, purge it so the user
+        // doesn't see two duplicate Codex MCP servers.
+        let tmp = TempDir::new().unwrap();
+        let config = tmp.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "[mcp_servers.brain]\ncommand = \"old-brain\"\nargs = []\n",
+        )
+        .unwrap();
+        register_codex_toml(&config, &brain_entry_for(tmp.path())).unwrap();
+        let raw = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            !raw.contains("[mcp_servers.brain]"),
+            "legacy lowercase section must be removed, got:\n{raw}"
+        );
+        assert!(raw.contains("[mcp_servers.BRAIN]"));
+    }
+
+    #[test]
+    fn cleanup_legacy_path_deletes_file_when_it_only_contains_brain_entry() {
+        // When pre-0.2.2 BRAIN wrote a JSON `mcpServers.BRAIN` block to
+        // a path that the target client doesn't actually read (orphan
+        // ChatGPT mcp.json, legacy Codex config.json), we'd like to
+        // clean it up on first post-upgrade run so the user doesn't
+        // have to manually wipe the disk. The cleanup must only fire
+        // when the file is provably 100% ours — i.e. its `mcpServers`
+        // map contains nothing but `BRAIN` plus any legacy aliases.
+        let tmp = TempDir::new().unwrap();
+        let orphan = tmp.path().join("mcp.json");
+        std::fs::write(
+            &orphan,
+            r#"{"mcpServers":{"BRAIN":{"command":"x","args":[],"env":{}}}}"#,
+        )
+        .unwrap();
+        cleanup_orphan_json_if_brain_only(&orphan).unwrap();
+        assert!(!orphan.exists(), "BRAIN-only orphan should have been deleted");
+    }
+
+    #[test]
+    fn cleanup_legacy_path_also_removes_files_that_only_have_legacy_lowercase_brain() {
+        let tmp = TempDir::new().unwrap();
+        let orphan = tmp.path().join("config.json");
+        std::fs::write(
+            &orphan,
+            r#"{"mcpServers":{"brain":{"command":"old","args":[],"env":{}}}}"#,
+        )
+        .unwrap();
+        cleanup_orphan_json_if_brain_only(&orphan).unwrap();
+        assert!(!orphan.exists());
+    }
+
+    #[test]
+    fn cleanup_legacy_path_does_not_touch_files_with_user_owned_entries() {
+        // Defensive: if a real user (or a future update of the target
+        // client) put OTHER entries in the file, leaving it alone is
+        // strictly the right thing — even if our entry happens to
+        // sit alongside them. We must never delete user-owned data.
+        let tmp = TempDir::new().unwrap();
+        let mixed = tmp.path().join("mcp.json");
+        let raw = r#"{"mcpServers":{"BRAIN":{"command":"x","args":[],"env":{}},"github":{"command":"gh-mcp","args":[],"env":{}}}}"#;
+        std::fs::write(&mixed, raw).unwrap();
+        cleanup_orphan_json_if_brain_only(&mixed).unwrap();
+        assert!(mixed.exists(), "file with non-BRAIN entries must be preserved");
+        let after = std::fs::read_to_string(&mixed).unwrap();
+        assert_eq!(
+            after, raw,
+            "file content must be byte-identical when there are foreign entries"
+        );
+    }
+
+    #[test]
+    fn cleanup_legacy_path_silently_succeeds_when_file_does_not_exist() {
+        // First-time installs never had the orphan files — cleanup is
+        // wired into the register path, so it must be a no-op when
+        // there's nothing to delete.
+        let tmp = TempDir::new().unwrap();
+        let nope = tmp.path().join("does-not-exist.json");
+        cleanup_orphan_json_if_brain_only(&nope).unwrap();
+    }
+
+    #[test]
+    fn cleanup_legacy_path_does_not_delete_files_that_arent_valid_json() {
+        // Defensive: if the file is hand-edited to non-JSON we have no
+        // way to tell if it's ours, so we must not delete it.
+        let tmp = TempDir::new().unwrap();
+        let weird = tmp.path().join("config.json");
+        std::fs::write(&weird, "not json").unwrap();
+        cleanup_orphan_json_if_brain_only(&weird).unwrap();
+        assert!(weird.exists());
+    }
+
+    #[test]
+    fn unregister_codex_removes_brain_only_and_leaves_other_servers() {
+        let tmp = TempDir::new().unwrap();
+        let config = tmp.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "[mcp_servers.BRAIN]\ncommand = \"brain\"\nargs = [\"mcp\"]\n\n[mcp_servers.github]\ncommand = \"gh-mcp\"\nargs = []\n",
+        )
+        .unwrap();
+        unregister_codex_toml(&config).unwrap();
+        let raw = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            !raw.contains("[mcp_servers.BRAIN]"),
+            "BRAIN entry must be removed, got:\n{raw}"
+        );
+        assert!(raw.contains("[mcp_servers.github]"), "github entry must remain");
     }
 
     #[test]

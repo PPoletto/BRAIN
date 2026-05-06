@@ -100,7 +100,6 @@ export function Completion() {
           <SubReport label="Claude Desktop (App)" status={report.claude_desktop} />
           <SubReport label="Codex" status={report.codex} />
           <SubReport label="Continue.dev" status={report.continue_dev} />
-          <SubReport label="ChatGPT Desktop" status={report.chatgpt_desktop} />
           {report.claude_desktop?.kind === "Registered" && (
             <div className="mt-3 rounded-md border border-amber-900 bg-amber-950/50 p-2 text-xs text-amber-200">
               <strong>For Claude Desktop:</strong> just registering BRAIN isn't

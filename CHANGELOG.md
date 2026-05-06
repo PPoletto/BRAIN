@@ -6,6 +6,71 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.3] — 2026-05-06
+
+### Fixed
+
+- MCP subprocess no longer dies silently when a tool handler panics —
+  the dispatch loop catches unwinds and converts them into a JSON-RPC
+  `-32603` "Internal error" response. Claude Desktop / Claude Code stay
+  connected, the LLM gets a structured error it can react to, and the
+  user no longer has to restart the client to recover the BRAIN
+  connection. Cause of the recurring "Server transport closed
+  unexpectedly" entries in `mcp-server-brain.log`.
+- **Codex registration**: file path moved from `~/.codex/config.json`
+  (legacy) to `~/.codex/config.toml`, and the format is now valid TOML
+  with `[mcp_servers.BRAIN]` + `[mcp_servers.BRAIN.env]` sub-tables.
+  Codex CLI's `/mcp` command now actually finds BRAIN; pre-0.2.2
+  installs were writing to a path Codex never reads. Cross-platform:
+  same path on macOS, Linux and Windows; `CODEX_HOME` env override is
+  respected. Existing entries in `~/.codex/config.toml` are preserved
+  via `toml_edit` (round-trip-safe) so the user's other Codex config
+  isn't disturbed.
+
+### Added
+
+- Stderr-only logging for the `brain mcp` subprocess
+  (`logging::init_for_mcp`). Tracing output goes to stderr exclusively
+  so the stdout JSON-RPC channel stays uncorrupted; Claude Desktop
+  captures stderr into `mcp-server-<name>.log`, so panics, warnings and
+  vault-disconnect notices are now visible during diagnosis instead of
+  being dropped on the floor. Cross-platform: relies only on
+  `std::io::stderr`, which behaves identically on macOS, Linux and
+  Windows.
+
+### Removed
+
+- **ChatGPT Desktop auto-registration**. ChatGPT does support MCP
+  servers (Settings → Apps & Connectors → Advanced → Developer Mode),
+  but the connect originates from OpenAI's backend, so the URL must
+  be public HTTPS — localhost is unreachable. Registration is UI-only
+  with no config file we could write. Pre-0.2.2 BRAIN was writing
+  `mcp.json` files at paths ChatGPT never reads, so the "Registered"
+  status was misleading. Settings and onboarding now spell out the
+  manual tunnel-based workaround (Cloudflare Tunnel / ngrok) plus its
+  C-04 trade-off, instead of pretending ChatGPT is auto-supported.
+
+### Documentation
+
+- README now explains the macOS Sequoia 15+ Gatekeeper situation: BRAIN
+  is not yet Apple-Developer-ID-signed, so first launch needs a one-off
+  `xattr -cr /Applications/BRAIN.app` to clear the quarantine flag. The
+  Code-signing section spells out the proper Developer ID + notarytool
+  roadmap (the GitHub Actions secrets are already wired up, just
+  commented out until the cert is acquired).
+
+### Cleanup
+
+- On first post-upgrade mount, BRAIN deletes the orphan files older
+  versions wrote to paths the target clients don't actually read:
+  `~/.codex/config.json` and the per-OS ChatGPT `mcp.json`
+  (`%APPDATA%\ChatGPT\mcp.json` on Windows,
+  `~/Library/Application Support/ChatGPT/mcp.json` on macOS,
+  `~/.config/chatgpt/mcp.json` on Linux). Conservative: only files
+  whose root contains exactly one `mcpServers` map with no entries
+  other than BRAIN's canonical and legacy keys are removed. Anything
+  with foreign entries, hand-edits, or non-JSON content is left alone.
+
 ## [0.2.1] — 2026-05-05
 
 ### Fixed

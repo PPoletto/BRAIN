@@ -1,9 +1,9 @@
 //! Minimal MCP-compatible JSON-RPC server over stdio.
 //!
-//! Speaks the subset of MCP that Claude Code, Codex and ChatGPT Desktop
-//! actually invoke during a session: `initialize`, `tools/list`,
-//! `tools/call`. Each line on stdin is one JSON-RPC envelope; responses are
-//! one line per request on stdout.
+//! Speaks the subset of MCP that Claude Code, Claude Desktop, Codex and
+//! Continue.dev actually invoke during a session: `initialize`,
+//! `tools/list`, `tools/call`. Each line on stdin is one JSON-RPC
+//! envelope; responses are one line per request on stdout.
 //!
 //! The server runs in the `brain mcp` subprocess. The vault path is
 //! provided via the `BRAIN_VAULT_PATH` environment variable so a single
@@ -90,7 +90,24 @@ pub fn run_stdio() -> std::io::Result<()> {
             continue;
         }
         let response_line = match serde_json::from_str::<RpcRequest>(&line) {
-            Ok(req) => handle_request(&req, vault_path.as_deref(), db.as_ref()),
+            Ok(req) => {
+                // Wrap dispatch so a panic anywhere in `handle_request` (or
+                // deeper in the wiki/db/git plumbing it calls) becomes a
+                // JSON-RPC error frame instead of taking the subprocess
+                // down. The closure captures references only; AssertUnwindSafe
+                // documents that we accept any state inconsistency the
+                // panicking code may have left behind — for stdio servers
+                // there's nothing meaningful for us to "recover" anyway.
+                let id_for_panic = req.id.clone().unwrap_or(Value::Null);
+                let method_for_log = req.method.clone();
+                panic_safe_dispatch(
+                    &id_for_panic,
+                    &method_for_log,
+                    std::panic::AssertUnwindSafe(|| {
+                        handle_request(&req, vault_path.as_deref(), db.as_ref())
+                    }),
+                )
+            }
             Err(err) => {
                 // Per JSON-RPC 2.0: parse-errors must reply with id=null
                 // ONLY if the message was a request. We can't tell from
@@ -221,6 +238,49 @@ fn error_response(id: &Value, code: i64, message: &str, data: Option<Value>) -> 
         }),
     })
     .unwrap_or_default()
+}
+
+/// Runs a request handler and converts any panic into a JSON-RPC 2.0
+/// "Internal error" (-32603) response instead of letting the panic
+/// propagate. Without this wrapper a single buggy tool call could exit
+/// the whole `brain mcp` subprocess; Claude Desktop then logs
+/// "Server transport closed unexpectedly" and the user has to restart
+/// the client to recover. With it, the connection survives and the
+/// model gets a structured error it can present to the user.
+fn panic_safe_dispatch<F>(id: &Value, method: &str, f: F) -> String
+where
+    F: FnOnce() -> String + std::panic::UnwindSafe,
+{
+    match std::panic::catch_unwind(f) {
+        Ok(s) => s,
+        Err(payload) => {
+            let msg = panic_message(payload.as_ref());
+            tracing::error!(method = %method, panic_msg = %msg, "MCP handler panicked — converting to JSON-RPC error");
+            error_response(
+                id,
+                -32603,
+                &format!("internal error: handler panicked: {msg}"),
+                None,
+            )
+        }
+    }
+}
+
+/// Best-effort extraction of a human-readable message from an unwound
+/// panic payload. The standard library models `panic!` payloads as
+/// `Box<dyn Any + Send>` so we have to downcast; in practice they are
+/// always either `&'static str` (from `panic!("literal")`) or `String`
+/// (from `panic!("{}", expr)`). Anything else falls back to a generic
+/// label so the JSON-RPC error message stays present even for exotic
+/// panics from third-party code.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "panic with non-string payload".to_string()
+    }
 }
 
 fn tool_descriptors() -> Vec<Value> {
@@ -716,6 +776,45 @@ mod tests {
             err.starts_with("BRAIN_VAULT_DISCONNECTED:"),
             "expected structured prefix, got: {err}"
         );
+    }
+
+    #[test]
+    fn panic_safe_dispatch_returns_jsonrpc_error_when_handler_panics() {
+        // Regression: a panic deep inside a tool handler used to take down
+        // the whole MCP subprocess, so Claude Desktop saw "Server transport
+        // closed unexpectedly" and the user had to restart Claude. With a
+        // panic catcher in place, the panic must be converted to a clean
+        // JSON-RPC error response so the connection stays alive and the
+        // calling LLM gets a chance to react.
+        let id = json!(42);
+        let resp_str = panic_safe_dispatch(&id, "test/method", || {
+            panic!("simulated handler panic");
+        });
+        let parsed: Value =
+            serde_json::from_str(&resp_str).expect("response must be valid JSON-RPC");
+        assert_eq!(parsed["jsonrpc"], "2.0");
+        assert_eq!(parsed["id"], 42);
+        // -32603 is JSON-RPC 2.0's "Internal error" code; using the
+        // standard one means clients can render it with their generic
+        // error UI without learning a Brain-specific code.
+        assert_eq!(parsed["error"]["code"], -32603);
+        assert!(
+            parsed["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("simulated handler panic"),
+            "the original panic message must surface to the client, got: {resp_str}"
+        );
+    }
+
+    #[test]
+    fn panic_safe_dispatch_passes_through_normal_string_results_unchanged() {
+        // Sanity: the wrapper must not alter happy-path payloads. The
+        // existing dispatch loop hands off pre-serialized strings; the
+        // wrapper relays them verbatim when no panic occurs.
+        let id = json!("abc");
+        let resp = panic_safe_dispatch(&id, "test/method", || "{\"jsonrpc\":\"2.0\"}".to_string());
+        assert_eq!(resp, "{\"jsonrpc\":\"2.0\"}");
     }
 
     #[test]

@@ -57,7 +57,11 @@ export type RegistrationReport = {
   claude_desktop: ClientStatus | null;
   codex: ClientStatus | null;
   continue_dev: ClientStatus | null;
-  chatgpt_desktop: ClientStatus | null;
+  // ChatGPT Desktop intentionally omitted — its current Windows Store
+  // and macOS clients only support remote HTTPS connectors registered
+  // server-side; there is no local-stdio config file we can write to.
+  // Keeping the row in the UI was misleading because the "Registered"
+  // status meant we wrote a file ChatGPT never reads.
 };
 
 export const commands = {

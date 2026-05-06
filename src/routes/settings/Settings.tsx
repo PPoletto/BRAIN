@@ -366,7 +366,6 @@ function McpTab({
             <RegistrationRow label="Claude Desktop (App)" status={report.claude_desktop} />
             <RegistrationRow label="Codex" status={report.codex} />
             <RegistrationRow label="Continue.dev" status={report.continue_dev} />
-            <RegistrationRow label="ChatGPT Desktop" status={report.chatgpt_desktop} />
           </ul>
         )}
       </Card>
@@ -590,33 +589,33 @@ function MemoryTab({ prompt, copy }: { prompt: string; copy: (s: string) => void
             </p>
           </SetupAccordion>
 
-          <SetupAccordion title="ChatGPT Desktop">
-            <ol className="ml-4 list-decimal space-y-1">
-              <li>
-                Easiest: <strong>Settings → Personalization → Custom
-                Instructions</strong>. Paste the snippet into the
-                "How would you like ChatGPT to respond" field. This
-                applies to every conversation.
-              </li>
-              <li>
-                Or, if you'd rather scope it: create a <strong>Custom
-                GPT</strong> in the desktop app, paste the snippet into
-                its instructions, and only use that GPT for memory-style
-                requests.
-              </li>
-              <li>
-                ChatGPT Desktop's MCP support is limited — verify under
-                <strong> Settings → Developer / Connectors</strong> that
-                BRAIN appears. If not, the snippet won't help; check{" "}
-                <em>Settings → MCP & Clients</em> in BRAIN to re-register.
-              </li>
-            </ol>
-            <p className="mt-2 text-xs text-neutral-500">
-              ChatGPT's own "Memory" feature is enabled by default — you
-              may want to disable it under{" "}
-              <strong>Settings → Personalization → Memory</strong> when
-              you switch to BRAIN-backed memory, so the two don't
-              compete.
+          <SetupAccordion title="ChatGPT Desktop — manual only, with caveats">
+            <p>
+              ChatGPT does support MCP servers (under{" "}
+              <strong>Settings → Apps & Connectors → Advanced →
+              Developer Mode</strong>), but the connection originates
+              from OpenAI's backend, not the local app. So the URL has
+              to be reachable from the public internet — a localhost
+              endpoint like BRAIN's HTTP server isn't acceptable, and
+              there's no config file we could auto-write into either
+              (registration is UI-only).
+            </p>
+            <p className="mt-2">
+              <strong>If you really want BRAIN in ChatGPT:</strong> run a
+              Cloudflare Tunnel or ngrok pointing at BRAIN's local HTTP
+              MCP port (default <code className="font-mono">7137</code>),
+              then paste the public <code className="font-mono">https://…/mcp</code>{" "}
+              URL plus the bearer token (from{" "}
+              <code className="font-mono">00_meta/.mcp.json</code>) into
+              the Developer Mode form.
+            </p>
+            <p className="mt-2 text-xs text-amber-300/90">
+              <strong>Trade-off:</strong> tunnel traffic egresses through
+              a third party, which is a real privacy regression vs. the
+              other supported clients (Claude Desktop, Codex,
+              Continue.dev — all dial localhost directly). Make sure
+              you understand what your ChatGPT queries would expose
+              before going down this path.
             </p>
           </SetupAccordion>
 

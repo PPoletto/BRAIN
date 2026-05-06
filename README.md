@@ -236,6 +236,25 @@ installer:
 - **macOS:**   `BRAIN_<version>_universal.dmg`
 - **Linux:**   `brain_<version>_amd64.AppImage` or `.deb`
 
+#### macOS first-run (Sequoia 15+)
+
+BRAIN is not yet signed with an Apple Developer ID, so macOS Gatekeeper
+refuses to open it on first launch with a "cannot verify [App] is free
+of malware" message. Apple removed the right-click → Open override in
+Sequoia 15, so the workaround is one Terminal command after dragging
+`BRAIN.app` to `/Applications`:
+
+```bash
+xattr -cr /Applications/BRAIN.app
+```
+
+This strips the `com.apple.quarantine` attribute that macOS stamps on
+anything downloaded from the internet. After that, BRAIN opens
+normally and stays open across reboots. (The proper fix is a notarised
+Apple Developer ID build — see
+[Code-signing for OS-level trust](#code-signing-for-os-level-trust)
+below for the roadmap.)
+
 ### First run (onboarding)
 
 The tray icon appears, the window opens to the wizard:
@@ -327,14 +346,28 @@ the host:
 | Client | Where it gets written |
 |--------|----------------------|
 | Claude Code (CLI) | `~/.claude.json` (`mcpServers.BRAIN`) |
-| Claude Desktop    | `%APPDATA%\Claude\claude_desktop_config.json` (Windows), `~/Library/Application Support/Claude/...` (macOS), `~/.config/Claude/...` (Linux) |
-| Codex             | `~/.codex/config.toml` / `~/.codex/mcp.json` |
+| Claude Desktop    | `%APPDATA%\Claude\claude_desktop_config.json` (Windows), `~/Library/Application Support/Claude/...` (macOS), `~/.config/Claude/...` (Linux). Plus the Microsoft Store sandbox path on Windows when that variant is installed. |
+| Codex             | `~/.codex/config.toml` (TOML, `[mcp_servers.BRAIN]` section). Same path on macOS, Linux and Windows. `CODEX_HOME` env var override is respected. |
 | Continue.dev      | `~/.continue/config.json` |
-| ChatGPT Desktop   | The MS Store sandbox path on Windows, `~/Library/...` on macOS |
 
 After registration, **restart your LLM client** (Claude Desktop reads
 config only at process start). The MCP server name is `BRAIN`. Verify
-with `claude mcp list` for Claude Code.
+with `claude mcp list` for Claude Code, with `/mcp` inside Codex.
+
+**ChatGPT Desktop: not auto-registered.** ChatGPT does speak MCP (under
+Settings → Apps & Connectors → Advanced → Developer Mode), but the
+connect originates from OpenAI's backend, so the URL must be public
+HTTPS — `localhost` is unreachable. Registration is also UI-only
+(no config file to write into), so auto-registration like the other
+clients isn't possible.
+
+If you really want BRAIN in ChatGPT, expose its HTTP MCP transport
+(port 7137 by default, bearer-token in `00_meta/.mcp.json`) through a
+Cloudflare Tunnel or ngrok and paste the public `https://…/mcp` URL
+plus token into the Developer Mode form. Caveat: tunnel traffic
+egresses through a third party, which is a real privacy regression
+vs. Claude Desktop / Codex / Continue.dev (all dial localhost
+directly). The Settings tab in BRAIN spells this out.
 
 ### Tools exposed
 
@@ -515,19 +548,25 @@ minisign -G -p brain.pub -s brain.key
 
 ### Code-signing for OS-level trust
 
-Beyond minisign (which protects the *updater*), Windows SmartScreen and
-macOS Gatekeeper want bundles signed with an OS-trusted certificate:
+Beyond minisign (which protects the *updater*), each OS has its own
+trust system:
 
-- **Windows**: EV or standard code-signing certificate (DigiCert,
-  Sectigo, …). Configure under `bundle.windows.certificateThumbprint`.
-- **macOS**: Apple Developer ID certificate, set
-  `APPLE_CERTIFICATE` + `APPLE_SIGNING_IDENTITY` env vars. Notarisation
-  via `notarytool`.
+- **Windows**: SmartScreen shows "Unknown publisher" with a "Run anyway"
+  link until the binary is signed with an EV or standard code-signing
+  certificate (DigiCert, Sectigo, …). Configure under
+  `bundle.windows.certificateThumbprint`. Functionally still launches.
+- **macOS**: Gatekeeper *blocks* unsigned bundles outright on Sequoia
+  15+ — the "Apple cannot verify…" prompt no longer has an override
+  button. End users currently need the `xattr -cr` workaround above.
+  Proper fix is an Apple Developer ID certificate ($99/year via the
+  Apple Developer Program) plus notarisation via `notarytool`. The
+  release workflow already wires up the relevant env vars
+  (`APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`,
+  `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`,
+  `APPLE_TEAM_ID`) — they're commented out and ready to activate as
+  soon as the Developer ID is acquired.
 - **Linux**: not strictly required, but signing the AppImage with `gpg`
   is good practice.
-
-Without these, users see "Unknown publisher" warnings; functionally
-nothing breaks.
 
 ---
 
@@ -546,7 +585,8 @@ What's already shipped:
 - ✅ Dataview-style structured query DSL
 - ✅ MCP server (stdio + HTTP) with bearer-token auth and 8 tools
 - ✅ Auto-registration in Claude Code, Claude Desktop, Codex,
-  Continue.dev, ChatGPT Desktop
+  Continue.dev (ChatGPT Desktop intentionally excluded — see
+  "Where the entry lives" above)
 - ✅ Tray state machine with 2 s busy-stabilisation
 - ✅ Auto-update with minisign verification
 - ✅ Launch-at-login on all three OSes
