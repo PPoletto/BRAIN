@@ -6,6 +6,37 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.7] — 2026-05-06
+
+### Fixed
+
+- Force-directed graph layout no longer collapses into a "comic
+  row" of nodes. v0.2.6's pink-screen mitigations had set
+  `randomize: false` and `quality: "draft"` on the fcose layout,
+  which combined to leave nodes starting at the same coordinates
+  and not getting enough force-iterations to spread apart. With
+  the v0.2.6 position-persistence already in place, fcose only
+  runs once per vault before the cached preset takes over, so
+  paying the full GPU cost once is acceptable. Both knobs are
+  back at the library defaults (`randomize: true`,
+  `quality: "default"`); the still-active mitigations
+  (200 ms ResizeObserver debounce + auto-recover plan-B remount
+  on NaN node positions) handle the GPU stress without degrading
+  layout quality.
+
+### Changed
+
+- **Mini-map is now opt-in.** v0.2.6 showed it permanently in the
+  bottom-right corner where it crowded the StatusBar's version
+  label and added GPU cost even when the user wasn't panning.
+  New "Mini-map" toggle in the graph toolbar — default off,
+  shown when the user wants pan-by-thumbnail. When off, the
+  navigator extension is not instantiated at all (zero
+  background cost).
+- Mini-map repositioned to bottom-LEFT and shrunk from 128×176 px
+  to 96×128 px so even when shown it reads as a thumbnail rather
+  than a competing pane, and never overlaps the version label.
+
 ## [0.2.6] — 2026-05-06
 
 ### Fixed

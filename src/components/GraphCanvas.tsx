@@ -54,6 +54,14 @@ type Props = {
   /// node ids so the user can isolate a cluster without leaving the
   /// graph view. Passing `null` returns to the full-graph fit.
   focusedSubset?: string[] | null;
+  /// Controls the cytoscape-navigator overlay. Default `false` so
+  /// users who don't need pan-by-thumbnail aren't shown a permanent
+  /// thumbnail eating screen real-estate. Tier3 wires this to a
+  /// toolbar toggle. Toggling causes a Cytoscape remount — the
+  /// navigator extension is tied to the cy lifecycle, so flipping
+  /// it on/off without a remount would leave a half-attached
+  /// thumbnail listener. The remount is cheap thanks to preset.
+  showMinimap?: boolean;
 };
 
 const TYPE_COLORS: Record<string, string> = {
@@ -62,13 +70,6 @@ const TYPE_COLORS: Record<string, string> = {
   source: "#34d399",
   topic: "#f59e0b",
 };
-
-// Threshold above which we drop fcose to "draft" quality. Default
-// quality runs many more force-directed iterations and can pin the
-// GPU on macOS WKWebView long enough to trigger the magenta backing-
-// store fallback. Draft is visually almost identical for our cluster
-// sizes and roughly half the iterations.
-const FCOSE_DRAFT_THRESHOLD = 100;
 
 // Debounce for the ResizeObserver. Window resizes can fire dozens of
 // events per second on macOS during a drag — re-running cy.fit() each
@@ -86,6 +87,7 @@ export function GraphCanvas({
   onPositionsChange,
   onClustersChange,
   focusedSubset = null,
+  showMinimap = false,
 }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   // Separate container for the cytoscape-navigator overlay (mini-map).
@@ -407,15 +409,13 @@ export function GraphCanvas({
       ]);
     });
 
-    // Mini-map overlay. cytoscape-navigator wants its own DOM node
-    // and renders an SVG thumbnail of the full graph plus a draggable
-    // viewport rectangle. We keep `viewLiveFramerate: 0` so the
-    // overlay redraws only when the viewport stops moving — animating
-    // the rectangle at 60fps was previously a second source of GPU
-    // pressure on the macOS WKWebView pipeline that triggered the
-    // magenta backing-store fallback.
+    // Mini-map overlay — opt-in via `showMinimap`. When off we
+    // skip both the container render (see JSX below) AND the
+    // navigator instantiation, so users who don't use the overlay
+    // don't pay any GPU/event-binding cost. `viewLiveFramerate: 0`
+    // keeps the redraw cheap when it is shown.
     let nav: { destroy: () => void } | null = null;
-    if (navRef.current) {
+    if (showMinimap && navRef.current) {
       const cyWithNavigator = cy as cytoscape.Core & {
         navigator: (opts: Record<string, unknown>) => {
           destroy: () => void;
@@ -455,7 +455,7 @@ export function GraphCanvas({
       cy.destroy();
       cyRef.current = null;
     };
-  }, [nodes, edges, onNodeClick, renderKey, layoutMode, positionMap]);
+  }, [nodes, edges, onNodeClick, renderKey, layoutMode, positionMap, showMinimap]);
 
   // Focus subset: when the parent (cluster sidebar click) hands us
   // a list of node ids, fit the viewport to just those nodes. Null
@@ -479,16 +479,21 @@ export function GraphCanvas({
     <div className="relative size-full">
       <div ref={ref} className="size-full bg-neutral-950" />
       {/*
-        Mini-map overlay. Fixed size, bottom-right, with a translucent
-        background so it reads as a thumbnail without competing with
-        the main canvas. cytoscape-navigator owns the inner content
-        (its own SVG with the viewport rectangle).
+        Mini-map overlay. Bottom-LEFT so it doesn't crowd the
+        version label in the StatusBar (the bottom-right corner of
+        the window). Only rendered when showMinimap is true — the
+        navigator extension is also only instantiated then, so users
+        with the toggle off pay zero GPU/event cost. Sized smaller
+        than v0.2.6 (96×128 px) so even when shown the overlay
+        feels like a thumbnail rather than a competing pane.
       */}
-      <div
-        ref={navRef}
-        className="pointer-events-auto absolute bottom-2 right-2 z-20 h-32 w-44 overflow-hidden rounded-md border border-neutral-700 bg-neutral-950/80 shadow-lg"
-        aria-label="Graph mini-map"
-      />
+      {showMinimap && (
+        <div
+          ref={navRef}
+          className="pointer-events-auto absolute bottom-2 left-2 z-20 h-24 w-32 overflow-hidden rounded-md border border-neutral-700 bg-neutral-950/80 shadow-lg"
+          aria-label="Graph mini-map"
+        />
+      )}
       {hovered && (
         <div
           // Pointer-events: none keeps the tooltip from intercepting
@@ -591,10 +596,19 @@ function pickLayout(args: {
     } as cytoscape.LayoutOptions;
   }
   // fcose default for connected graphs without saved coordinates.
-  // `randomize: false` keeps the layout deterministic; `quality:
-  // "draft"` past 100 nodes halves the iteration count so the macOS
-  // GPU pipeline doesn't get pinned long enough to drop into Metal's
-  // magenta-debug-fill backstop.
+  // `randomize: true` (the library default) gives nodes random
+  // starting positions so the force iterations have something to
+  // push apart from — without it, every node starts at (0,0) and
+  // the result is a degenerate row, especially with limited
+  // iterations. `quality: "default"` runs the full iteration
+  // budget; with the v0.2.6 position-persistence in place, fcose
+  // only runs *once* per vault before the cached preset takes
+  // over, so paying the full GPU cost once is fine. The earlier
+  // pink-screen mitigations on this layout were a correct gut-
+  // reaction but the wrong knob — the still-active mitigations
+  // (200 ms ResizeObserver debounce + the auto-recover plan-B
+  // remount on NaN positions) handle the GPU stress without
+  // degrading the layout quality.
   return {
     name: "fcose",
     animate: false,
@@ -604,9 +618,8 @@ function pickLayout(args: {
     idealEdgeLength: 70,
     edgeElasticity: 0.6,
     gravity: 0.3,
-    randomize: false,
-    quality:
-      args.nodeCount > FCOSE_DRAFT_THRESHOLD ? "draft" : "default",
+    randomize: true,
+    quality: "default",
     nodeSeparation: 80,
   } as unknown as cytoscape.LayoutOptions;
 }

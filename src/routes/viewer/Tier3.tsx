@@ -35,6 +35,13 @@ export function Tier3() {
   const [layoutMode, setLayoutMode] =
     useState<"force" | "hierarchical">("force");
 
+  // Mini-map toggle. Off by default — the overlay was permanently
+  // visible in v0.2.6 which crowded the bottom-right of the window
+  // (where the version label lives) and added GPU cost even when
+  // the user wasn't panning. Now opt-in via the toolbar; persists
+  // for the session only.
+  const [showMinimap, setShowMinimap] = useState(false);
+
   // Persistent layout. `null` = haven't loaded yet; `[]` = loaded,
   // empty (first time the user opens the graph). Both behave the
   // same way at render time — fcose runs and saves its output.
@@ -271,6 +278,18 @@ export function Tier3() {
           >
             Re-layout
           </Button>
+          <Button
+            size="sm"
+            variant={showMinimap ? "primary" : "ghost"}
+            onClick={() => setShowMinimap((v) => !v)}
+            title={
+              showMinimap
+                ? "Hide the mini-map overlay"
+                : "Show a thumbnail overview for panning large graphs"
+            }
+          >
+            Mini-map
+          </Button>
         </div>
         {graph && (
           <span className="ml-auto text-xs text-neutral-500">
@@ -361,6 +380,7 @@ export function Tier3() {
                       ?.nodeIds ?? null)
                   : null
               }
+              showMinimap={showMinimap}
             />
           </>
         )}
