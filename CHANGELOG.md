@@ -10,19 +10,25 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- Mini-map overlay no longer hijacks the viewport. The
-  `cytoscape-navigator` package's own stylesheet hard-codes
-  `position: fixed; bottom: 0; right: 0; width: 400px;
-  height: 400px; background: white;` which broke out of the
-  GraphCanvas container, floated a 400×400 white block over the
-  StatusBar (covering the version label), and ignored the
-  Tailwind sizing on our own container element. We override the
-  `.cytoscape-navigator` class in `globals.css` with `!important`
-  rules so the overlay sits inside its parent at 128×96 px,
-  bottom-LEFT, with BRAIN's dark theme — the way it was supposed
-  to look in v0.2.7. The viewport rectangle changes from the
-  package's pale baby-blue to BRAIN's accent green at 35 %
-  opacity so it reads on a dark thumbnail.
+- Mini-map overlay no longer hijacks the viewport. Previous
+  attempt (the v0.2.7 release) tried to override the package's
+  `.cytoscape-navigator` CSS with `!important`, which masked the
+  symptom but missed the actual cause: `cytoscape-navigator`'s
+  `container` option only accepts a string CSS selector
+  (verified in the package source at `cytoscape-navigator.js`
+  line 378). Passing an HTMLElement is silently rejected and
+  the plugin builds its own `<div class="cytoscape-navigator">`
+  attached to `document.body` with the package's hard-coded
+  white 400×400 styling — that was the giant white block the
+  user reported. Fix: give our container element an `id`
+  attribute and pass the matching `#…` string to the navigator
+  plugin so it actually re-uses our element. The container is
+  then styled directly with Tailwind (small dark thumbnail in
+  the GraphCanvas's bottom-LEFT, away from the StatusBar's
+  version label) and the only remaining CSS rule applies to
+  the inner `.cytoscape-navigatorView` viewport rectangle —
+  recoloured from the package's pale baby-blue to BRAIN's
+  accent green so it reads on the dark thumbnail.
 - Bootstrap now auto-mounts an attached BRAIN drive even when
   there's no saved `last_active_vault_path`. Pre-0.2.8 the
   startup flow only tried the persisted path; if that was None

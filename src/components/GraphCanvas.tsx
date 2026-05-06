@@ -78,6 +78,14 @@ const TYPE_COLORS: Record<string, string> = {
 // fully complete before we kick another resize.
 const RESIZE_DEBOUNCE_MS = 200;
 
+// DOM id for the mini-map container. cytoscape-navigator only accepts
+// CSS-selector *strings* for its `container` option (HTMLElement is
+// silently rejected and the plugin builds its own body-attached div
+// with the package's default white styling). The container element in
+// the JSX carries this id so the plugin's `document.getElementById`
+// lookup actually returns our element.
+const MINIMAP_CONTAINER_ID = "cy-navigator-container";
+
 export function GraphCanvas({
   nodes,
   edges,
@@ -414,6 +422,17 @@ export function GraphCanvas({
     // navigator instantiation, so users who don't use the overlay
     // don't pay any GPU/event-binding cost. `viewLiveFramerate: 0`
     // keeps the redraw cheap when it is shown.
+    //
+    // Important detail uncovered the hard way: cytoscape-navigator
+    // *only* accepts a string CSS selector for `container` (see
+    // node_modules/cytoscape-navigator/cytoscape-navigator.js
+    // line 378). Passing an HTMLElement gets silently ignored and
+    // the plugin builds its own `<div class="cytoscape-navigator">`
+    // attached to `document.body` with the package's hard-coded
+    // 400×400 white styling — that was the giant white block that
+    // covered the version label in v0.2.7. Passing the matching
+    // `#…` id selector makes the plugin actually use our container,
+    // which we then style directly with Tailwind on the JSX side.
     let nav: { destroy: () => void } | null = null;
     if (showMinimap && navRef.current) {
       const cyWithNavigator = cy as cytoscape.Core & {
@@ -422,12 +441,12 @@ export function GraphCanvas({
         };
       };
       nav = cyWithNavigator.navigator({
-        container: navRef.current,
+        container: `#${MINIMAP_CONTAINER_ID}`,
         viewLiveFramerate: 0,
         thumbnailEventFramerate: 30,
         thumbnailLiveFramerate: false,
         dblClickDelay: 200,
-        removeCustomContainer: false,
+        removeCustomContainer: true,
         rerenderDelay: 100,
       });
     }
@@ -479,20 +498,26 @@ export function GraphCanvas({
     <div className="relative size-full">
       <div ref={ref} className="size-full bg-neutral-950" />
       {/*
-        Mini-map overlay. cytoscape-navigator stamps the class
-        `cytoscape-navigator` onto this container and that class's
-        defaults (position:fixed bottom:0 right:0 400×400 white)
-        would otherwise hijack our positioning. We override the
-        package CSS in `globals.css` (.cytoscape-navigator block)
-        with the BRAIN-themed dark thumbnail at bottom-left. No
-        Tailwind classes here on purpose — the override would
-        conflict with them and the !important rules win anyway.
-        Only rendered when showMinimap is true; the navigator
-        extension is also only instantiated then, so users with
-        the toggle off pay zero GPU/event cost.
+        Mini-map overlay. The id matches the selector we pass to
+        `cy.navigator({ container: '#cy-navigator-container' })`
+        — without that, the plugin would silently ignore our
+        element and float its own white 400×400 div over the
+        whole window (see comment in the create-effect above).
+        We style this container directly with Tailwind: small
+        thumbnail in the bottom-LEFT of the GraphCanvas (away
+        from the StatusBar's version label in the bottom-right),
+        BRAIN-themed dark background, `relative` so the inner
+        `.cytoscape-navigatorView` viewport rectangle and the
+        `.cytoscape-navigatorOverlay` mouse-target overlay
+        position correctly inside it.
       */}
       {showMinimap && (
-        <div ref={navRef} aria-label="Graph mini-map" />
+        <div
+          ref={navRef}
+          id={MINIMAP_CONTAINER_ID}
+          aria-label="Graph mini-map"
+          className="pointer-events-auto absolute bottom-2 left-2 z-20 h-24 w-32 overflow-hidden rounded-md border border-neutral-700 bg-neutral-950/85 shadow-lg"
+        />
       )}
       {hovered && (
         <div
