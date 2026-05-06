@@ -583,7 +583,7 @@ What's already shipped:
 - ✅ Real bge-m3 embeddings via candle (XLM-RoBERTa, CLS-pooled, 1024-d)
 - ✅ Cytoscape graph view with type/tag/recency filters
 - ✅ Dataview-style structured query DSL
-- ✅ MCP server (stdio + HTTP) with bearer-token auth and 8 tools
+- ✅ MCP server (stdio + HTTP) with bearer-token auth and 9 tools
 - ✅ Auto-registration in Claude Code, Claude Desktop, Codex,
   Continue.dev (ChatGPT Desktop intentionally excluded — see
   "Where the entry lives" above)

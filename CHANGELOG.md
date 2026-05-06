@@ -6,6 +6,42 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.4] — 2026-05-06
+
+### Fixed
+
+- `brain_list_pages` no longer times out on large vaults backed by slow
+  storage. When the SQLite index is available the dispatch hits a
+  `SELECT id FROM pages` fastpath (sub-millisecond regardless of disk
+  speed) instead of walking the filesystem; without the index the
+  walker is still used as a fallback and never reads file contents.
+  This is the fix for the user-reported 4-minute timeout on
+  `BRAIN:brain_list_pages`.
+- `brain_write_page`'s lint-failure response now embeds the full
+  `LintError[]` array as JSON next to the human summary (`"page
+  written but lint failed: 13 errors\n[…]"`). Pre-0.2.4 only the
+  count was returned, so the LLM had to probe iteratively to discover
+  *which* links were broken — multiple round-trips for data that's
+  already known server-side. Calling LLMs can now create the missing
+  pages or fix typos in one shot.
+
+### Added
+
+- **`brain_list_pages` filter parameters** (all optional, no-arg
+  behaviour unchanged for backward compat):
+  - `type`: `entities | concepts | sources | topics` — restrict to
+    one bucket
+  - `prefix`: id-prefix substring filter (e.g. `entities/dextra`)
+  - `limit` / `offset`: per-bucket pagination
+  Server-side filtering saves both bandwidth and tokens for the LLM
+  on large vaults.
+- **`brain_page_exists`** — new lightweight existence-check tool.
+  Returns `{id, exists}` for the given page id via a single
+  `Path::is_file()` call. Use this when the LLM only needs yes/no
+  (e.g. before deciding create-vs-update); much cheaper than
+  `brain_get_page`, which loads and parses the entire markdown body.
+  Hardened against empty ids and `..` path-traversal attempts.
+
 ## [0.2.3] — 2026-05-06
 
 ### Changed

@@ -304,6 +304,20 @@ fn tool_descriptors() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "brain_page_exists",
+            "description": "Lightweight existence check: returns {id, exists} for the given page id. Use this when you only need yes/no (e.g. before deciding to create-vs-update) — much cheaper than brain_get_page, which loads and parses the entire markdown body.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "page id, e.g. 'entities/alice'"
+                    }
+                },
+                "required": ["id"]
+            }
+        }),
+        json!({
             "name": "brain_get_context",
             "description": "Return a wiki page plus the pages it links to and pages that link to it (1-hop).",
             "inputSchema": {
@@ -314,8 +328,31 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "brain_list_pages",
-            "description": "List all wiki page ids grouped by type (entities, concepts, sources, topics).",
-            "inputSchema": { "type": "object", "properties": {} }
+            "description": "List wiki page ids grouped by type (entities, concepts, sources, topics). All arguments are optional; with no args the response shape is the legacy four-bucket layout. Use the filters on large vaults to keep responses small and fast: 'type' restricts to a single bucket, 'prefix' matches an id prefix like 'entities/dextra', 'limit' caps each bucket's size, 'offset' enables pagination.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "enum": ["entities", "concepts", "sources", "topics"],
+                        "description": "Restrict to a single bucket; the others are returned empty."
+                    },
+                    "prefix": {
+                        "type": "string",
+                        "description": "Id-prefix substring filter, e.g. 'entities/dextra'."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Maximum entries per bucket (default: no limit)."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Skip the first N entries per bucket (default: 0)."
+                    }
+                }
+            }
         }),
         json!({
             "name": "brain_write_page",
@@ -409,6 +446,35 @@ fn call_tool(
             let page = tree::read_page(vault, id).map_err(|e| e.to_string())?;
             Ok(serde_json::to_string_pretty(&page).unwrap_or_default())
         }
+        "brain_page_exists" => {
+            // Cheap yes/no check the user-feedback called out: an LLM
+            // wanting to know "does entities/foo already exist?" would
+            // otherwise call brain_get_page (which loads + parses the
+            // whole markdown body) just to throw away the result. This
+            // tool is one Path::is_file() — sub-millisecond — so the
+            // create-vs-update decision costs almost nothing.
+            let id = args
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing 'id'".to_string())?;
+            if id.is_empty() {
+                return Err("'id' must not be empty".to_string());
+            }
+            // Same hardening as brain_write_raw_file: defend against
+            // path-traversal smuggled into the id (e.g. `../../etc/passwd`).
+            // Reject before joining onto the wiki dir so the resulting
+            // Path::is_file() check can never escape the vault root.
+            if id.contains("..") {
+                return Err("id may not contain '..'".to_string());
+            }
+            let target = wiki_dir(vault).join(format!("{id}.md"));
+            let exists = target.is_file();
+            Ok(serde_json::to_string(&json!({
+                "id": id,
+                "exists": exists,
+            }))
+            .unwrap_or_default())
+        }
         "brain_get_context" => {
             let id = args.get("id").and_then(Value::as_str).unwrap_or("");
             let page = tree::read_page(vault, id).map_err(|e| e.to_string())?;
@@ -425,10 +491,7 @@ fn call_tool(
             }))
             .unwrap_or_default())
         }
-        "brain_list_pages" => {
-            let t = tree::list_tree(vault).map_err(|e| e.to_string())?;
-            Ok(serde_json::to_string_pretty(&t).unwrap_or_default())
-        }
+        "brain_list_pages" => list_pages_dispatch(&args, vault, db),
         "brain_write_page" => {
             let id = args
                 .get("id")
@@ -459,8 +522,17 @@ fn call_tool(
             // Run lint synchronously so the caller learns about a hard error.
             let report = lint::lint(vault).map_err(|e| e.to_string())?;
             if !report.is_clean() {
+                // Pre-0.2.4 we only surfaced `report.errors.len()` and
+                // discarded the per-error `{path, kind, message}` triples.
+                // The LLM then had to probe the wiki to discover *which*
+                // links were broken. Now we serialise the full LintError
+                // array next to the human-readable count, so a single
+                // round-trip gives the model everything it needs to
+                // create the missing pages or fix typos.
+                let detail = serde_json::to_string(&report.errors)
+                    .unwrap_or_else(|_| "[]".to_string());
                 return Err(format!(
-                    "page written but lint failed: {} errors",
+                    "page written but lint failed: {} errors\n{detail}",
                     report.errors.len()
                 ));
             }
@@ -519,6 +591,173 @@ fn call_tool(
             Ok(serde_json::to_string_pretty(&hits).unwrap_or_default())
         }
         other => Err(format!("unknown tool: {other}")),
+    }
+}
+
+/// `brain_list_pages` dispatch with optional filters and pagination.
+/// Two acceleration strategies:
+///   1. **DB fastpath** (`db: Some`) — `SELECT id FROM pages` against
+///      the SQLite index. Sub-millisecond on any vault size, completely
+///      independent of disk speed. This is the fix for the user-reported
+///      4-minute timeout on slow storage.
+///   2. **Filesystem fallback** — current `tree::list_tree` walk, which
+///      does *not* read file contents. Only used when no DB handle is
+///      available (e.g. an unindexed vault).
+///
+/// Optional arguments (all backward-compatible — no args = same shape
+/// as pre-0.2.4):
+///   - `type`: `"entities" | "concepts" | "sources" | "topics"` —
+///     restrict to one bucket; the others are returned empty.
+///   - `prefix`: id-prefix substring filter, e.g. `"entities/dextra"`.
+///   - `limit`: cap each bucket's result count.
+///   - `offset`: skip the first N results per bucket (after sort).
+fn list_pages_dispatch(
+    args: &Value,
+    vault: &std::path::Path,
+    db: Option<&crate::db::DbHandle>,
+) -> Result<String, String> {
+    const BUCKETS: [&str; 4] = ["entities", "concepts", "sources", "topics"];
+
+    let type_filter = args.get("type").and_then(Value::as_str).map(String::from);
+    let prefix = args
+        .get("prefix")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize);
+    let offset = args
+        .get("offset")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(0);
+
+    if let Some(ref t) = type_filter {
+        if !BUCKETS.contains(&t.as_str()) {
+            return Err(format!(
+                "invalid type '{t}': expected one of entities|concepts|sources|topics"
+            ));
+        }
+    }
+
+    // Collect (bucket, id) pairs from whichever source is fastest.
+    let pairs: Vec<(String, String)> = if let Some(handle) = db {
+        list_page_ids_via_db(handle).map_err(|e| e.to_string())?
+    } else {
+        list_page_ids_via_filesystem(vault).map_err(|e| e.to_string())?
+    };
+
+    // Server-side filtering — saves both bytes on the wire and tokens
+    // for the LLM.
+    let filtered: Vec<(String, String)> = pairs
+        .into_iter()
+        .filter(|(bucket, id)| {
+            if let Some(ref t) = type_filter {
+                if bucket != t {
+                    return false;
+                }
+            }
+            if !prefix.is_empty() && !id.starts_with(&prefix) {
+                return false;
+            }
+            true
+        })
+        .collect();
+
+    // Group into the four canonical buckets and sort each one for
+    // deterministic ordering (filesystem walk order is platform-dep).
+    let mut grouped: std::collections::HashMap<&str, Vec<String>> =
+        BUCKETS.iter().map(|b| (*b, Vec::new())).collect();
+    for (bucket, id) in filtered {
+        if let Some(slot) = grouped.get_mut(bucket.as_str()) {
+            slot.push(id);
+        }
+    }
+    for ids in grouped.values_mut() {
+        ids.sort();
+    }
+
+    // Apply offset+limit per bucket, then assemble the response in the
+    // canonical four-key order so the JSON shape stays stable.
+    let mut out = serde_json::Map::new();
+    for bucket in BUCKETS {
+        let ids = grouped.remove(bucket).unwrap_or_default();
+        let sliced: Vec<Value> = ids
+            .into_iter()
+            .skip(offset)
+            .take(limit.unwrap_or(usize::MAX))
+            .map(Value::String)
+            .collect();
+        out.insert(bucket.to_string(), Value::Array(sliced));
+    }
+
+    Ok(
+        serde_json::to_string_pretty(&Value::Object(out))
+            .unwrap_or_default(),
+    )
+}
+
+/// DB fastpath: `SELECT id FROM pages` and derive bucket from the
+/// id prefix (`entities/alice` → `entities`). Matches the layout
+/// already used by `tree::list_tree`. Unknown buckets are silently
+/// dropped — they shouldn't occur unless the index drifts from the
+/// filesystem schema.
+fn list_page_ids_via_db(
+    handle: &crate::db::DbHandle,
+) -> crate::db::DbResult<Vec<(String, String)>> {
+    handle.with(|conn| {
+        let mut stmt = conn.prepare("SELECT id FROM pages")?;
+        let rows = stmt.query_map([], |row| {
+            let id: String = row.get(0)?;
+            Ok(id)
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let id = r?;
+            if let Some((bucket, _)) = id.split_once('/') {
+                out.push((bucket.to_string(), id));
+            }
+        }
+        Ok(out)
+    })
+}
+
+/// Filesystem fallback for vaults that haven't been DB-indexed yet.
+/// Reuses the existing tree walker (no file content reads) and
+/// flattens the four-bucket result into a `(bucket, id)` list so the
+/// dispatch stays uniform.
+fn list_page_ids_via_filesystem(
+    vault: &std::path::Path,
+) -> Result<Vec<(String, String)>, ViewerErrAdapter> {
+    let t = tree::list_tree(vault).map_err(ViewerErrAdapter)?;
+    let mut out = Vec::with_capacity(
+        t.entities.len() + t.concepts.len() + t.sources.len() + t.topics.len(),
+    );
+    for id in t.entities {
+        out.push(("entities".to_string(), id));
+    }
+    for id in t.concepts {
+        out.push(("concepts".to_string(), id));
+    }
+    for id in t.sources {
+        out.push(("sources".to_string(), id));
+    }
+    for id in t.topics {
+        out.push(("topics".to_string(), id));
+    }
+    Ok(out)
+}
+
+/// Adapter so `?`-propagation from `tree::list_tree` (returns
+/// `ViewerError`) lands as a `String` cleanly through the
+/// `Result<…, String>` boundary used by `call_tool`.
+struct ViewerErrAdapter(crate::viewer::ViewerError);
+
+impl std::fmt::Display for ViewerErrAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
     }
 }
 
@@ -600,7 +839,12 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_returns_at_least_seven_tool_descriptors() {
+    fn tools_list_advertises_every_tool_handler_we_implement() {
+        // Discovery test — `tools/list` is what every MCP client calls
+        // to learn what BRAIN can do. If a handler exists in `call_tool`
+        // but its descriptor was forgotten, no LLM ever finds it. Spot
+        // check covers the two 0.2.4 additions plus a few load-bearing
+        // older tools so a future deletion gets caught here.
         let req = RpcRequest {
             jsonrpc: "2.0".into(),
             id: Some(json!(2)),
@@ -608,9 +852,22 @@ mod tests {
             params: json!({}),
         };
         let resp = handle_request(&req, None, None);
-        assert!(resp.contains("brain_search"));
-        assert!(resp.contains("brain_write_page"));
-        assert!(resp.contains("brain_graph"));
+        for name in [
+            "brain_search",
+            "brain_get_page",
+            "brain_page_exists",
+            "brain_get_context",
+            "brain_list_pages",
+            "brain_write_page",
+            "brain_write_raw_file",
+            "brain_graph",
+            "brain_query",
+        ] {
+            assert!(
+                resp.contains(name),
+                "tools/list response is missing {name}: {resp}"
+            );
+        }
     }
 
     #[test]
@@ -815,6 +1072,340 @@ mod tests {
         let id = json!("abc");
         let resp = panic_safe_dispatch(&id, "test/method", || "{\"jsonrpc\":\"2.0\"}".to_string());
         assert_eq!(resp, "{\"jsonrpc\":\"2.0\"}");
+    }
+
+    /// Helper: build a small but realistic vault with two entities, one
+    /// concept and one source. Used by the `brain_list_pages`
+    /// performance-improvement tests so each test starts from a known
+    /// shape without re-typing the boilerplate.
+    fn build_sample_vault() -> tempfile::TempDir {
+        use crate::vault::layout::{ensure_skeleton, wiki_dir};
+        let tmp = tempfile::TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        seed_marker(tmp.path());
+        let mk = |sub: &str, slug: &str| {
+            let dir = wiki_dir(tmp.path()).join(sub);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(format!("{slug}.md")),
+                format!(
+                    "---\nid: {sub}/{slug}\ntype: {kind}\ntitle: {slug}\ncreated: 2026-04-30\nupdated: 2026-04-30\n---\n\nbody\n",
+                    kind = match sub {
+                        "entities" => "entity",
+                        "concepts" => "concept",
+                        "sources" => "source",
+                        "topics" => "topic",
+                        _ => "entity",
+                    }
+                ),
+            )
+            .unwrap();
+        };
+        mk("entities", "alice");
+        mk("entities", "dextra-acme");
+        mk("concepts", "nlspec");
+        mk("sources", "kickoff-doc");
+        tmp
+    }
+
+    fn list_pages_call(
+        vault: &std::path::Path,
+        args: Value,
+        db: Option<&crate::db::DbHandle>,
+    ) -> Value {
+        let result = call_tool(
+            &json!({ "name": "brain_list_pages", "arguments": args }),
+            vault,
+            db,
+        )
+        .expect("brain_list_pages should succeed");
+        serde_json::from_str(&result).expect("result must be valid JSON")
+    }
+
+    #[test]
+    fn list_pages_db_fastpath_returns_same_ids_as_filesystem_fallback() {
+        // Without a DB handle we walk the filesystem; with one we should
+        // hit a much faster `SELECT id, type FROM pages` path. Both must
+        // surface the same set of IDs, otherwise we have a divergence
+        // bug that would silently mislead the LLM.
+        let tmp = build_sample_vault();
+        let db = crate::db::DbHandle::open(tmp.path()).unwrap();
+        crate::db::pages_index::rebuild(&db, tmp.path()).unwrap();
+
+        let fs_result = list_pages_call(tmp.path(), json!({}), None);
+        let db_result = list_pages_call(tmp.path(), json!({}), Some(&db));
+
+        // Set-equality per bucket so ordering doesn't matter.
+        for bucket in ["entities", "concepts", "sources", "topics"] {
+            let fs_set: std::collections::HashSet<&str> = fs_result[bucket]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            let db_set: std::collections::HashSet<&str> = db_result[bucket]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            assert_eq!(
+                fs_set, db_set,
+                "DB and filesystem paths disagree on bucket '{bucket}'"
+            );
+        }
+    }
+
+    #[test]
+    fn list_pages_with_type_filter_only_populates_that_bucket() {
+        // Reduces response size for callers who only need one type — the
+        // primary fix for the user-reported timeout on big vaults.
+        let tmp = build_sample_vault();
+        let result = list_pages_call(tmp.path(), json!({ "type": "entities" }), None);
+        assert!(!result["entities"].as_array().unwrap().is_empty());
+        assert!(result["concepts"].as_array().unwrap().is_empty());
+        assert!(result["sources"].as_array().unwrap().is_empty());
+        assert!(result["topics"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_pages_with_prefix_filter_returns_only_matching_ids() {
+        // Lets callers narrow down to e.g. `entities/dextra-*` instead
+        // of pulling every entity ID and filtering client-side.
+        let tmp = build_sample_vault();
+        let result = list_pages_call(
+            tmp.path(),
+            json!({ "prefix": "entities/dextra" }),
+            None,
+        );
+        let ents: Vec<&str> = result["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(ents, vec!["entities/dextra-acme"]);
+        assert!(
+            result["concepts"].as_array().unwrap().is_empty(),
+            "prefix on entities must not leak into other buckets"
+        );
+    }
+
+    #[test]
+    fn list_pages_with_limit_caps_each_bucket() {
+        // Pagination affordance — caller can request a bounded page size.
+        let tmp = build_sample_vault();
+        let result = list_pages_call(tmp.path(), json!({ "limit": 1 }), None);
+        for bucket in ["entities", "concepts", "sources", "topics"] {
+            let len = result[bucket].as_array().unwrap().len();
+            assert!(
+                len <= 1,
+                "bucket {bucket} should be capped at limit=1 but has {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn list_pages_with_offset_skips_leading_entries_per_bucket() {
+        // Offset only makes sense paired with sort order — IDs are
+        // already returned sorted ascending. With two entities and
+        // offset=1 we expect exactly one entity returned.
+        let tmp = build_sample_vault();
+        let result = list_pages_call(
+            tmp.path(),
+            json!({ "type": "entities", "offset": 1 }),
+            None,
+        );
+        let ents = result["entities"].as_array().unwrap();
+        assert_eq!(
+            ents.len(),
+            1,
+            "offset=1 on 2-entity vault should leave exactly 1 entry"
+        );
+    }
+
+    #[test]
+    fn list_pages_with_no_args_returns_full_grouped_shape_for_backward_compat() {
+        // Defensive: existing callers (LLMs that have been pointing at
+        // older BRAIN releases) must keep working — no args = same
+        // four-bucket shape with all IDs populated.
+        let tmp = build_sample_vault();
+        let result = list_pages_call(tmp.path(), json!({}), None);
+        assert!(result.get("entities").is_some());
+        assert!(result.get("concepts").is_some());
+        assert!(result.get("sources").is_some());
+        assert!(result.get("topics").is_some());
+        assert_eq!(result["entities"].as_array().unwrap().len(), 2);
+        assert_eq!(result["concepts"].as_array().unwrap().len(), 1);
+        assert_eq!(result["sources"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn page_exists_returns_true_for_a_page_that_is_on_disk() {
+        // The lightweight "does this id exist?"-check the user feedback
+        // asked for. brain_get_page returns the whole markdown body
+        // for this question, which is wasted bandwidth and tokens; this
+        // tool only does a single Path::exists() under 02_wiki/<id>.md.
+        use tempfile::TempDir;
+        use crate::vault::layout::{ensure_skeleton, wiki_dir};
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        seed_marker(tmp.path());
+        let dir = wiki_dir(tmp.path()).join("entities");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("alice.md"),
+            "---\nid: entities/alice\ntype: entity\ntitle: Alice\ncreated: 2026-04-30\nupdated: 2026-04-30\n---\n\nbody\n",
+        )
+        .unwrap();
+        let result = call_tool(
+            &json!({
+                "name": "brain_page_exists",
+                "arguments": { "id": "entities/alice" }
+            }),
+            tmp.path(),
+            None,
+        )
+        .expect("brain_page_exists should succeed");
+        let parsed: Value = serde_json::from_str(&result).expect("must be valid JSON");
+        assert_eq!(parsed["exists"], json!(true));
+        assert_eq!(parsed["id"], json!("entities/alice"));
+    }
+
+    #[test]
+    fn page_exists_returns_false_for_a_page_that_is_not_on_disk() {
+        use tempfile::TempDir;
+        use crate::vault::layout::ensure_skeleton;
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        seed_marker(tmp.path());
+        let result = call_tool(
+            &json!({
+                "name": "brain_page_exists",
+                "arguments": { "id": "entities/never-created" }
+            }),
+            tmp.path(),
+            None,
+        )
+        .expect("brain_page_exists must succeed even for missing pages — the missing case is data, not error");
+        let parsed: Value = serde_json::from_str(&result).expect("must be valid JSON");
+        assert_eq!(parsed["exists"], json!(false));
+        assert_eq!(parsed["id"], json!("entities/never-created"));
+    }
+
+    #[test]
+    fn page_exists_rejects_id_with_path_traversal_components() {
+        // Defensive: an id like "../../../etc/passwd" must be rejected
+        // before it gets joined onto the wiki dir. Same hardening the
+        // existing brain_write_raw_file does for connector paths.
+        use tempfile::TempDir;
+        use crate::vault::layout::ensure_skeleton;
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        seed_marker(tmp.path());
+        let err = call_tool(
+            &json!({
+                "name": "brain_page_exists",
+                "arguments": { "id": "../../etc/passwd" }
+            }),
+            tmp.path(),
+            None,
+        )
+        .expect_err("path traversal must reject");
+        assert!(err.contains(".."));
+    }
+
+    #[test]
+    fn page_exists_rejects_empty_or_missing_id() {
+        // Hardening: the LLM might forget the `id` arg entirely or
+        // pass an empty string. Either way the tool must return a
+        // crisp error rather than walking the vault root.
+        use tempfile::TempDir;
+        use crate::vault::layout::ensure_skeleton;
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        seed_marker(tmp.path());
+        let err = call_tool(
+            &json!({
+                "name": "brain_page_exists",
+                "arguments": {}
+            }),
+            tmp.path(),
+            None,
+        )
+        .expect_err("missing id must reject");
+        assert!(err.to_lowercase().contains("id"));
+    }
+
+    #[test]
+    fn page_exists_propagates_vault_disconnect_with_canonical_prefix() {
+        // The same fast-fail guard call_tool already does for every
+        // other tool — when the vault disappeared mid-session, we
+        // return the BRAIN_VAULT_DISCONNECTED-prefixed message the
+        // LLM has been trained to recognise via the existing tools.
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        // No ensure_skeleton, no marker — looks like a torn-off vault.
+        let err = call_tool(
+            &json!({
+                "name": "brain_page_exists",
+                "arguments": { "id": "entities/alice" }
+            }),
+            tmp.path(),
+            None,
+        )
+        .expect_err("disconnected vault must reject");
+        assert!(err.starts_with("BRAIN_VAULT_DISCONNECTED:"));
+    }
+
+    #[test]
+    fn write_page_lint_failure_returns_structured_error_list_not_just_count() {
+        // Regression: pre-0.2.4 the response was just "page written but
+        // lint failed: 13 errors", throwing away the LintError struct's
+        // `path`/`kind`/`message` fields. The LLM had to iteratively
+        // probe to find which links were broken — multiple round-trips
+        // for what's already known server-side. Now the response
+        // embeds the actual error array as JSON so the LLM can act on
+        // it in one shot.
+        use tempfile::TempDir;
+        use crate::vault::layout::ensure_skeleton;
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        seed_marker(tmp.path());
+        let err = call_tool(
+            &json!({
+                "name": "brain_write_page",
+                "arguments": {
+                    "id": "entities/alice",
+                    "content": "---\nid: entities/alice\ntype: entity\ntitle: Alice\ncreated: 2026-04-30\nupdated: 2026-04-30\n---\n\nLinks to [[entities/missing-page]] and [[concepts/also-missing]].\n"
+                }
+            }),
+            tmp.path(),
+            None,
+        )
+        .expect_err("page with broken links must fail lint");
+
+        // The LLM-readable summary stays so humans skimming logs see
+        // the count at a glance.
+        assert!(
+            err.contains("lint failed"),
+            "human summary must remain, got: {err}"
+        );
+        // The machine-readable detail must include each broken link
+        // target plus the `broken-link` kind. This is what closes the
+        // probing loop the user complained about.
+        assert!(
+            err.contains("entities/missing-page"),
+            "first broken link target must surface in error, got: {err}"
+        );
+        assert!(
+            err.contains("concepts/also-missing"),
+            "second broken link target must surface in error, got: {err}"
+        );
+        assert!(
+            err.contains("broken-link"),
+            "error kind must surface so the LLM can disambiguate from frontmatter errors, got: {err}"
+        );
     }
 
     #[test]
