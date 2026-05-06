@@ -46,14 +46,21 @@ fn is_under_temp_dir(path: &Path) -> bool {
         }
     }
 
-    let normalised: Vec<String> = path
-        .components()
-        .filter_map(|c| match c {
-            std::path::Component::Normal(s) => Some(s.to_string_lossy().to_lowercase()),
-            _ => None,
-        })
+    // Component-pattern heuristic for stale paths the OS has wiped
+    // (so canonicalize() can't help) and for paths whose separator
+    // doesn't match the host's. The CI runs on Linux where
+    // `Path::components()` does not split on `\\` — a config file
+    // saved on Windows then read on Linux would look like a single
+    // opaque component and the heuristic would miss. Working on the
+    // raw lower-cased string with both separators normalised to `/`
+    // keeps the check OS-agnostic.
+    let lower = path.to_string_lossy().to_lowercase();
+    let normalised = lower.replace('\\', "/");
+    let parts: Vec<&str> = normalised
+        .split('/')
+        .filter(|s| !s.is_empty())
         .collect();
-    normalised
+    parts
         .windows(3)
         .any(|w| w == ["appdata", "local", "temp"])
 }
@@ -424,6 +431,23 @@ mod tests {
         assert!(
             is_under_temp_dir(&stale),
             "stale Windows AppData\\Local\\Temp path must be flagged"
+        );
+    }
+
+    #[test]
+    fn is_under_temp_dir_catches_appdata_local_temp_paths_with_forward_slashes() {
+        // Cross-platform regression: this same heuristic must work on
+        // both Windows (`\`-separated) and Linux/macOS (`/`-separated).
+        // The CI runs on Linux, where Path::components() does not
+        // split on `\` — without explicit separator-normalisation the
+        // earlier all-backslash test passed only on Windows. Asserting
+        // the forward-slash form locks in the cross-platform contract.
+        let stale = PathBuf::from(
+            "C:/Users/PASCAL~1.POL/AppData/Local/Temp/.tmp2oZT2Y",
+        );
+        assert!(
+            is_under_temp_dir(&stale),
+            "stale AppData/Local/Temp path with forward slashes must also be flagged"
         );
     }
 
