@@ -129,6 +129,51 @@ pub async fn rebuild_index(
     Ok(count as u32)
 }
 
+/// Reads every persisted graph-node coordinate. The Tier-3 viewer
+/// calls this on mount; if the response is non-empty, it skips the
+/// fcose force-directed pass and renders straight from the saved
+/// positions — instant load on subsequent opens.
+#[tauri::command]
+pub fn load_graph_positions(
+    state: State<Arc<crate::state::AppState>>,
+) -> BrainResult<Vec<crate::db::node_positions::NodePosition>> {
+    let db = state
+        .db()
+        .ok_or_else(|| BrainError::Internal("no SQLite index is open".into()))?;
+    crate::db::node_positions::load(&db)
+        .map_err(|e| BrainError::Internal(format!("load_graph_positions: {e}")))
+}
+
+/// Bulk-saves graph-node coordinates. Called from the Tier-3 viewer
+/// after fcose finishes (so the next mount skips fcose) and after a
+/// drag (so the user's hand-tuning sticks). The frontend batches
+/// multiple drags into one call to avoid hammering SQLite.
+#[tauri::command]
+pub fn save_graph_positions(
+    state: State<Arc<crate::state::AppState>>,
+    positions: Vec<crate::db::node_positions::NodePosition>,
+) -> BrainResult<()> {
+    let db = state
+        .db()
+        .ok_or_else(|| BrainError::Internal("no SQLite index is open".into()))?;
+    crate::db::node_positions::save(&db, &positions)
+        .map_err(|e| BrainError::Internal(format!("save_graph_positions: {e}")))
+}
+
+/// Wipes all stored graph-node coordinates. Backs the Tier-3
+/// "Re-layout" button — one click reverts to fcose, and the next
+/// drag/save will re-populate the table.
+#[tauri::command]
+pub fn clear_graph_positions(
+    state: State<Arc<crate::state::AppState>>,
+) -> BrainResult<()> {
+    let db = state
+        .db()
+        .ok_or_else(|| BrainError::Internal("no SQLite index is open".into()))?;
+    crate::db::node_positions::clear(&db)
+        .map_err(|e| BrainError::Internal(format!("clear_graph_positions: {e}")))
+}
+
 /// Opens the Markdown file backing a wiki page in the OS-default editor.
 /// S08 calls this from the viewer toolbar's "Open in editor" button.
 #[tauri::command]

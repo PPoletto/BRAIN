@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 use super::DbResult;
 
-const CURRENT_VERSION: i64 = 3;
+const CURRENT_VERSION: i64 = 4;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -96,6 +96,24 @@ pub fn apply(conn: &Connection) -> DbResult<()> {
                 embedding float[1024]\
              );",
         );
+    }
+    if current < 4 {
+        // Persistent graph node coordinates so re-opening the viewer
+        // skips the fcose layout step entirely — the graph appears
+        // instantly with the user's last-arranged layout. The table is
+        // intentionally separate from `pages` so that a vault export /
+        // graph layout reset doesn't have to touch page rows. NULL
+        // page_id is impossible because of the PRIMARY KEY; deleting a
+        // page leaves a stale row that the load function filters out
+        // by joining against `pages`.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS node_positions (\
+                page_id    TEXT PRIMARY KEY,\
+                x          REAL NOT NULL,\
+                y          REAL NOT NULL,\
+                updated_at TEXT NOT NULL\
+             );",
+        )?;
     }
     conn.execute(
         "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('version', ?1)",

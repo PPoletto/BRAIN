@@ -132,6 +132,15 @@ export const commands = {
       },
     }),
 
+  loadGraphPositions: () =>
+    invoke<Array<{ page_id: string; x: number; y: number }>>(
+      "load_graph_positions",
+    ),
+  saveGraphPositions: (
+    positions: Array<{ page_id: string; x: number; y: number }>,
+  ) => invoke<void>("save_graph_positions", { positions }),
+  clearGraphPositions: () => invoke<void>("clear_graph_positions"),
+
   wikiHistory: (limit: number) =>
     invoke<Array<{ sha: string; ts: string; message: string; files_changed: number }>>(
       "wiki_history",

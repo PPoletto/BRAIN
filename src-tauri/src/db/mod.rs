@@ -3,6 +3,7 @@
 //! lands. The schema mirrors `docs/architecture.md` §2.4.
 
 pub mod migrations;
+pub mod node_positions;
 pub mod pages_index;
 pub mod vec_loader;
 

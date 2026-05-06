@@ -1,6 +1,6 @@
 //! Tauri commands exposed to the frontend for the onboarding flow.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -10,6 +10,53 @@ use crate::error::{BrainError, BrainResult};
 use crate::mcp::registration as mcp_register;
 use crate::mount::lifecycle;
 use crate::vault::{self, VaultMarker};
+
+/// Returns true when `path` is somewhere inside the OS's temp directory.
+/// Used to refuse persisting an obviously-bad vault path that the user
+/// might have picked through the folder dialog by accident — temp dirs
+/// get wiped by the OS, which is what made the post-update offline
+/// loop self-perpetuating: each setup wrote a temp path, the next OS
+/// reboot/update wiped it, BRAIN saw "vault gone" and kicked the user
+/// back into setup with the same broken default location.
+///
+/// Three layers because a *stale* temp path may not exist on disk
+/// (so `canonicalize` fails) and may have been written in 8.3
+/// short-name form (so a direct prefix check against `env::temp_dir()`
+/// long-form misses it):
+///
+/// 1. Direct prefix match — covers the common "current user, current
+///    process" case on every OS.
+/// 2. Canonicalised match — handles short/long-name discrepancy on
+///    Windows for paths that do exist.
+/// 3. `…\AppData\Local\Temp\…` component-pattern heuristic — catches
+///    stale paths from a different OS user (`PASCAL~1.POL\AppData\
+///    Local\Temp\…`) that no longer exist on disk and so fail
+///    canonicalisation. Targeted enough to avoid false-positives on
+///    arbitrary directories named `temp` outside that chain.
+fn is_under_temp_dir(path: &Path) -> bool {
+    let temp = std::env::temp_dir();
+
+    if path.starts_with(&temp) {
+        return true;
+    }
+
+    if let (Ok(p), Ok(t)) = (path.canonicalize(), temp.canonicalize()) {
+        if p.starts_with(&t) {
+            return true;
+        }
+    }
+
+    let normalised: Vec<String> = path
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_string_lossy().to_lowercase()),
+            _ => None,
+        })
+        .collect();
+    normalised
+        .windows(3)
+        .any(|w| w == ["appdata", "local", "temp"])
+}
 
 use super::disks::{self, DiskInfo};
 use super::format;
@@ -161,6 +208,29 @@ pub fn bootstrap_app(
         });
     };
 
+    // Self-heal: if the persisted path lives inside the OS temp dir,
+    // it was almost certainly written by an earlier setup that picked a
+    // bad default location (the loop the post-update offline bug
+    // triggered). Forget it instead of showing the user yet another
+    // "BRAIN is offline" screen with a path that could never come back.
+    // The user lands on the welcome screen and gets a clean restart of
+    // setup with the in-process `is_under_temp_dir` guard now in place
+    // to prevent the same mistake from being persisted again.
+    if is_under_temp_dir(&last) {
+        tracing::warn!(
+            path = %last.display(),
+            "discarding persisted vault path inside OS temp dir; sending user to onboarding"
+        );
+        let _ = state.config.update(|s| {
+            s.last_active_vault_path = None;
+        });
+        return Ok(BootstrapResult {
+            auto_mounted: false,
+            vault_path: None,
+            last_known_vault_missing: false,
+        });
+    }
+
     if !crate::vault::layout::is_vault(&last) {
         // Path is stale (disk unplugged, vault deleted) — let the user
         // decide via the welcome screen.
@@ -257,6 +327,22 @@ pub fn finish_onboarding(
     path: String,
 ) -> BrainResult<()> {
     let vault_path = PathBuf::from(&path);
+
+    // Defend against the post-update offline loop: if the user picked a
+    // temp directory through the folder dialog (or somehow ended up with
+    // one), refuse it before persisting. Without this guard the same
+    // broken path would survive into `last_active_vault_path`, the OS
+    // would wipe it on next reboot/update, and the next launch would
+    // again show "BRAIN is offline" — exactly the cycle we observed.
+    if is_under_temp_dir(&vault_path) {
+        return Err(BrainError::Internal(format!(
+            "vault path '{}' is inside the system temp directory and would be \
+             wiped by the OS — pick a permanent location like an external SSD \
+             or a folder under your home directory.",
+            vault_path.display()
+        )));
+    }
+
     lifecycle::mount_source(&state, &vault_path).map_err(BrainError::from)?;
 
     // Persist the active vault path so the next Brain start auto-mounts
@@ -292,4 +378,65 @@ pub fn finish_onboarding(
     spawn_bootstrap_background_work(app, state.inner().clone(), vault_path);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn is_under_temp_dir_detects_paths_under_the_current_user_temp() {
+        // Layer 1: direct prefix match against `std::env::temp_dir()`.
+        // Picks up the case where the running process and the saved
+        // path are on the same machine with the same user form.
+        let inside = std::env::temp_dir().join("brain-test-vault");
+        assert!(
+            is_under_temp_dir(&inside),
+            "path inside temp_dir() must be flagged: {inside:?}"
+        );
+    }
+
+    #[test]
+    fn is_under_temp_dir_accepts_paths_outside_temp() {
+        let outside = if cfg!(target_os = "windows") {
+            PathBuf::from("D:/my-vault")
+        } else {
+            PathBuf::from("/home/user/my-vault")
+        };
+        assert!(
+            !is_under_temp_dir(&outside),
+            "permanent path must NOT be flagged: {outside:?}"
+        );
+    }
+
+    #[test]
+    fn is_under_temp_dir_catches_stale_windows_appdata_local_temp_paths() {
+        // Layer 3 (the actually-bug-relevant one): on the affected user's
+        // Windows machine, the saved path was
+        // `C:\Users\PASCAL~1.POL\AppData\Local\Temp\.tmp2oZT2Y` —
+        // 8.3 short-name form pointing into Local\Temp\ for a stale user.
+        // The path no longer exists on disk, so canonicalize() can't
+        // help. The component-pattern heuristic must still flag it.
+        let stale = PathBuf::from(
+            r"C:\Users\PASCAL~1.POL\AppData\Local\Temp\.tmp2oZT2Y",
+        );
+        assert!(
+            is_under_temp_dir(&stale),
+            "stale Windows AppData\\Local\\Temp path must be flagged"
+        );
+    }
+
+    #[test]
+    fn is_under_temp_dir_does_not_flag_unrelated_directories_named_temp() {
+        // Defensive: a user's own folder happening to contain a "temp"
+        // segment outside the canonical AppData\Local\ chain must NOT
+        // be rejected. Avoid surprising users with legitimate vault
+        // locations like `D:\MyDocs\temp-notes`.
+        let mine = PathBuf::from(r"D:\MyDocs\temp-notes");
+        assert!(
+            !is_under_temp_dir(&mine),
+            "unrelated 'temp'-named folder must NOT be flagged: {mine:?}"
+        );
+    }
 }

@@ -6,6 +6,69 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.6] — 2026-05-06
+
+### Fixed
+
+- Post-update offline loop. Pre-0.2.6 a stale temp-directory path in
+  `last_active_vault_path` (most likely written by an earlier setup
+  that picked the wrong default folder) survived every update,
+  pointed BRAIN at a path the OS had already wiped, and forced the
+  user back through the wizard on each launch — where the same
+  broken default location was about to get re-saved. Two layers
+  prevent that now: (1) `finish_onboarding` rejects any path inside
+  the OS temp dir with a clear error, (2) `bootstrap_app` self-heals
+  by treating an existing temp-dir-based path as None and sending
+  the user to onboarding instead of the "BRAIN is offline" screen.
+  Detection works across stale 8.3-shortname paths
+  (`PASCAL~1.POL\AppData\Local\Temp\…`) that no longer exist on disk.
+- Pink-screen Cytoscape rendering on macOS (Apple Silicon WKWebView).
+  The graph view used to occasionally fill its entire area with
+  magenta — Metal's debug-fill backstop when a backing-store
+  allocation fails. Two reinforcing fixes:
+  - **Auto-recover** (Plan B): on `layoutstop`, if every node has
+    non-finite render coordinates, the GraphCanvas remounts itself
+    once. Guarded by a one-shot ref so a graph that stays broken
+    after the recovery doesn't loop.
+  - **Hardening** (Plan C): ResizeObserver now debounces window-drag
+    bursts to 200 ms (was RAF, too tight); fcose runs with
+    `randomize: false` for deterministic layouts; `quality` drops
+    to `"draft"` past 100 nodes so the GPU pipeline doesn't get
+    pinned long enough to trip Metal's failure path.
+
+### Added
+
+- **Persistent graph layout** with one-click reset. New
+  `node_positions` table (DB migration v4) stores the user's last
+  layout per page id. The graph viewer reads it on mount and skips
+  fcose entirely (preset layout) when every visible node has a
+  saved position — re-opens are visually instant. Drag-and-drop is
+  saved automatically (debounced 400 ms). New "Re-layout" toolbar
+  button wipes the table so the next mount falls back to fcose,
+  and the resulting positions get persisted afresh.
+- **Hierarchical layout** as an alternative to force-directed.
+  Toolbar toggle "Force / Hierarchical" — Hierarchical uses
+  `cytoscape-dagre` for a top-down rank flow, useful when looking
+  for parent/child structure across topics → concepts → entities.
+- **Cluster-focus chip strip**. Connected components are computed
+  on every layout settle; if the graph has more than one cluster a
+  chip strip appears below the filter bar showing each cluster's
+  size. Clicking a chip fits the viewport to that cluster only;
+  clicking "All" releases the focus.
+- **Mini-map overlay** in the graph view's bottom-right corner via
+  `cytoscape-navigator` — drag the viewport rectangle to pan
+  large graphs without losing context. Static framerate
+  (`viewLiveFramerate: 0`) so the navigator doesn't add to GPU
+  pressure.
+- **Hover tooltip** on graph nodes: title + backlink count + the
+  first prose line of the page body. Body excerpt is lazy-fetched
+  via `read_page` and cached in-memory per id, so re-hovering the
+  same node doesn't re-fire the IPC.
+- **Degree-based node sizing**. Nodes with more wiki-link
+  connections render larger (linear in degree, capped at 56 px),
+  giving the graph an immediate visual hierarchy without any
+  configuration.
+
 ## [0.2.5] — 2026-05-06
 
 ### Fixed

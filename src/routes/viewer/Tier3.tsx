@@ -1,14 +1,25 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { commands } from "../../lib/commands";
 import { useDataRefresh } from "../../lib/events";
-import { GraphCanvas } from "../../components/GraphCanvas";
+import {
+  GraphCanvas,
+  type Cluster,
+  type SavedPosition,
+} from "../../components/GraphCanvas";
 import { Button } from "../../components/ui/Button";
 import { EmptyState } from "../../components/ui/EmptyState";
 
 type Graph = Awaited<ReturnType<typeof commands.getGraph>>;
 
 const ALL_TYPES = ["entity", "concept", "source", "topic"];
+
+// Drag-save debounce. Cytoscape fires `dragfree` per-node when the
+// user releases the mouse; rapid back-to-back drags would otherwise
+// kick off a SQLite write each. 400 ms feels instant to the user
+// and coalesces a typical "tug a node, immediately tug another"
+// session into one batch.
+const POSITION_SAVE_DEBOUNCE_MS = 400;
 
 export function Tier3() {
   const navigate = useNavigate();
@@ -18,6 +29,26 @@ export function Tier3() {
   const [tags, setTags] = useState<string[]>([]);
   const [updatedAfter, setUpdatedAfter] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
+
+  // Layout toggle. Default is force-directed (fcose / preset); the
+  // user can flip to a top-down hierarchical view via the toolbar.
+  const [layoutMode, setLayoutMode] =
+    useState<"force" | "hierarchical">("force");
+
+  // Persistent layout. `null` = haven't loaded yet; `[]` = loaded,
+  // empty (first time the user opens the graph). Both behave the
+  // same way at render time — fcose runs and saves its output.
+  const [savedPositions, setSavedPositions] =
+    useState<SavedPosition[] | null>(null);
+
+  const [clusters, setClusters] = useState<Cluster[]>([]);
+  const [focusedCluster, setFocusedCluster] = useState<string | null>(null);
+
+  // Pending position writes — coalesced into a single Tauri call by
+  // the debouncer below. Stored by page_id so a node dragged twice
+  // in quick succession only persists its last position.
+  const pendingPositionsRef = useRef<Map<string, SavedPosition>>(new Map());
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Centralised fetch: invoked from both the filter-change effect
   // *and* from the auto-refresh hook below, so a wiki-changed event
@@ -40,6 +71,84 @@ export function Tier3() {
 
   // Live-update: redraw on auto-commit or disk reconnect.
   useDataRefresh(fetchGraph);
+
+  // One-shot load of persisted positions on mount. We don't refetch
+  // when the graph payload changes — the saved set is keyed by
+  // page_id and silently ignores ids that aren't in the current
+  // graph, so the data stays correct as the user edits filters.
+  useEffect(() => {
+    let cancelled = false;
+    commands
+      .loadGraphPositions()
+      .then((positions) => {
+        if (!cancelled) setSavedPositions(positions);
+      })
+      .catch(() => {
+        // Persistence is a best-effort feature — the user can still
+        // use the graph if the table is unreachable. Mark as loaded
+        // (empty) so the canvas doesn't sit on its hands.
+        if (!cancelled) setSavedPositions([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Position-change handler. Two callsites in GraphCanvas:
+  //   - `layoutstop` after fcose / dagre with the FULL set of nodes
+  //   - `dragfree` per node with just the dropped position
+  // Both feed into the same pending-map; the timer flushes them as
+  // one Tauri call so SQLite never sees a write storm.
+  const handlePositionsChange = useCallback(
+    (positions: SavedPosition[]) => {
+      for (const p of positions) {
+        pendingPositionsRef.current.set(p.page_id, p);
+      }
+      if (saveTimerRef.current !== null) {
+        clearTimeout(saveTimerRef.current);
+      }
+      saveTimerRef.current = setTimeout(() => {
+        const flush = Array.from(pendingPositionsRef.current.values());
+        pendingPositionsRef.current.clear();
+        saveTimerRef.current = null;
+        if (flush.length === 0) return;
+        commands
+          .saveGraphPositions(flush)
+          .then(() => {
+            // Mirror the just-saved set into local state so the
+            // graph remains in `preset` mode on the next remount
+            // (e.g. after a filter change).
+            setSavedPositions((cur) => {
+              const map = new Map<string, SavedPosition>();
+              for (const p of cur ?? []) map.set(p.page_id, p);
+              for (const p of flush) map.set(p.page_id, p);
+              return Array.from(map.values());
+            });
+          })
+          .catch((e: unknown) => {
+            console.warn("[Tier3] position save failed", e);
+          });
+      }, POSITION_SAVE_DEBOUNCE_MS);
+    },
+    [],
+  );
+
+  // "Re-layout" button. Clears the saved-positions table, resets the
+  // local state to empty, and lets the next mount fall back to fcose.
+  // The fcose output then lands back in `savedPositions` via the
+  // normal layoutstop → handlePositionsChange flow, so subsequent
+  // mounts again skip layout entirely.
+  const handleReLayout = useCallback(() => {
+    pendingPositionsRef.current.clear();
+    if (saveTimerRef.current !== null) {
+      clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+    commands
+      .clearGraphPositions()
+      .then(() => setSavedPositions([]))
+      .catch((e: unknown) => setError(String(e)));
+  }, []);
 
   function addTag() {
     const cleaned = tagInput.trim();
@@ -124,12 +233,90 @@ export function Tier3() {
             </Button>
           )}
         </div>
+        {/*
+          Layout-mode toggle + Re-layout. Force-directed (fcose) is
+          the default; hierarchical (dagre) gives a top-down tree
+          when the user is looking for parent/child structure. The
+          Re-layout button wipes saved positions so the next mount
+          reverts to the auto-arranged layout.
+        */}
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            onClick={() => setLayoutMode("force")}
+            className={`rounded-l-md border border-neutral-800 px-2 py-1 text-xs ${
+              layoutMode === "force"
+                ? "bg-emerald-700 text-white"
+                : "bg-neutral-900 text-neutral-300 hover:bg-neutral-800"
+            }`}
+          >
+            Force
+          </button>
+          <button
+            type="button"
+            onClick={() => setLayoutMode("hierarchical")}
+            className={`-ml-px rounded-r-md border border-neutral-800 px-2 py-1 text-xs ${
+              layoutMode === "hierarchical"
+                ? "bg-emerald-700 text-white"
+                : "bg-neutral-900 text-neutral-300 hover:bg-neutral-800"
+            }`}
+          >
+            Hierarchical
+          </button>
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={handleReLayout}
+            title="Discard hand-tuned positions and re-arrange the graph automatically"
+          >
+            Re-layout
+          </Button>
+        </div>
         {graph && (
           <span className="ml-auto text-xs text-neutral-500">
             {graph.nodes.length} nodes · {graph.edges.length} edges
           </span>
         )}
       </div>
+      {/*
+        Cluster chip strip — connected-component summary supplied by
+        the GraphCanvas. Click a chip to fit the viewport on that
+        cluster only; click "All" to release the focus. Hidden when
+        there's only one cluster (no value in choosing).
+      */}
+      {clusters.length > 1 && (
+        <div className="flex flex-wrap items-center gap-1.5 border-b border-neutral-800 bg-neutral-950/80 px-3 py-2 text-xs">
+          <span className="text-neutral-500">Clusters:</span>
+          <button
+            type="button"
+            onClick={() => setFocusedCluster(null)}
+            className={`rounded-full px-2 py-0.5 ${
+              focusedCluster === null
+                ? "bg-emerald-700 text-white"
+                : "bg-neutral-800 text-neutral-300 hover:bg-neutral-700"
+            }`}
+          >
+            All
+          </button>
+          {clusters.map((c) => (
+            <button
+              key={c.id}
+              type="button"
+              onClick={() =>
+                setFocusedCluster((cur) => (cur === c.id ? null : c.id))
+              }
+              className={`rounded-full px-2 py-0.5 ${
+                focusedCluster === c.id
+                  ? "bg-emerald-700 text-white"
+                  : "bg-neutral-800 text-neutral-300 hover:bg-neutral-700"
+              }`}
+              title={`${c.size} pages`}
+            >
+              {c.size}
+            </button>
+          ))}
+        </div>
+      )}
       <div className="relative min-h-0 flex-1">
         {error && (
           <div className="absolute right-3 top-3 rounded-md border border-red-900 bg-red-950/80 p-2 text-xs text-red-300">
@@ -156,6 +343,16 @@ export function Tier3() {
               edges={graph.edges}
               onNodeClick={(id) =>
                 navigate(`/viewer?id=${encodeURIComponent(id)}`)
+              }
+              layoutMode={layoutMode}
+              savedPositions={savedPositions}
+              onPositionsChange={handlePositionsChange}
+              onClustersChange={setClusters}
+              focusedSubset={
+                focusedCluster
+                  ? (clusters.find((c) => c.id === focusedCluster)
+                      ?.nodeIds ?? null)
+                  : null
               }
             />
           </>
