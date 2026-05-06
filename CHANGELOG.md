@@ -8,6 +8,18 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.2.3] — 2026-05-06
 
+### Changed
+
+- Auto-update install is now **silent** on Windows
+  (`plugins.updater.windows.installMode = "quiet"`). The NSIS installer
+  no longer pops a wizard window during update; the app closes for a
+  couple of seconds, the binary is replaced in-place, the app reopens
+  on the new version. Matches the Claude Desktop / Slack
+  background-install experience. Note: this only takes effect for
+  updates *originating from* a 0.2.3+ install — the legacy 0.2.0 →
+  0.2.3 path still shows the visible installer because the 0.2.0
+  binary doesn't know about the new flag.
+
 ### Fixed
 
 - MCP subprocess no longer dies silently when a tool handler panics —
