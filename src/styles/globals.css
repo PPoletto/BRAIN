@@ -110,6 +110,40 @@ body {
 .prose-brain th, .prose-brain td { border: 1px solid var(--color-brain-border); padding: 0.5rem 0.75rem; text-align: left; }
 .prose-brain th { background: var(--color-brain-elevated); font-weight: 600; }
 
+/* Cytoscape-navigator (graph mini-map) overrides.
+ *
+ * The package's own stylesheet hard-codes:
+ *   .cytoscape-navigator { position: fixed; bottom:0; right:0;
+ *                          width:400px; height:400px; background:#fff; }
+ * which (a) breaks out of our GraphCanvas's relative parent and floats
+ * the overlay over the entire viewport, (b) puts it directly on top of
+ * the StatusBar's version label, and (c) ignores any Tailwind sizing
+ * we apply to the container div. We keep the package's CSS for the
+ * inner viewport rectangle / canvas styling and override only the
+ * outer container's positioning + dimensions. `!important` is needed
+ * to win against the package's single-class selector. */
+.cytoscape-navigator {
+  position: absolute !important;
+  bottom: 8px !important;
+  left: 8px !important;
+  right: auto !important;
+  top: auto !important;
+  width: 128px !important;
+  height: 96px !important;
+  background: rgba(10, 10, 10, 0.85) !important;
+  border: 1px solid var(--color-brain-border-strong) !important;
+  border-radius: 6px !important;
+  z-index: 20 !important;
+  overflow: hidden !important;
+}
+/* Viewport rectangle: BRAIN's accent green at low opacity so it reads
+ * on the dark thumbnail background rather than the package's pale
+ * baby-blue (which disappears on dark themes). */
+.cytoscape-navigatorView {
+  background: var(--color-brain-accent) !important;
+  opacity: 0.35 !important;
+}
+
 /* BrainIcon heartbeat — slow scale animation used as a loading affordance
  * on splash screens (Bootstrap, "checking for updates", etc.). 1 cycle/sec
  * is gentle enough not to feel frantic. */

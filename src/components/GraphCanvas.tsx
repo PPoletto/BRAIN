@@ -479,20 +479,20 @@ export function GraphCanvas({
     <div className="relative size-full">
       <div ref={ref} className="size-full bg-neutral-950" />
       {/*
-        Mini-map overlay. Bottom-LEFT so it doesn't crowd the
-        version label in the StatusBar (the bottom-right corner of
-        the window). Only rendered when showMinimap is true — the
-        navigator extension is also only instantiated then, so users
-        with the toggle off pay zero GPU/event cost. Sized smaller
-        than v0.2.6 (96×128 px) so even when shown the overlay
-        feels like a thumbnail rather than a competing pane.
+        Mini-map overlay. cytoscape-navigator stamps the class
+        `cytoscape-navigator` onto this container and that class's
+        defaults (position:fixed bottom:0 right:0 400×400 white)
+        would otherwise hijack our positioning. We override the
+        package CSS in `globals.css` (.cytoscape-navigator block)
+        with the BRAIN-themed dark thumbnail at bottom-left. No
+        Tailwind classes here on purpose — the override would
+        conflict with them and the !important rules win anyway.
+        Only rendered when showMinimap is true; the navigator
+        extension is also only instantiated then, so users with
+        the toggle off pay zero GPU/event cost.
       */}
       {showMinimap && (
-        <div
-          ref={navRef}
-          className="pointer-events-auto absolute bottom-2 left-2 z-20 h-24 w-32 overflow-hidden rounded-md border border-neutral-700 bg-neutral-950/80 shadow-lg"
-          aria-label="Graph mini-map"
-        />
+        <div ref={navRef} aria-label="Graph mini-map" />
       )}
       {hovered && (
         <div

@@ -11,6 +11,23 @@ use crate::mcp::registration as mcp_register;
 use crate::mount::lifecycle;
 use crate::vault::{self, VaultMarker};
 
+/// Walks the supplied paths and returns the first one that looks
+/// like a BRAIN vault. Used by `bootstrap_app` as a fallback when
+/// no `last_active_vault_path` is saved (or it was self-healed away
+/// because it pointed into the OS temp dir): if the user's BRAIN
+/// drive is plugged in, we'd rather auto-mount it than dump them
+/// back into the welcome wizard.
+///
+/// Temp-dir safety lives at the call site (bootstrap only persists
+/// the result when it is NOT in the OS temp dir) rather than here,
+/// so this helper stays a pure "is there a marker?" check that's
+/// trivial to test.
+fn find_attached_vault(
+    paths: impl Iterator<Item = PathBuf>,
+) -> Option<PathBuf> {
+    paths.into_iter().find(|p| crate::vault::layout::is_vault(p))
+}
+
 /// Returns true when `path` is somewhere inside the OS's temp directory.
 /// Used to refuse persisting an obviously-bad vault path that the user
 /// might have picked through the folder dialog by accident — temp dirs
@@ -207,83 +224,131 @@ pub fn bootstrap_app(
     app: AppHandle,
 ) -> BrainResult<BootstrapResult> {
     let snapshot = state.config.snapshot();
-    let Some(last) = snapshot.last_active_vault_path.clone() else {
-        return Ok(BootstrapResult {
-            auto_mounted: false,
-            vault_path: None,
-            last_known_vault_missing: false,
-        });
-    };
 
-    // Self-heal: if the persisted path lives inside the OS temp dir,
-    // it was almost certainly written by an earlier setup that picked a
-    // bad default location (the loop the post-update offline bug
-    // triggered). Forget it instead of showing the user yet another
-    // "BRAIN is offline" screen with a path that could never come back.
-    // The user lands on the welcome screen and gets a clean restart of
-    // setup with the in-process `is_under_temp_dir` guard now in place
-    // to prevent the same mistake from being persisted again.
-    if is_under_temp_dir(&last) {
-        tracing::warn!(
-            path = %last.display(),
-            "discarding persisted vault path inside OS temp dir; sending user to onboarding"
+    // Step 1: try the persisted path. Three sub-cases — temp-dir
+    // self-heal, stale-but-not-temp (offline screen), live (auto-mount).
+    if let Some(last) = snapshot.last_active_vault_path.clone() {
+        if is_under_temp_dir(&last) {
+            // Self-heal: the persisted path lives inside the OS temp
+            // dir, almost certainly written by an earlier broken
+            // setup. Forget it and fall through to step 2 (auto-detect)
+            // so we still try to find an attached BRAIN drive instead
+            // of dumping the user back into the wizard.
+            tracing::warn!(
+                path = %last.display(),
+                "discarding persisted vault path inside OS temp dir; trying disk-scan fallback"
+            );
+            let _ = state.config.update(|s| {
+                s.last_active_vault_path = None;
+            });
+            // Intentional fall-through — drop out of the `if let` below
+            // by NOT returning here.
+        } else if !crate::vault::layout::is_vault(&last) {
+            // Path looks legit but the disk isn't here right now.
+            // Show the offline screen so the user gets the explicit
+            // "your saved path points at <X>, plug it in" feedback
+            // rather than a silent re-detection that might pick a
+            // *different* attached vault.
+            return Ok(BootstrapResult {
+                auto_mounted: false,
+                vault_path: Some(last.to_string_lossy().to_string()),
+                last_known_vault_missing: true,
+            });
+        } else if let Some(result) = complete_auto_mount(state.inner(), &app, last.clone()) {
+            return Ok(result);
+        } else {
+            tracing::warn!("auto-mount of remembered vault failed");
+            return Ok(BootstrapResult {
+                auto_mounted: false,
+                vault_path: Some(last.to_string_lossy().to_string()),
+                last_known_vault_missing: false,
+            });
+        }
+    }
+
+    // Step 2: scan attached disks for a vault marker. Catches the
+    // "BRAIN drive is plugged in but bootstrap has no saved path
+    // for it" case — fresh install, post-self-heal of the temp-path
+    // bug, post-reset_brain. Without this fallback the user lands
+    // in the welcome wizard even though there's literally a BRAIN
+    // disk sitting one connector away.
+    let candidates = disks::list_disks()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|d| d.mount_path.map(PathBuf::from));
+    if let Some(found) = find_attached_vault(candidates) {
+        tracing::info!(
+            path = %found.display(),
+            "auto-detected attached BRAIN vault; mounting and persisting"
         );
-        let _ = state.config.update(|s| {
-            s.last_active_vault_path = None;
-        });
-        return Ok(BootstrapResult {
-            auto_mounted: false,
-            vault_path: None,
-            last_known_vault_missing: false,
-        });
+        // Persist so the *next* startup finds it the cheap way (no
+        // disk-scan). Defensive temp-dir guard mirrors the
+        // finish_onboarding write-side check; in practice list_disks
+        // never returns temp paths but the cost of the check is
+        // negligible.
+        if !is_under_temp_dir(&found) {
+            let _ = state.config.update(|s| {
+                s.last_active_vault_path = Some(found.clone());
+            });
+        }
+        if let Some(result) = complete_auto_mount(state.inner(), &app, found) {
+            return Ok(result);
+        }
     }
 
-    if !crate::vault::layout::is_vault(&last) {
-        // Path is stale (disk unplugged, vault deleted) — let the user
-        // decide via the welcome screen.
-        return Ok(BootstrapResult {
-            auto_mounted: false,
-            vault_path: Some(last.to_string_lossy().to_string()),
-            last_known_vault_missing: true,
-        });
+    // Step 3: nothing saved, nothing detected. Welcome wizard.
+    Ok(BootstrapResult {
+        auto_mounted: false,
+        vault_path: None,
+        last_known_vault_missing: false,
+    })
+}
+
+/// Wraps the whole "we have a vault path that looks legit, set up
+/// the running app around it" sequence — mount, open DB, start
+/// watcher, emit `mount-state`, kick off background indexing /
+/// MCP-registration. Returns `Some(BootstrapResult { auto_mounted:
+/// true, ... })` on success; `None` if `mount_source` rejects the
+/// path so the caller can decide what to surface.
+///
+/// Extracted out of `bootstrap_app` so both the persisted-path
+/// branch and the auto-detect-fallback branch reuse the same
+/// post-mount machinery — divergence between the two paths would
+/// be subtle (different watcher, different background work) and
+/// the wrong source of bugs to invite.
+fn complete_auto_mount(
+    app_state: &Arc<crate::state::AppState>,
+    app: &AppHandle,
+    vault_path: PathBuf,
+) -> Option<BootstrapResult> {
+    if lifecycle::mount_source(app_state, &vault_path).is_err() {
+        return None;
     }
 
-    if let Err(err) = lifecycle::mount_source(&state, &last) {
-        tracing::warn!(?err, "auto-mount of remembered vault failed");
-        return Ok(BootstrapResult {
-            auto_mounted: false,
-            vault_path: Some(last.to_string_lossy().to_string()),
-            last_known_vault_missing: false,
-        });
+    if let Ok(db) = crate::db::DbHandle::open(&vault_path) {
+        app_state.set_db(Some(db));
     }
 
-    if let Ok(db) = crate::db::DbHandle::open(&last) {
-        state.set_db(Some(db));
-    }
+    let _ = crate::wiki::watcher::spawn(app.clone(), app_state.clone(), vault_path.clone());
 
-    let inner_state: Arc<crate::state::AppState> = state.inner().clone();
-    let _ = crate::wiki::watcher::spawn(app.clone(), inner_state, last.clone());
-
-    let path_str = last.to_string_lossy().to_string();
+    let path_str = vault_path.to_string_lossy().to_string();
     let _ = app.emit(
         "mount-state",
         serde_json::json!({
             "state": "mounted-idle",
-            "vault_path": path_str,
+            "vault_path": path_str.clone(),
         }),
     );
 
     // The two pieces that used to block bootstrap — pages-index rebuild
     // (which can take 30-60 s when bge-m3 needs to re-embed) and MCP
-    // re-registration (5+ subprocess spawns on Windows) — now run in a
+    // re-registration (5+ subprocess spawns on Windows) — run in a
     // background thread. The window navigates straight to the viewer,
     // active-op counters tick the tray pill yellow while they run, and
-    // search/MCP become available the moment they finish. This trades a
-    // black-on-startup window for a "ready to read existing pages
-    // immediately, fully indexed shortly after" feel.
-    spawn_bootstrap_background_work(app.clone(), state.inner().clone(), last);
+    // search/MCP become available the moment they finish.
+    spawn_bootstrap_background_work(app.clone(), app_state.clone(), vault_path);
 
-    Ok(BootstrapResult {
+    Some(BootstrapResult {
         auto_mounted: true,
         vault_path: Some(path_str),
         last_known_vault_missing: false,
@@ -449,6 +514,48 @@ mod tests {
             is_under_temp_dir(&stale),
             "stale AppData/Local/Temp path with forward slashes must also be flagged"
         );
+    }
+
+    #[test]
+    fn find_attached_vault_returns_none_when_no_paths_have_a_marker() {
+        // Empty input + paths that don't exist on disk both yield
+        // None — the bootstrap caller falls through to the onboarding
+        // wizard exactly as before, no behaviour change.
+        let none = find_attached_vault(std::iter::empty()).is_none();
+        assert!(none);
+
+        let nonexistent = find_attached_vault(
+            vec![PathBuf::from("D:/never-existed"), PathBuf::from("/tmp/no")]
+                .into_iter(),
+        );
+        assert!(nonexistent.is_none());
+    }
+
+    #[test]
+    fn find_attached_vault_returns_first_path_with_a_brain_marker() {
+        // Simulates "user plugged in their BRAIN drive but
+        // bootstrap has no saved path for it" — the fallback finds
+        // it via the marker file and returns its mount path so the
+        // caller can mount + persist.
+        use crate::vault::layout::ensure_skeleton;
+        use crate::vault::marker::{write_marker, VaultMarker};
+        let with_vault = tempfile::TempDir::new().unwrap();
+        ensure_skeleton(with_vault.path()).unwrap();
+        write_marker(with_vault.path(), &VaultMarker::new("test")).unwrap();
+
+        let without_vault = tempfile::TempDir::new().unwrap();
+        // Deliberately no skeleton + marker.
+
+        // Pass the no-vault one first so we can see the fallback
+        // *iterates* rather than just picking [0].
+        let found = find_attached_vault(
+            vec![
+                without_vault.path().to_path_buf(),
+                with_vault.path().to_path_buf(),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(found.as_deref(), Some(with_vault.path()));
     }
 
     #[test]
