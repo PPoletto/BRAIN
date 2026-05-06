@@ -6,6 +6,25 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.9] — 2026-05-06
+
+### Fixed
+
+- Toggling the mini-map off no longer crashes the renderer with
+  `Cannot read properties of null (reading 'removeChild')`. The
+  cytoscape-navigator plugin's `destroy()` with the v0.2.8
+  setting `removeCustomContainer: true` calls
+  `this.$panel.parentElement.removeChild(this.$panel)`, but
+  React's commit phase removes the conditionally-rendered
+  `<div id="cy-navigator-container">` from the DOM *before*
+  the effect cleanup fires — so `parentElement` is null when
+  the navigator tries to detach itself. Flipping the option to
+  `removeCustomContainer: false` makes the destroy path take
+  `this.$panel.innerHTML = ''` instead, which is safe on a
+  detached element; React then garbage-collects the empty
+  container during its own unmount. Single-line config change
+  in `GraphCanvas.tsx`.
+
 ## [0.2.8] — 2026-05-06
 
 ### Fixed
@@ -29,17 +48,6 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the inner `.cytoscape-navigatorView` viewport rectangle —
   recoloured from the package's pale baby-blue to BRAIN's
   accent green so it reads on the dark thumbnail.
-- Toggling the mini-map off no longer crashes the renderer with
-  `Cannot read properties of null (reading 'removeChild')`. The
-  plugin's `destroy()` defaults to `parentElement.removeChild
-  (this.$panel)`, but React's commit phase removes the
-  conditionally-rendered container from the DOM *before* the
-  effect cleanup fires — so `parentElement` is null when the
-  navigator tries to detach itself. Setting
-  `removeCustomContainer: false` makes the destroy path empty
-  the container's `innerHTML` instead, which is safe on a
-  detached element; React then GC's the empty container during
-  its own unmount.
 - Bootstrap now auto-mounts an attached BRAIN drive even when
   there's no saved `last_active_vault_path`. Pre-0.2.8 the
   startup flow only tried the persisted path; if that was None
