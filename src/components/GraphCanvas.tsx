@@ -209,15 +209,26 @@ export function GraphCanvas({
     // Layout decision tree:
     //   - hierarchical mode → dagre (top-down tree)
     //   - 0 edges → grid (no force/structure to leverage)
-    //   - every node has a saved position → preset (instant)
-    //   - else → fcose (force-directed)
+    //   - every node has a saved position → preset (instant, no
+    //     force iterations, layout exactly as the user left it)
+    //   - some nodes have saved positions (e.g. a new wiki page
+    //     appeared since the last save) → fcose with
+    //     `randomize: false`, so saved nodes start at their
+    //     persisted coordinates and only the new ones get
+    //     force-placed. Avoids the "every reopen rotates the
+    //     whole graph" feel that randomize-true produces.
+    //   - no positions known → fcose with `randomize: true` so
+    //     nodes don't all collapse onto (0,0) for a degenerate
+    //     "comic row" layout (the v0.2.6 bug).
     const everyNodeHasSavedPosition =
       nodes.length > 0 && nodes.every((n) => positionMap.has(n.id));
+    const someNodeHasSavedPosition = positionMap.size > 0;
     const layoutChoice = pickLayout({
       mode: layoutMode,
       edgeCount: edges.length,
       nodeCount: nodes.length,
       hasFullPreset: everyNodeHasSavedPosition,
+      hasPartialSeeds: someNodeHasSavedPosition,
     });
 
     const cy = cytoscape({
@@ -601,6 +612,7 @@ function pickLayout(args: {
   edgeCount: number;
   nodeCount: number;
   hasFullPreset: boolean;
+  hasPartialSeeds: boolean;
 }): cytoscape.LayoutOptions {
   if (args.mode === "hierarchical") {
     return {
@@ -631,20 +643,24 @@ function pickLayout(args: {
       padding: 40,
     } as cytoscape.LayoutOptions;
   }
-  // fcose default for connected graphs without saved coordinates.
-  // `randomize: true` (the library default) gives nodes random
-  // starting positions so the force iterations have something to
-  // push apart from — without it, every node starts at (0,0) and
-  // the result is a degenerate row, especially with limited
-  // iterations. `quality: "default"` runs the full iteration
-  // budget; with the v0.2.6 position-persistence in place, fcose
-  // only runs *once* per vault before the cached preset takes
-  // over, so paying the full GPU cost once is fine. The earlier
-  // pink-screen mitigations on this layout were a correct gut-
-  // reaction but the wrong knob — the still-active mitigations
-  // (200 ms ResizeObserver debounce + the auto-recover plan-B
+  // fcose for connected graphs. Two flavours:
+  //   - `randomize: false` when at least some nodes have saved
+  //     positions: fcose uses those as starting points and only
+  //     force-places the unknown ones, so adding a new wiki page
+  //     doesn't reshuffle the entire layout. This is the fix for
+  //     the "every reopen rotates" complaint when the graph grew
+  //     between sessions.
+  //   - `randomize: true` for the cold-start case (no saved
+  //     positions at all). Without random seeding every node
+  //     defaults to (0,0) and fcose can't break the symmetry,
+  //     producing a degenerate row layout (the v0.2.6 bug).
+  // `quality: "default"` runs the full iteration budget; with
+  // position persistence in place fcose runs at most once per
+  // vault before the cached preset takes over, so paying the
+  // full GPU cost once is fine. The active pink-screen
+  // mitigations (200 ms ResizeObserver debounce + auto-recover
   // remount on NaN positions) handle the GPU stress without
-  // degrading the layout quality.
+  // degrading layout quality.
   return {
     name: "fcose",
     animate: false,
@@ -654,7 +670,7 @@ function pickLayout(args: {
     idealEdgeLength: 70,
     edgeElasticity: 0.6,
     gravity: 0.3,
-    randomize: true,
+    randomize: !args.hasPartialSeeds,
     quality: "default",
     nodeSeparation: 80,
   } as unknown as cytoscape.LayoutOptions;

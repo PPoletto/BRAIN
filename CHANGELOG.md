@@ -6,6 +6,33 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.10] — 2026-05-06
+
+### Fixed
+
+- Graph layout no longer rotates on every reopen / mini-map toggle.
+  Two underlying causes:
+  - **Race between fcose and the position-save round-trip.** Tier3
+    only mirrored the just-computed coordinates into local state
+    AFTER `saveGraphPositions(...).then(...)` resolved — i.e. after
+    the 400 ms debounce + the Tauri IPC roundtrip, ~500 ms total.
+    Any remount in that window (mini-map toggle, wiki-changed event,
+    filter change) found `savedPositions` still empty, ran fcose
+    again with `randomize: true`, and produced a fresh rotation.
+    `handlePositionsChange` now mirrors positions into local state
+    *immediately*, before the IPC. Subsequent re-mounts within the
+    save window see the fcose result and use `preset`, not `fcose`.
+  - **fcose-with-partial-seeds reshuffled the entire graph.** When
+    a single new wiki page appeared between sessions (one node
+    without a saved position, all others with), the layout
+    dispatcher dropped to fcose with `randomize: true`, ignoring
+    every saved coordinate. Old pages got randomly re-placed.
+    Layout now sets `randomize` based on whether ANY saved seeds
+    exist: cold-start (no saves) keeps `randomize: true` to avoid
+    the (0,0)-collapse degenerate row; partial saves use
+    `randomize: false` so existing pages stay roughly where the
+    user put them and only the new ones get force-placed.
+
 ## [0.2.9] — 2026-05-06
 
 ### Fixed

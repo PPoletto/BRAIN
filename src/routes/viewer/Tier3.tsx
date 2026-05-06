@@ -108,6 +108,32 @@ export function Tier3() {
   // one Tauri call so SQLite never sees a write storm.
   const handlePositionsChange = useCallback(
     (positions: SavedPosition[]) => {
+      // Mirror the new positions into local state IMMEDIATELY —
+      // before the debounce timer or the IPC roundtrip. This was
+      // the cause of the "graph rotates every time I open it / toggle
+      // mini-map" bug: pre-fix, `savedPositions` was only updated
+      // *after* `saveGraphPositions(...).then(...)` resolved, which
+      // takes the 400 ms debounce + the Tauri IPC roundtrip — call it
+      // ~500 ms. Any remount in that window (mini-map toggle,
+      // wiki-changed event, filter change) found `savedPositions`
+      // still empty, ran fcose with `randomize: true` again, and
+      // produced a fresh "rotation" of the layout.
+      // Updating state synchronously closes the window: by the time
+      // any subsequent re-render reads `savedPositions`, the
+      // post-fcose coordinates are already there and the next layout
+      // is `preset`, not `fcose`.
+      setSavedPositions((cur) => {
+        const map = new Map<string, SavedPosition>();
+        for (const p of cur ?? []) map.set(p.page_id, p);
+        for (const p of positions) map.set(p.page_id, p);
+        return Array.from(map.values());
+      });
+
+      // Persist the same positions to the DB asynchronously,
+      // debounced so a flurry of drag events doesn't hammer SQLite.
+      // The save is fire-and-forget for UI purposes — local state is
+      // already consistent regardless of when (or if) the IPC
+      // resolves.
       for (const p of positions) {
         pendingPositionsRef.current.set(p.page_id, p);
       }
@@ -119,22 +145,9 @@ export function Tier3() {
         pendingPositionsRef.current.clear();
         saveTimerRef.current = null;
         if (flush.length === 0) return;
-        commands
-          .saveGraphPositions(flush)
-          .then(() => {
-            // Mirror the just-saved set into local state so the
-            // graph remains in `preset` mode on the next remount
-            // (e.g. after a filter change).
-            setSavedPositions((cur) => {
-              const map = new Map<string, SavedPosition>();
-              for (const p of cur ?? []) map.set(p.page_id, p);
-              for (const p of flush) map.set(p.page_id, p);
-              return Array.from(map.values());
-            });
-          })
-          .catch((e: unknown) => {
-            console.warn("[Tier3] position save failed", e);
-          });
+        commands.saveGraphPositions(flush).catch((e: unknown) => {
+          console.warn("[Tier3] position save failed", e);
+        });
       }, POSITION_SAVE_DEBOUNCE_MS);
     },
     [],
