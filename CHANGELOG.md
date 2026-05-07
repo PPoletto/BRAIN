@@ -6,6 +6,31 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.13] — 2026-05-06
+
+### Fixed
+
+- Mini-map toggle truly does not relayout the graph anymore. The
+  v0.2.10 / v0.2.11 / v0.2.12 attempts kept whittling away at the
+  symptom but never removed the root cause: `showMinimap` was in
+  the create-effect's dependency list, so every toggle destroyed
+  cy and built a fresh one — even with `positionMapRef`'s
+  perfectly preserved coordinates, a freshly-built cy still has
+  to *run* a layout, and any state edge-case in that single run
+  (NaN render coordinates → pink-screen recovery, partial-seed
+  detection, etc.) could degrade the result. The only structurally
+  correct fix is to never rebuild cy on toggle. Mini-map lifecycle
+  is now in a separate `useEffect` keyed on `showMinimap` only;
+  it attaches / detaches `cytoscape-navigator` against the live
+  cy via two helpers (`attachNavigatorIfWanted` /
+  `detachNavigator`) and never touches the cy graph. The main
+  create-effect's deps list lost `showMinimap` and now reads
+  only `[nodes, edges, renderKey, layoutMode, layoutResetSignal]`.
+  When the main effect *does* rebuild cy (e.g. graph data
+  changed), it detaches the navigator first and reattaches via
+  the same helper at the end so a stale instance can never point
+  at a destroyed cy.
+
 ## [0.2.12] — 2026-05-06
 
 ### Changed

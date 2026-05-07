@@ -114,6 +114,22 @@ export function GraphCanvas({
   // can act on the same Cytoscape graph without remounting it.
   const cyRef = useRef<cytoscape.Core | null>(null);
 
+  // Mini-map navigator instance lives in its own ref because its
+  // lifecycle is *deliberately decoupled* from the cy lifecycle.
+  // Toggling the mini-map must not rebuild cy (rebuilding would
+  // re-run a layout, which can rotate the graph) — so the navigator
+  // is attached / detached in a separate effect that does not
+  // touch cy. The main create-effect coordinates with this ref
+  // when it does need to destroy cy: it detaches first, the new
+  // cy gets a fresh navigator on demand.
+  const navInstanceRef = useRef<{ destroy: () => void } | null>(null);
+  // Track the latest `showMinimap` in a ref so the helpers below
+  // (called from both the cy-lifecycle effect and the
+  // showMinimap-effect) can read it without becoming a closure
+  // dependency of either.
+  const showMinimapRef = useRef(showMinimap);
+  showMinimapRef.current = showMinimap;
+
   // Latest callbacks captured in refs so the create-effect doesn't
   // need them in its dependency list — otherwise every parent
   // re-render would tear Cytoscape down and re-mount it. Tier3's
@@ -130,6 +146,48 @@ export function GraphCanvas({
   useEffect(() => {
     onClustersChangeRef.current = onClustersChange;
   }, [onClustersChange]);
+  // Attach the cytoscape-navigator overlay to the current cy
+  // instance, but only if (a) showMinimap is currently true,
+  // (b) we don't already have an instance, (c) cy exists, and
+  // (d) the container div is in the DOM. Idempotent — calling
+  // it twice in a row only attaches once. Used by both the
+  // create-effect (to get a navigator on a freshly-built cy) and
+  // by the showMinimap effect (to react to toggle).
+  const attachNavigatorIfWanted = () => {
+    if (!showMinimapRef.current) return;
+    if (navInstanceRef.current) return;
+    if (!cyRef.current) return;
+    if (typeof document === "undefined") return;
+    const container = document.getElementById(MINIMAP_CONTAINER_ID);
+    if (!container) return;
+    const cyWithNavigator = cyRef.current as cytoscape.Core & {
+      navigator: (opts: Record<string, unknown>) => {
+        destroy: () => void;
+      };
+    };
+    navInstanceRef.current = cyWithNavigator.navigator({
+      container: `#${MINIMAP_CONTAINER_ID}`,
+      viewLiveFramerate: 0,
+      thumbnailEventFramerate: 30,
+      thumbnailLiveFramerate: false,
+      dblClickDelay: 200,
+      // Must be false so the plugin's destroy() empties our
+      // container's innerHTML instead of doing
+      // `parentElement.removeChild(this.$panel)` — by the time
+      // React commits the conditionally-rendered container
+      // disappearing from the DOM, parentElement is already null
+      // and the removeChild call would throw.
+      removeCustomContainer: false,
+      rerenderDelay: 100,
+    });
+  };
+
+  const detachNavigator = () => {
+    if (!navInstanceRef.current) return;
+    navInstanceRef.current.destroy();
+    navInstanceRef.current = null;
+  };
+
   useEffect(() => {
     onNodeClickRef.current = onNodeClick;
   }, [onNodeClick]);
@@ -555,50 +613,13 @@ export function GraphCanvas({
       ]);
     });
 
-    // Mini-map overlay — opt-in via `showMinimap`. When off we
-    // skip both the container render (see JSX below) AND the
-    // navigator instantiation, so users who don't use the overlay
-    // don't pay any GPU/event-binding cost. `viewLiveFramerate: 0`
-    // keeps the redraw cheap when it is shown.
-    //
-    // Important detail uncovered the hard way: cytoscape-navigator
-    // *only* accepts a string CSS selector for `container` (see
-    // node_modules/cytoscape-navigator/cytoscape-navigator.js
-    // line 378). Passing an HTMLElement gets silently ignored and
-    // the plugin builds its own `<div class="cytoscape-navigator">`
-    // attached to `document.body` with the package's hard-coded
-    // 400×400 white styling — that was the giant white block that
-    // covered the version label in v0.2.7. Passing the matching
-    // `#…` id selector makes the plugin actually use our container,
-    // which we then style directly with Tailwind on the JSX side.
-    let nav: { destroy: () => void } | null = null;
-    if (showMinimap && navRef.current) {
-      const cyWithNavigator = cy as cytoscape.Core & {
-        navigator: (opts: Record<string, unknown>) => {
-          destroy: () => void;
-        };
-      };
-      nav = cyWithNavigator.navigator({
-        container: `#${MINIMAP_CONTAINER_ID}`,
-        viewLiveFramerate: 0,
-        thumbnailEventFramerate: 30,
-        thumbnailLiveFramerate: false,
-        dblClickDelay: 200,
-        // CRITICAL: must be false. With true, the plugin's destroy()
-        // calls `this.$panel.parentElement.removeChild(this.$panel)`
-        // — but by the time React's effect cleanup runs, our
-        // container is already detached from the DOM (React's commit
-        // phase removed the conditionally-rendered `{showMinimap &&
-        // <div…>}` element BEFORE the cleanup fires), so
-        // `parentElement` is null and the .removeChild call throws
-        // "Cannot read properties of null". With false the destroy
-        // path takes `this.$panel.innerHTML = ''` which is safe on
-        // a detached element. React then garbage-collects the now-
-        // empty container as part of its normal unmount.
-        removeCustomContainer: false,
-        rerenderDelay: 100,
-      });
-    }
+    // Sync the mini-map navigator to the *current* showMinimap
+    // state. Decoupled from the showMinimap prop so a toggle does
+    // NOT rebuild cy (rebuilding would re-run a layout, which is
+    // exactly the rotation the user kept reporting). The
+    // attach/detach helpers and the dedicated showMinimap effect
+    // below own the navigator lifecycle from this point on.
+    attachNavigatorIfWanted();
 
     // Re-fit when the container resizes. Bursts of resize events on
     // macOS during window-drag used to fire dozens of cy.fit() per
@@ -620,7 +641,10 @@ export function GraphCanvas({
       observer.disconnect();
       if (debounce !== null) clearTimeout(debounce);
       wheelAbort.abort();
-      nav?.destroy();
+      // Detach navigator BEFORE destroying cy — the plugin's
+      // destroy() touches cy internals that disappear once
+      // cy.destroy() has run.
+      detachNavigator();
       cy.destroy();
       cyRef.current = null;
     };
@@ -633,7 +657,33 @@ export function GraphCanvas({
     //     go through their respective refs so a parent re-render
     //     (e.g. setShowMinimap → Tier3 re-renders → fresh callback
     //     identities) does not destroy and recreate cy.
-  }, [nodes, edges, renderKey, layoutMode, showMinimap, layoutResetSignal]);
+    //   - `showMinimap` is owned by the navigator-effect below;
+    //     toggling it must NOT rebuild cy (that re-runs a layout,
+    //     which is the exact "rotation on toggle" bug).
+  }, [nodes, edges, renderKey, layoutMode, layoutResetSignal]);
+
+  // Mini-map navigator lifecycle — fully decoupled from cy. When
+  // the user toggles the toolbar button, we attach (showMinimap →
+  // true) or detach (showMinimap → false) the cytoscape-navigator
+  // instance against the current cyRef. The cy graph itself is
+  // never rebuilt here, so the layout the user is looking at
+  // stays exactly where it is. Cleanup also detaches in case
+  // both showMinimap toggles AND cy is rebuilt by the main effect
+  // — the main effect's cleanup detaches first to avoid a stale
+  // navigator pointing at a destroyed cy.
+  useEffect(() => {
+    if (showMinimap) {
+      attachNavigatorIfWanted();
+    } else {
+      detachNavigator();
+    }
+    return () => {
+      // No-op on plain showMinimap toggles (we already detached
+      // above when going false), but if the GraphCanvas component
+      // unmounts entirely this catches the leaked navigator.
+      detachNavigator();
+    };
+  }, [showMinimap]);
 
   // Focus subset: when the parent (cluster sidebar click) hands us
   // a list of node ids, fit the viewport to just those nodes. Null
