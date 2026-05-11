@@ -669,13 +669,25 @@ export function GraphCanvas({
       ]);
     });
 
-    // Zoom-aware node sizing — shrink nodes when the user zooms in
-    // so the neighbourhood stays readable (more nodes fit in the
-    // viewport, labels don't overlap less and less as the user
-    // gets closer). Uses 1/√zoom so the scaling is moderate: at
-    // 2× zoom nodes are ~71 % of their base size, at 4× ~50 %.
-    // Throttled to one rAF tick because cy fires zoom events
-    // continuously during a wheel gesture.
+    // Zoom-aware visual sizing — shrink nodes, labels, edges and
+    // arrows when the user zooms in so the neighbourhood stays
+    // readable (more nodes fit in the viewport, labels don't bloat
+    // to dozens of pixels, edges stay as thin connecting strokes
+    // instead of fat ribbons). Uses 1/√zoom so the scaling is
+    // moderate: at 2× zoom everything is ~71 % of its base size,
+    // at 4× ~50 %. Throttled to one rAF tick because cy fires zoom
+    // events continuously during a wheel gesture.
+    //
+    // The 0.2.14 version of this handler only scaled width/height
+    // on nodes. Pascal hit the symptom at high zoom on his vault
+    // (~166 nodes / 966 edges): with `font-size: 11` and `width: 2`
+    // in world coordinates, cytoscape rendered labels at ~55 px
+    // and edges at ~10 px at the zoom level he was inspecting —
+    // text dominated the canvas, edges looked like fat ribbons,
+    // node circles were dwarfed. Mirroring the same 1/√zoom on
+    // font-size, text-outline-width, edge width and arrow-scale
+    // keeps the visual hierarchy consistent across the whole
+    // zoom range.
     let zoomRafId = 0;
     const updateZoomScaledSizes = () => {
       const scale = 1 / Math.sqrt(cy.zoom());
@@ -684,6 +696,19 @@ export function GraphCanvas({
           Math.min(14 + ele.degree(false) * 1.5, 38) * scale,
         height: (ele: cytoscape.NodeSingular) =>
           Math.min(14 + ele.degree(false) * 1.5, 38) * scale,
+        "font-size": 11 * scale,
+        // text-outline-width is the dark halo behind labels
+        // (`text-outline-color: "#0a0a0a"` in the stylesheet
+        // above) — without scaling it grows along with the
+        // font and turns into a chunky black box around each
+        // label at high zoom.
+        "text-outline-width": 2 * scale,
+      });
+      cy.edges().style({
+        width: 2 * scale,
+        // arrow-scale is a multiplier on top of the edge width,
+        // so it shrinks proportionally without separate tuning.
+        "arrow-scale": 1.0 * scale,
       });
     };
     cy.on("zoom", () => {

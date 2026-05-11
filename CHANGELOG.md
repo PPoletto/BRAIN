@@ -6,6 +6,21 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Graph labels and edges now shrink along with nodes when zooming
+  in.** The v0.2.14 zoom-aware sizing only scaled `width`/`height`
+  on nodes — labels (`font-size`), label haloes
+  (`text-outline-width`), edge widths and arrow heads stayed at
+  their base values and grew linearly with `cy.zoom()` (Cytoscape
+  renders all of those in world coordinates by default). On a
+  ~166-node / 966-edge vault inspected at moderate zoom this produced
+  ~55 px labels that fully covered the canvas, fat ribbon-like
+  edges, and dwarfed node circles. The handler now applies the
+  same `1 / √zoom` to font-size, text-outline-width, edge width and
+  arrow-scale, so the visual hierarchy stays balanced across the
+  full zoom range.
+
 ### Added
 
 - **Lint warns about unregistered frontmatter `type:` values.** The
