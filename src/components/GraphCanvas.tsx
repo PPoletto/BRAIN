@@ -358,15 +358,17 @@ export function GraphCanvas({
             "text-outline-width": 2,
             // Degree-based sizing: pages with more wiki-link
             // connections grow larger, giving the graph visual
-            // hierarchy without any extra UI. Floor at 22 px so
-            // isolated nodes stay clickable; cap at 56 px so a
-            // hub-of-hubs doesn't dominate the canvas. Linear in
-            // (in+out) degree, two pixels per connection — produces
-            // the right perceptual spread on vaults of 50–500 nodes.
+            // hierarchy without any extra UI. Floor at 14 px so
+            // isolated nodes stay clickable; cap at 38 px so a
+            // hub-of-hubs doesn't dominate the canvas. The static
+            // values (used at zoom = 1) get scaled inversely with
+            // zoom level by the `cy.on("zoom", …)` handler below —
+            // zooming in shrinks nodes so the user sees more of
+            // their neighbourhood at higher detail levels.
             width: (ele: cytoscape.NodeSingular) =>
-              Math.min(22 + ele.degree(false) * 2, 56),
+              Math.min(14 + ele.degree(false) * 1.5, 38),
             height: (ele: cytoscape.NodeSingular) =>
-              Math.min(22 + ele.degree(false) * 2, 56),
+              Math.min(14 + ele.degree(false) * 1.5, 38),
             "background-color": (ele: cytoscape.NodeSingular) =>
               TYPE_COLORS[ele.data("type") as string] ?? "#9ca3af",
             "border-width": 1,
@@ -613,6 +615,28 @@ export function GraphCanvas({
       ]);
     });
 
+    // Zoom-aware node sizing — shrink nodes when the user zooms in
+    // so the neighbourhood stays readable (more nodes fit in the
+    // viewport, labels don't overlap less and less as the user
+    // gets closer). Uses 1/√zoom so the scaling is moderate: at
+    // 2× zoom nodes are ~71 % of their base size, at 4× ~50 %.
+    // Throttled to one rAF tick because cy fires zoom events
+    // continuously during a wheel gesture.
+    let zoomRafId = 0;
+    const updateZoomScaledSizes = () => {
+      const scale = 1 / Math.sqrt(cy.zoom());
+      cy.nodes().style({
+        width: (ele: cytoscape.NodeSingular) =>
+          Math.min(14 + ele.degree(false) * 1.5, 38) * scale,
+        height: (ele: cytoscape.NodeSingular) =>
+          Math.min(14 + ele.degree(false) * 1.5, 38) * scale,
+      });
+    };
+    cy.on("zoom", () => {
+      cancelAnimationFrame(zoomRafId);
+      zoomRafId = requestAnimationFrame(updateZoomScaledSizes);
+    });
+
     // Sync the mini-map navigator to the *current* showMinimap
     // state. Decoupled from the showMinimap prop so a toggle does
     // NOT rebuild cy (rebuilding would re-run a layout, which is
@@ -640,6 +664,7 @@ export function GraphCanvas({
     return () => {
       observer.disconnect();
       if (debounce !== null) clearTimeout(debounce);
+      cancelAnimationFrame(zoomRafId);
       wheelAbort.abort();
       // Detach navigator BEFORE destroying cy — the plugin's
       // destroy() touches cy internals that disappear once
@@ -848,18 +873,25 @@ function pickLayout(args: {
   // mitigations (200 ms ResizeObserver debounce + auto-recover
   // remount on NaN positions) handle the GPU stress without
   // degrading layout quality.
+  // Spread tuned for vaults of 50–500 nodes: `nodeRepulsion`,
+  // `idealEdgeLength` and `nodeSeparation` are all bumped over
+  // the library defaults so dense clusters get readable breathing
+  // room. Pre-0.2.14 these were respectively 12000 / 70 / 80
+  // which left hub-of-hubs nodes overlapping their neighbours;
+  // 28000 / 120 / 140 pushes them apart enough that labels stop
+  // colliding at default zoom.
   return {
     name: "fcose",
     animate: false,
     fit: true,
     padding: 50,
-    nodeRepulsion: 12000,
-    idealEdgeLength: 70,
+    nodeRepulsion: 28000,
+    idealEdgeLength: 120,
     edgeElasticity: 0.6,
     gravity: 0.3,
     randomize: !args.hasPartialSeeds,
     quality: "default",
-    nodeSeparation: 80,
+    nodeSeparation: 140,
   } as unknown as cytoscape.LayoutOptions;
 }
 

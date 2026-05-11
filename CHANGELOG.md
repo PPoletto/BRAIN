@@ -6,6 +6,27 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.14] — 2026-05-06
+
+### Changed
+
+- Graph layout breathes properly on dense vaults. Three tunings
+  reinforce each other:
+  - **fcose spread bumped**: `nodeRepulsion` 12000 → 28000,
+    `idealEdgeLength` 70 → 120, `nodeSeparation` 80 → 140. On
+    vaults of 50–500 nodes this stops hub-of-hubs from
+    overlapping its neighbours and lets labels read at default
+    zoom.
+  - **Smaller base node sizes**: floor 22 px → 14 px, slope
+    ×2 → ×1.5 per connection, cap 56 px → 38 px. Hubs stay
+    visually distinguishable without dominating the canvas.
+  - **Zoom-aware shrink**: a new `cy.on("zoom", …)` listener
+    rescales node widths by `1 / √zoom`. Zooming in to inspect
+    a neighbourhood now shrinks nodes (at 2× zoom they're ~71 %
+    of base size, at 4× ~50 %) instead of bloating them into
+    each other. Throttled to one `requestAnimationFrame` tick
+    per zoom burst so it doesn't fight the zoom gesture.
+
 ## [0.2.13] — 2026-05-06
 
 ### Fixed
