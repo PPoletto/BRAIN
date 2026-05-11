@@ -6,20 +6,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Fixed
-
-- **Graph labels and edges now shrink along with nodes when zooming
-  in.** The v0.2.14 zoom-aware sizing only scaled `width`/`height`
-  on nodes — labels (`font-size`), label haloes
-  (`text-outline-width`), edge widths and arrow heads stayed at
-  their base values and grew linearly with `cy.zoom()` (Cytoscape
-  renders all of those in world coordinates by default). On a
-  ~166-node / 966-edge vault inspected at moderate zoom this produced
-  ~55 px labels that fully covered the canvas, fat ribbon-like
-  edges, and dwarfed node circles. The handler now applies the
-  same `1 / √zoom` to font-size, text-outline-width, edge width and
-  arrow-scale, so the visual hierarchy stays balanced across the
-  full zoom range.
+## [0.2.16] — 2026-05-11
 
 ### Added
 
@@ -45,6 +32,40 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   intended workflow when the user says "fix all lint issues" is:
   call `brain_lint_report` → iterate, fix each entry via
   `brain_write_page` → call again until both arrays are empty.
+
+### Fixed
+
+- **Graph labels and edges now shrink along with nodes when zooming
+  in.** The v0.2.14 zoom-aware sizing only scaled `width`/`height`
+  on nodes — labels (`font-size`), label haloes
+  (`text-outline-width`), edge widths and arrow heads stayed at
+  their base values and grew linearly with `cy.zoom()` (Cytoscape
+  renders all of those in world coordinates by default). On a
+  ~166-node / 966-edge vault inspected at moderate zoom this produced
+  ~55 px labels that fully covered the canvas, fat ribbon-like
+  edges, and dwarfed node circles. The handler now applies the
+  same `1 / √zoom` to font-size, text-outline-width, edge width and
+  arrow-scale, so the visual hierarchy stays balanced across the
+  full zoom range.
+
+### Migration notes (for existing 0.2.x users)
+
+- **No breaking changes.** Existing vaults open and work unchanged
+  on first launch. The new lint rule is a Warning, not an Error;
+  pages with a non-canonical `type:` value (typical drift: the
+  directory plural `entities` instead of the singular `entity`)
+  stay fully readable, indexed and graph-visible, they just get
+  flagged in the lint toast and in `brain_lint_report`. Auto-
+  commit continues to run.
+- **No schema or DB migration required.** Drop-in update.
+- **Optional cleanup.** Vaults that accumulated drift can be
+  cleaned by asking an MCP-connected agent: *"Call brain_lint_
+  report. For every `unregistered-type` warning, read the page,
+  change the frontmatter type to the singular form (`entities`
+  → `entity` etc.), write it back via brain_write_page. Repeat
+  until warnings is empty."* Same flow handles `non-canonical-
+  wiki-link` warnings (brain_write_page auto-normalises markdown
+  links on every save).
 
 ## [0.2.15] — 2026-05-11
 
