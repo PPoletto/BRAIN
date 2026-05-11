@@ -13,6 +13,17 @@ use regex::Regex;
 use super::page::{parse, ParsedPage};
 use super::WikiResult;
 
+/// Canonical singular `type:` values accepted in page frontmatter. The
+/// project intentionally keeps this list hardcoded: introducing a new
+/// page-type is a design decision, not a per-page choice, and a code
+/// change makes that conscious. Pages whose frontmatter type falls
+/// outside this set are surfaced as `unregistered-type` Warnings — never
+/// as Errors — so reads, auto-commits and the indexer continue to see
+/// them unchanged. An agent or the user then corrects the field via
+/// `brain_write_page` (the typical case is the directory-name plural,
+/// e.g. `type: entities` → `type: entity`).
+pub const KNOWN_TYPES: &[&str] = &["entity", "concept", "source", "topic"];
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct LintReport {
     pub errors: Vec<LintError>,
@@ -101,6 +112,23 @@ pub fn lint(vault: &Path) -> WikiResult<LintReport> {
                 path: file.to_string_lossy().to_string(),
                 kind: "missing-title".into(),
                 message: "frontmatter has no 'title' field".into(),
+            });
+        }
+        // Type-registry check. Pure warning: parse() already accepted
+        // the page and the indexer has indexed it. We only flag that
+        // the value isn't one of the canonical singular forms so a
+        // follow-up brain_write_page can correct it. No error path —
+        // see `lint_does_not_block_commit_on_unregistered_type_warning`.
+        if !KNOWN_TYPES.contains(&parsed.frontmatter.page_type.as_str()) {
+            warnings.push(LintWarning {
+                path: file.to_string_lossy().to_string(),
+                kind: "unregistered-type".into(),
+                message: format!(
+                    "frontmatter type '{}' is not in the registered set {:?}; \
+                     change it to one of those, or place the artifact under \
+                     01_raw/ if it doesn't fit any wiki category",
+                    parsed.frontmatter.page_type, KNOWN_TYPES,
+                ),
             });
         }
         // Soft warning: markdown-style links pointing at a wiki page
@@ -254,6 +282,102 @@ mod tests {
                 .iter()
                 .any(|w| w.kind == "non-canonical-wiki-link"),
             "missing non-canonical-wiki-link warning: {:#?}",
+            report.warnings
+        );
+    }
+
+    /// Helper: writes a page with an arbitrary `type:` field, so the type-
+    /// registry tests can exercise registered and unregistered values
+    /// without the standard `page()` helper forcing `entity` on them.
+    fn page_with_type(id: &str, page_type: &str, body: &str) -> String {
+        format!(
+            "---\nid: {id}\ntype: {page_type}\ntitle: t\ncreated: 2026-04-29\nupdated: 2026-04-29\n---\n\n{body}\n"
+        )
+    }
+
+    #[test]
+    fn lint_warns_when_frontmatter_type_is_not_in_registered_set() {
+        let tmp = make_vault();
+        // `entities` (plural) is not in KNOWN_TYPES — exactly the
+        // schema-drift case the user hit when an MCP agent matched the
+        // type-field to the directory name instead of the canonical
+        // singular form.
+        write_page(
+            tmp.path(),
+            "entities",
+            "alice",
+            &page_with_type("entities/alice", "entities", "hi"),
+        );
+        let report = lint(tmp.path()).unwrap();
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.kind == "unregistered-type"),
+            "expected an unregistered-type warning, got warnings = {:#?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn lint_does_not_block_commit_on_unregistered_type_warning() {
+        let tmp = make_vault();
+        write_page(
+            tmp.path(),
+            "entities",
+            "alice",
+            &page_with_type("entities/alice", "entities", "hi"),
+        );
+        let report = lint(tmp.path()).unwrap();
+        // The rule is a Warning, not an Error — auto-commit must keep
+        // running so the user can correct the field via the next edit
+        // or have an agent fix it via brain_write_page. Blocking would
+        // strand the page in a half-saved state.
+        assert!(
+            report.is_clean(),
+            "unregistered type must not produce an Error: {:#?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn lint_accepts_all_registered_types_without_unregistered_warning() {
+        let tmp = make_vault();
+        // One page per canonical singular type — none of them should
+        // trip the new rule. Other warnings (missing-title etc.) are
+        // not under test here.
+        write_page(
+            tmp.path(),
+            "entities",
+            "a",
+            &page_with_type("entities/a", "entity", "x"),
+        );
+        write_page(
+            tmp.path(),
+            "concepts",
+            "b",
+            &page_with_type("concepts/b", "concept", "x"),
+        );
+        write_page(
+            tmp.path(),
+            "sources",
+            "c",
+            &page_with_type("sources/c", "source", "x"),
+        );
+        write_page(
+            tmp.path(),
+            "topics",
+            "d",
+            &page_with_type("topics/d", "topic", "x"),
+        );
+        let report = lint(tmp.path()).unwrap();
+        assert!(
+            report
+                .warnings
+                .iter()
+                .all(|w| w.kind != "unregistered-type"),
+            "no unregistered-type warning expected for canonical types, \
+             got: {:#?}",
             report.warnings
         );
     }

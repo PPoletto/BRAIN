@@ -6,6 +6,31 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Lint warns about unregistered frontmatter `type:` values.** The
+  set of canonical singular page-types is now hardcoded as
+  `KNOWN_TYPES = ["entity", "concept", "source", "topic"]` in
+  `wiki/lint.rs`. Pages whose `type:` falls outside that set produce
+  a Warning of kind `unregistered-type` — never an Error — so reads,
+  auto-commits, the indexer and the graph continue to see them
+  unchanged. The warning carries the offending value so an agent
+  can correct it in one round-trip (typical case: the directory
+  name plural `type: entities` slipped in via an MCP write and
+  needs to become `type: entity`). Introducing a new page-type
+  stays a deliberate design decision via code change; for one-off
+  artifacts that don't fit any category, the warning explicitly
+  points at `01_raw/`.
+- **New MCP tool `brain_lint_report`.** Returns the current
+  `{errors, warnings}` from the same lint pass that drives the
+  auto-commit watcher and the Tauri toast bridge. Closes the loop
+  where external MCP clients (Claude Code, Ollama-driven hosts, …)
+  could see the user's wiki *change* via `brain_get_page` /
+  `brain_search` but had no path to inspect *its lint state*. The
+  intended workflow when the user says "fix all lint issues" is:
+  call `brain_lint_report` → iterate, fix each entry via
+  `brain_write_page` → call again until both arrays are empty.
+
 ## [0.2.15] — 2026-05-11
 
 ### Fixed

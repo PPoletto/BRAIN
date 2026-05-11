@@ -390,6 +390,14 @@ fn tool_descriptors() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "brain_lint_report",
+            "description": "Return the current lint state of the wiki as { errors, warnings } — both are arrays of { path, kind, message }. Errors block auto-commits, warnings don't. Common warning kinds you should fix in place via brain_write_page: 'unregistered-type' (frontmatter type isn't one of entity/concept/source/topic — usually a plural slipped in), 'missing-title', 'non-canonical-wiki-link'. Common error kinds: 'frontmatter' (malformed YAML), 'duplicate-id' (two files share an id), 'broken-link' (wiki link points at a missing page). Use this when the user asks you to clean up the wiki: loop through the report, fix each entry, then call again until clean.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        json!({
             "name": "brain_query",
             "description": "Dataview-style structured query against page metadata. Supports fields id, type, title, tag, created, updated; operators `:` (eq), `:>`, `:<`; AND, OR, NOT; quoted values for spaces. Examples: `type:source AND tag:customer AND updated:>2026-04-01`, `tag:nis2 OR tag:dora`, `NOT type:source AND title:\"NLSpec\"`. Use this for filtered listings; use brain_search for free-text search.",
             "inputSchema": {
@@ -589,6 +597,16 @@ fn call_tool(
             let hits = crate::viewer::query::executor::run(handle, query)
                 .map_err(|e| e.to_string())?;
             Ok(serde_json::to_string_pretty(&hits).unwrap_or_default())
+        }
+        "brain_lint_report" => {
+            // Read-only view of the same lint pass that drives the
+            // auto-commit watcher and the Tauri toast bridge. Errors
+            // block commits in the watcher; warnings don't. Surfacing
+            // both here lets an agent triage which to fix first — and
+            // closes the loop where the user could see a `wiki-lint-
+            // error` toast but the LLM had no MCP path to inspect it.
+            let report = lint::lint(vault).map_err(|e| e.to_string())?;
+            Ok(serde_json::to_string_pretty(&report).unwrap_or_default())
         }
         other => Err(format!("unknown tool: {other}")),
     }
@@ -862,6 +880,7 @@ mod tests {
             "brain_write_raw_file",
             "brain_graph",
             "brain_query",
+            "brain_lint_report",
         ] {
             assert!(
                 resp.contains(name),
@@ -971,6 +990,61 @@ mod tests {
         assert!(result.contains("concepts/nlspec"));
         // Must not surface any lint chatter.
         assert!(!result.contains("lint:"), "result leaks lint-error: {result}");
+    }
+
+    #[test]
+    fn brain_lint_report_surfaces_unregistered_type_warning_for_agent_cleanup() {
+        // The agent-cleanup workflow: an MCP client (Claude Code, an
+        // Ollama-driven host, …) is told "fix all lint problems" and
+        // calls this tool to discover *which* pages are wrong. The
+        // unregistered-type warning is the most common one in the wild
+        // — pluralised `type:` slipped in by an earlier write — so we
+        // assert it surfaces with the offending value and path the
+        // agent will need to write back via brain_write_page.
+        use tempfile::TempDir;
+        use crate::vault::layout::{ensure_skeleton, wiki_dir};
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        seed_marker(tmp.path());
+        let entities = wiki_dir(tmp.path()).join("entities");
+        std::fs::create_dir_all(&entities).unwrap();
+        // Clean page — must not appear in the warning list.
+        std::fs::write(
+            entities.join("alice.md"),
+            "---\nid: entities/alice\ntype: entity\ntitle: Alice\ncreated: 2026-04-30\nupdated: 2026-04-30\n---\n\nbody\n",
+        )
+        .unwrap();
+        // Drifted page — `entities` (plural) is not a registered type.
+        std::fs::write(
+            entities.join("bob.md"),
+            "---\nid: entities/bob\ntype: entities\ntitle: Bob\ncreated: 2026-04-30\nupdated: 2026-04-30\n---\n\nbody\n",
+        )
+        .unwrap();
+        let result = call_tool(
+            &json!({
+                "name": "brain_lint_report",
+                "arguments": {}
+            }),
+            tmp.path(),
+            None,
+        )
+        .expect("brain_lint_report should succeed");
+        assert!(
+            result.contains("unregistered-type"),
+            "missing unregistered-type kind: {result}"
+        );
+        assert!(
+            result.contains("bob.md"),
+            "warning should name the offending file: {result}"
+        );
+        // Sanity: the clean page must not produce a same-kind warning.
+        // Cheap proxy — alice.md should not appear next to the kind.
+        let kind_idx = result.find("\"unregistered-type\"").unwrap();
+        let around = &result[kind_idx.saturating_sub(200)..result.len().min(kind_idx + 400)];
+        assert!(
+            !around.contains("alice.md"),
+            "unregistered-type warning is wrongly attached to alice.md: {around}"
+        );
     }
 
     #[test]
