@@ -9,6 +9,7 @@ import {
 } from "../../components/GraphCanvas";
 import { Button } from "../../components/ui/Button";
 import { EmptyState } from "../../components/ui/EmptyState";
+import { useToast } from "../../components/ui/toast-context";
 
 type Graph = Awaited<ReturnType<typeof commands.getGraph>>;
 
@@ -50,6 +51,18 @@ export function Tier3() {
   // ignore non-reset savedPositions changes in the ref to prevent
   // toggle-rotation races).
   const [layoutResetSignal, setLayoutResetSignal] = useState(0);
+
+  // Used to surface position-save failures. Without this, an IPC
+  // failure during `saveGraphPositions` would only land in the
+  // DevTools console and the user would wrongly assume their
+  // layout is being persisted — then come back next session and
+  // see fresh fcose every time.
+  const { push: pushToast } = useToast();
+  // One-shot guard so a sustained save failure doesn't spam the
+  // toast layer on every drag. Reset on each fresh Tier3 mount so
+  // a transient failure earlier in the session doesn't permanently
+  // silence the warning.
+  const saveFailureReportedRef = useRef(false);
 
   // Persistent layout. `null` = haven't loaded yet; `[]` = loaded,
   // empty (first time the user opens the graph). Both behave the
@@ -156,11 +169,62 @@ export function Tier3() {
         if (flush.length === 0) return;
         commands.saveGraphPositions(flush).catch((e: unknown) => {
           console.warn("[Tier3] position save failed", e);
+          // Surface the failure to the user — silently swallowing
+          // it is what produced the "graph randomises every time
+          // I come back" reports: in-memory positions look fine
+          // for the session, the DB never gets them, and the next
+          // mount falls back to fcose. One-shot per Tier3 mount
+          // so a sustained failure doesn't carpet-bomb toasts.
+          if (!saveFailureReportedRef.current) {
+            saveFailureReportedRef.current = true;
+            pushToast({
+              kind: "warning",
+              message: "Graph layout couldn't be saved",
+              detail:
+                "Your hand-tuned positions for this session are fine, but the next time you reopen the graph it will fall back to auto-layout. " +
+                (e instanceof Error ? e.message : String(e)),
+            });
+          }
         });
       }, POSITION_SAVE_DEBOUNCE_MS);
     },
-    [],
+    [pushToast],
   );
+
+  // Flush-on-unmount. Without this, navigating away from the Graph
+  // tab while a debounce window is open (the 400 ms after the last
+  // drag) silently drops the queued save: React unmounts Tier3,
+  // setTimeout's callback is garbage-collected with the closure, and
+  // the positions never reach SQLite. On the next return to the
+  // Graph tab fcose re-runs from scratch and the user sees their
+  // hand-tuned layout "randomised". The cleanup body cancels the
+  // pending timer and fires a final saveGraphPositions immediately
+  // so the IPC is in flight before unmount completes.
+  useEffect(() => {
+    // Capture the refs at effect-setup time so the cleanup reads the
+    // same Map/Timer object the rest of the component has been
+    // mutating throughout the session. The refs themselves are stable
+    // (mutable boxes) — what matters is that we read `.current` at
+    // cleanup time, which is exactly what `pending.values()` does
+    // because `pending` is the same Map object.
+    const pending = pendingPositionsRef.current;
+    const timerHolder = saveTimerRef;
+    return () => {
+      if (timerHolder.current !== null) {
+        clearTimeout(timerHolder.current);
+        timerHolder.current = null;
+      }
+      const flush = Array.from(pending.values());
+      pending.clear();
+      if (flush.length === 0) return;
+      commands.saveGraphPositions(flush).catch((e: unknown) => {
+        // Best-effort — Tier3 is gone, so a toast wouldn't reach the
+        // user anyway. The next mount will fall back to fcose and the
+        // failure toast will fire from there on the next drag.
+        console.warn("[Tier3] flush-on-unmount position save failed", e);
+      });
+    };
+  }, []);
 
   // "Re-layout" button. Clears the saved-positions table, resets the
   // local state to empty, and lets the next mount fall back to fcose.

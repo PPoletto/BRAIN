@@ -325,12 +325,37 @@ export function GraphCanvas({
     const everyNodeHasSavedPosition =
       nodes.length > 0 && nodes.every((n) => positionMap.has(n.id));
     const someNodeHasSavedPosition = positionMap.size > 0;
+    // For partial-seeds fcose runs we hand the saved positions to
+    // the layout engine as `fixedNodeConstraint`. fcose will keep
+    // these nodes EXACTLY where they are during the force pass —
+    // only the new (unknown-position) nodes get force-placed.
+    // Without this constraint, fcose's force iterations gradually
+    // drift the known nodes too, producing the "everything rotated
+    // slightly when I came back to the tab" feel even though
+    // `randomize: false` told it to start from existing positions.
+    // For the full-preset and no-seeds cases the array is harmless:
+    // preset doesn't read fixedNodeConstraint, and a zero-seeds
+    // fcose run with an empty array behaves as if it weren't set.
+    const fixedConstraints: Array<{
+      nodeId: string;
+      position: { x: number; y: number };
+    }> = [];
+    for (const n of nodes) {
+      const saved = positionMap.get(n.id);
+      if (saved) {
+        fixedConstraints.push({
+          nodeId: n.id,
+          position: { x: saved.x, y: saved.y },
+        });
+      }
+    }
     const layoutChoice = pickLayout({
       mode: layoutMode,
       edgeCount: edges.length,
       nodeCount: nodes.length,
       hasFullPreset: everyNodeHasSavedPosition,
       hasPartialSeeds: someNodeHasSavedPosition,
+      fixedConstraints,
     });
 
     const cy = cytoscape({
@@ -825,6 +850,10 @@ function pickLayout(args: {
   nodeCount: number;
   hasFullPreset: boolean;
   hasPartialSeeds: boolean;
+  fixedConstraints: Array<{
+    nodeId: string;
+    position: { x: number; y: number };
+  }>;
 }): cytoscape.LayoutOptions {
   if (args.mode === "hierarchical") {
     return {
@@ -892,6 +921,12 @@ function pickLayout(args: {
     randomize: !args.hasPartialSeeds,
     quality: "default",
     nodeSeparation: 140,
+    // Lock any node we already have a saved position for. fcose
+    // will run forces against the *new* nodes only — existing
+    // pages stay exactly where they were last time, no drift.
+    // Empty array on cold start, full set when only one wiki page
+    // appeared since the last layout.
+    fixedNodeConstraint: args.fixedConstraints,
   } as unknown as cytoscape.LayoutOptions;
 }
 

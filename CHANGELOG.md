@@ -27,6 +27,41 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     each other. Throttled to one `requestAnimationFrame` tick
     per zoom burst so it doesn't fight the zoom gesture.
 
+### Fixed
+
+- Graph no longer "randomises" when the user navigates from
+  another tab back into Graph. Three interlocking root causes
+  were dismantled:
+  - **Flush-on-unmount**: Tier3 used to drop any save still
+    inside the 400 ms debounce window when React unmounted it
+    on route change — `setTimeout`'s callback was garbage-
+    collected with the closure and the positions never reached
+    SQLite. A cleanup useEffect now cancels the timer *and*
+    fires a final `saveGraphPositions(...)` immediately so the
+    IPC is in flight before unmount completes.
+  - **fcose `fixedNodeConstraint`**: when only some nodes had
+    persisted positions (new pages joined an existing layout)
+    fcose's partial-seed path used to nudge the saved nodes
+    along with the rest. Pre-existing saved positions are now
+    passed in `fixedNodeConstraint`, freezing them as anchors
+    so the force iterations move only the new arrivals.
+  - **Visible save-failure feedback**: a silent IPC failure
+    used to leave the user thinking their hand-tuned layout
+    was being persisted while in fact every reopen fell back
+    to fresh fcose. Saves now surface as a warning toast
+    ("Graph layout couldn't be saved") on first failure of
+    a Tier3 mount, with a one-shot guard so a sustained
+    backend issue doesn't carpet-bomb the toast layer.
+- History tab opens instantly on first visit. `wikiHistory(100)`
+  is now warmed in the background by `AppShell` on shell mount
+  via a new `useWikiHistoryStore` (zustand) cache. The History
+  view consumes from the store instead of firing its own IPC,
+  and a `wiki-changed` subscription on the shell invalidates
+  the cache after every auto-commit so the timeline stays
+  fresh. Restore/hard-reset actions also nudge the store so
+  the new "revert: …" / "reset: …" commits show without
+  waiting for the event roundtrip.
+
 ## [0.2.13] — 2026-05-06
 
 ### Fixed

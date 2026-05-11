@@ -6,9 +6,10 @@ import { StatusBar } from "./StatusBar";
 import { DefaultShortcuts } from "../ui/KeyboardShortcuts";
 import { BackendToastsBridge } from "../ui/Toast";
 import { useToast } from "../ui/toast-context";
-import { onMountState, onWikiLintReport } from "../../lib/events";
+import { onMountState, onWikiChanged, onWikiLintReport } from "../../lib/events";
 import { commands } from "../../lib/commands";
 import { useAppState } from "../../lib/state";
+import { useWikiHistoryStore } from "../../lib/wikiHistoryStore";
 
 /// Persistent app shell rendered for every mounted-Brain route.
 /// Hosts:
@@ -95,6 +96,35 @@ export function AppShell() {
       unlisten?.();
     };
   }, [setTray]);
+
+  // Wiki-history prefetch. The History tab's `commands.wikiHistory(100)`
+  // IPC walks the Git log + computes per-commit file counts, which can
+  // take ~1–2 s on a vault with a few thousand commits. Fetching it
+  // once when the shell mounts (i.e. as soon as the vault is up) means
+  // the user's *first* visit to the History tab renders from the
+  // already-warm cache — even if they never click into History at all,
+  // the cost is one background IPC at shell-mount time.
+  //
+  // The store is also subscribed to `wiki-changed` below so a fresh
+  // auto-commit refreshes the cached timeline before the next visit.
+  const prefetchHistory = useWikiHistoryStore((s) => s.prefetch);
+  const invalidateHistory = useWikiHistoryStore((s) => s.invalidate);
+
+  useEffect(() => {
+    prefetchHistory();
+  }, [prefetchHistory]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void onWikiChanged(() => {
+      invalidateHistory();
+    }).then((u) => {
+      unlisten = u;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, [invalidateHistory]);
 
   return (
     <div className="flex h-screen w-screen flex-col bg-neutral-950">

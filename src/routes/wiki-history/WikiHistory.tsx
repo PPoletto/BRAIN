@@ -6,36 +6,39 @@ import { EmptyState } from "../../components/ui/EmptyState";
 import { ResizableSplit } from "../../components/ui/ResizableSplit";
 import { Button } from "../../components/ui/Button";
 import { useAsyncAction } from "../../components/ui/useAsyncAction";
+import { useWikiHistoryStore } from "../../lib/wikiHistoryStore";
 
-type Commit = Awaited<ReturnType<typeof commands.wikiHistory>>[number];
 type Detail = Awaited<ReturnType<typeof commands.wikiCommitDetail>>;
 
 export function WikiHistory() {
   const navigate = useNavigate();
-  const [commits, setCommits] = useState<Commit[]>([]);
+  // Read from the prefetched store. AppShell warms this on shell mount
+  // so the first visit to History renders instantly from cache; the
+  // local component used to fire its own `wikiHistory(100)` here and
+  // sit on a spinner for ~1–2 s while the IPC walked the Git log.
+  const cachedEntries = useWikiHistoryStore((s) => s.entries);
+  const storeLoading = useWikiHistoryStore((s) => s.loading);
+  const storeError = useWikiHistoryStore((s) => s.error);
+  const invalidateHistory = useWikiHistoryStore((s) => s.invalidate);
+  const commits = cachedEntries ?? [];
+  // Only show the "Loading…" placeholder for the cold-cache case
+  // (entries still null). Once we have entries — even stale ones — we
+  // render them and let a background refresh swap them in.
+  const loading = cachedEntries === null && storeLoading;
   const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const displayError = error ?? storeError;
   const [selected, setSelected] = useState<string | null>(null);
   const [detail, setDetail] = useState<Detail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
 
-  useEffect(() => {
-    commands
-      .wikiHistory(100)
-      .then(setCommits)
-      .catch((e: unknown) => setError(String(e)))
-      .finally(() => setLoading(false));
-  }, []);
-
   // Live-update on every auto-commit so the timeline grows in real
   // time without the user having to switch tabs and back. Also handles
   // the disk-reconnect case where commits made on another machine
-  // become visible after a remount.
+  // become visible after a remount. The store's own `wiki-changed`
+  // subscription handles the timeline refresh; this hook only needs to
+  // keep the *currently-selected commit's detail panel* fresh.
   useDataRefresh(() => {
-    commands
-      .wikiHistory(100)
-      .then(setCommits)
-      .catch((e: unknown) => setError(String(e)));
+    invalidateHistory();
     if (selected) {
       commands
         .wikiCommitDetail(selected)
@@ -64,9 +67,11 @@ export function WikiHistory() {
   const restoreAction = useAsyncAction(
     async ({ sha, page }: { sha: string; page: string }) => {
       await commands.wikiRestorePage(sha, page);
-      // Refresh history so the new "revert: …" commit appears at the top.
-      const next = await commands.wikiHistory(100);
-      setCommits(next);
+      // The restore writes a new "revert: …" auto-commit which fires
+      // `wiki-changed`; AppShell's listener then `invalidate()`s the
+      // store. Calling it here too closes the race where the event
+      // fires before AppShell's subscription is up (e.g. first render).
+      invalidateHistory();
     },
     {
       success: "Page restored",
@@ -77,8 +82,7 @@ export function WikiHistory() {
   const hardResetAction = useAsyncAction(
     async (sha: string) => {
       await commands.wikiHardReset(sha);
-      const next = await commands.wikiHistory(100);
-      setCommits(next);
+      invalidateHistory();
     },
     {
       success: "Wiki reset",
@@ -104,9 +108,9 @@ export function WikiHistory() {
         left={
           <div className="flex h-full flex-col bg-neutral-950">
             <div className="min-h-0 flex-1 overflow-y-auto px-6 py-4">
-              {error && (
+              {displayError && (
                 <p className="rounded-md border border-red-900 bg-red-950/40 p-3 text-sm text-red-300">
-                  {error}
+                  {displayError}
                 </p>
               )}
               {loading && <p className="text-sm text-neutral-500">Loading…</p>}
