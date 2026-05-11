@@ -101,6 +101,15 @@ export function WikiHistory() {
         </p>
       </header>
       <ResizableSplit
+        // `flex-1 min-h-0` is mandatory here: WikiHistory wraps the
+        // split in a flex column with a sibling <header>, so the
+        // split's own `h-full` would otherwise compute against the
+        // *whole* column height (header + split = overflow under
+        // the StatusBar). flex-1 makes it claim only the leftover
+        // row; min-h-0 lets its inner `overflow-y-auto` panes
+        // actually scroll instead of being squished by their own
+        // content.
+        className="min-h-0 flex-1"
         storageKey="brain.history.split"
         initial={420}
         min={320}

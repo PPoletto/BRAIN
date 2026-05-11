@@ -180,6 +180,35 @@ export function GraphCanvas({
       removeCustomContainer: false,
       rerenderDelay: 100,
     });
+
+    // Kick cy into producing its first render so the navigator's
+    // thumbnail materialises immediately. Internally the plugin
+    // registers a throttled `cy.onRender(handler)` in its setup
+    // path (cytoscape-navigator.js:897) — that handler is the only
+    // path that ever sets `src` on the `<img alt="Graph navigator">`
+    // it injects into our container. If we just leave it there, cy
+    // does not render again until the user pans or zooms, so the
+    // `<img>` sits without a `src`. The browser then shows the
+    // broken-image glyph plus the alt text in the corner of the
+    // mini-map panel until the first interaction.
+    //
+    // `cy.resize()` ensures the renderer agrees on the canvas
+    // dimensions (the mini-map container just appeared, so the
+    // main viewport's bounding rect may have shifted), and
+    // `cy.forceRender()` then triggers exactly one render tick
+    // synchronously — that's all the plugin needs to populate the
+    // thumbnail. rAF defers the call by one frame so the plugin's
+    // own constructor has finished wiring up its listeners by the
+    // time we emit.
+    requestAnimationFrame(() => {
+      // Guard against the case where the user toggled the mini-map
+      // back off in the gap between this rAF being scheduled and
+      // firing — detachNavigator() will have cleared the instance.
+      if (!navInstanceRef.current || !cyRef.current) return;
+      const cy = cyRef.current;
+      cy.resize();
+      (cy as cytoscape.Core & { forceRender: () => void }).forceRender();
+    });
   };
 
   const detachNavigator = () => {
@@ -775,7 +804,13 @@ export function GraphCanvas({
           ref={navRef}
           id={MINIMAP_CONTAINER_ID}
           aria-label="Graph mini-map"
-          className="pointer-events-auto absolute bottom-2 left-2 z-20 h-24 w-32 overflow-hidden rounded-md border border-neutral-700 bg-neutral-950/85 shadow-lg"
+          // The arbitrary-variant `[&_img:not([src])]:opacity-0` hides
+          // the plugin-injected `<img alt="Graph navigator">` for the
+          // single rAF frame between navigator attach and our
+          // `cy.forceRender()` populating its `src`. Without it the
+          // browser briefly paints the broken-image glyph + alt text
+          // in the corner of the mini-map.
+          className="pointer-events-auto absolute bottom-2 left-2 z-20 h-24 w-32 overflow-hidden rounded-md border border-neutral-700 bg-neutral-950/85 shadow-lg [&_img:not([src])]:opacity-0"
         />
       )}
       {hovered && (

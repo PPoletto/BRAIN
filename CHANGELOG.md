@@ -6,6 +6,36 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.15] — 2026-05-11
+
+### Fixed
+
+- **Wiki history no longer overflows under the StatusBar.** The
+  History route is a flex-column with a `<header>` plus a
+  `<ResizableSplit>`. `ResizableSplit`'s root is `flex h-full
+  w-full`, but `h-full` means "100 % of parent" — so it claimed
+  the *entire* column height while the header sat on top of it,
+  pushing the last 40-odd pixels of the commit list (and the
+  Pick-a-commit panel) behind the StatusBar. The split is now
+  marked `flex-1 min-h-0` at its call site, so it claims only the
+  leftover row inside the flex column and the inner
+  `overflow-y-auto` panes scroll cleanly inside their bounds.
+- **Mini-map no longer paints the broken-image glyph on first
+  open.** The cytoscape-navigator plugin injects an `<img
+  alt="Graph navigator">` into the panel and registers a throttled
+  thumbnail handler against `cy.onRender(...)`. Because nothing on
+  the cy side renders between toggle-on and the user's first
+  pan/zoom, the handler never fired and the `<img>` stayed
+  `src`-less — the browser then drew its broken-image icon plus
+  the alt text in the corner of the panel for several seconds
+  until the user interacted. `attachNavigatorIfWanted` now
+  schedules a one-frame-deferred `cy.resize()` + `cy.forceRender()`
+  immediately after the plugin attaches, so the first thumbnail is
+  generated synchronously with the panel becoming visible. A CSS
+  fallback (`[&_img:not([src])]:opacity-0` on the panel container)
+  hides the empty `<img>` during the single rAF frame, so even on
+  a slow first paint the user never sees the broken glyph.
+
 ## [0.2.14] — 2026-05-06
 
 ### Changed
