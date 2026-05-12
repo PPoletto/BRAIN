@@ -41,7 +41,16 @@ export const Button = forwardRef<HTMLButtonElement, Props>(
     },
     ref,
   ) => {
-    const cls = `inline-flex items-center justify-center gap-1.5 rounded-md transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60 disabled:cursor-not-allowed ${VARIANT_STYLES[variant]} ${SIZE_STYLES[size]} ${className}`;
+    // `whitespace-nowrap` so multi-word labels ("Update vault templates",
+    // "Rebuild index", "Re-register MCP") render on a single line — when
+    // a Button sits in a flex row next to a long description card the
+    // default would shrink the button column and split the label across
+    // three lines (the visible bug on the Danger zone screenshot).
+    // `shrink-0` keeps the button from being squeezed below its intrinsic
+    // width by a flex sibling that wants the space. The two together
+    // make every button look the same regardless of where it lands in
+    // the layout.
+    const cls = `inline-flex shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-md transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60 disabled:cursor-not-allowed ${VARIANT_STYLES[variant]} ${SIZE_STYLES[size]} ${className}`;
     const isDisabled = disabled || loading;
     return (
       <button ref={ref} className={cls} disabled={isDisabled} aria-busy={loading} {...rest}>

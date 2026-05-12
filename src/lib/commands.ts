@@ -81,6 +81,22 @@ export const commands = {
       last_known_vault_missing: boolean;
     }>("bootstrap_app"),
   resetBrain: () => invoke<void>("reset_brain"),
+  /// Refreshes the bundled AGENTS.md / CLAUDE.md in the mounted
+  /// vault's 00_meta/ from the binary's embedded copies. Returns one
+  /// entry per template file describing whether it was created,
+  /// overwritten or already up-to-date. `.mcp.json` is intentionally
+  /// NOT touched so the user's bearer token + external MCP servers
+  /// survive. Listed under Danger in Settings because it's
+  /// destructive of any local AGENTS.md / CLAUDE.md edits.
+  updateVaultTemplates: () =>
+    invoke<
+      Array<{
+        path: string;
+        action: "created" | "overwritten" | "unchanged";
+        size_before: number;
+        size_after: number;
+      }>
+    >("update_vault_templates"),
   refreshDisks: () => invoke<DiskInfo[]>("refresh_disks"),
   brainMcpCommandHint: () => invoke<McpCommandHint>("brain_mcp_command_hint"),
   reregisterMcp: () => invoke<RegistrationReport>("reregister_mcp"),

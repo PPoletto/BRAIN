@@ -215,6 +215,39 @@ pub fn reset_brain(
     Ok(())
 }
 
+/// Refreshes the bundled vault templates (`AGENTS.md`, `CLAUDE.md`)
+/// in the currently-mounted vault's `00_meta/` from the binary's
+/// embedded copies. Returns one entry per template file describing
+/// whether it was created, overwritten or already up-to-date plus
+/// before/after byte sizes — the frontend formats that as a toast.
+///
+/// Wired to the "Update vault templates" button in Settings → Danger.
+/// Listed under Danger because it's a destructive-ish operation: the
+/// user's local edits to AGENTS.md / CLAUDE.md will be lost. The
+/// neighbouring `.mcp.json` is deliberately NOT touched so the user's
+/// bearer token and external MCP server configuration survive.
+///
+/// Fails fast when no vault is mounted — there's nothing to write
+/// templates *into* in that state, and silently no-op'ing would
+/// confuse the user looking at an empty toast.
+#[tauri::command]
+pub fn update_vault_templates(
+    state: State<Arc<crate::state::AppState>>,
+) -> BrainResult<Vec<super::template::TemplateUpdateEntry>> {
+    let snapshot = state.config.snapshot();
+    let vault = snapshot.last_active_vault_path.ok_or_else(|| {
+        BrainError::Vault(crate::vault::VaultError::Io(std::io::Error::other(
+            "no vault is currently mounted — open one before refreshing templates",
+        )))
+    })?;
+    if !crate::vault::layout::is_vault(&vault) {
+        return Err(BrainError::Vault(crate::vault::VaultError::NotAVault {
+            path: vault,
+        }));
+    }
+    super::template::refresh_vault_templates(&vault).map_err(BrainError::Vault)
+}
+
 /// Called once at app startup. If the user has a remembered vault that
 /// still looks like one on disk, we silently mount it and skip the
 /// onboarding wizard. Otherwise the frontend should show the wizard.

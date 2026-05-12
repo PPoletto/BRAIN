@@ -6,6 +6,144 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.17] — 2026-05-12
+
+### Added
+
+- **Page-scoped lint in `brain_write_page` response.** The lint
+  output returned by a write is now filtered to findings whose path
+  matches the page that was just written. Pre-0.2.17 every write
+  surfaced the entire vault's lint state, which during bulk-ingest
+  drowned the agent in stale errors from earlier writes and burnt
+  context budget. Global state stays accessible via
+  `brain_lint_report`.
+- **Structured success response for `brain_write_page`.** Replaces
+  the plain `wrote {id}` string with `{wrote, previous_size_bytes,
+  new_size_bytes, warnings}` so the agent can detect an accidental
+  shrink (rich page overwritten with sparse content) in the same
+  round-trip.
+- **New MCP tool `brain_ping`.** Vault-independent liveness probe.
+  Returns `{status, server, version, uptime_seconds}`. Use between
+  bulk-ingest batches to detect a stuck server within seconds
+  instead of waiting for the IPC timeout.
+- **New MCP tool `brain_get_pages([ids])`.** Bulk-read variant of
+  `brain_get_page`. One call returns `{pages: [{id, found, page?}]}`
+  in request order; missing ids surface as `found: false` rather
+  than aborting the batch. Cuts round-trips for refactor sweeps
+  inspecting 5+ related pages.
+- **New MCP tool `brain_write_batch([{id, content}])`.** Atomic
+  multi-page write. Phase 1 validates + buffers all pages in
+  memory; if any single page fails to parse, nothing is written.
+  Phase 2 writes the batch to disk. Phase 3 lints once over the
+  whole vault and returns the union-scoped findings. Eliminates
+  the cascade of broken-link errors that the single-page form
+  produced when multiple new pages referenced each other.
+- **New MCP tool `brain_list_tags`.** Returns each distinct tag in
+  the vault with its page count, sorted by count desc (alphabetic
+  on ties). Closes the tag-discoverability gap: agents no longer
+  have to guess tag names before writing a `brain_query tag:<foo>`
+  filter.
+- **New MCP tool `brain_embedding_status`.** Reports the active
+  embedder (`bge-m3` vs the deterministic `hashed-fh-1024`
+  fallback), model directory, vector dimension, and indexed chunk
+  count. Lets an agent distinguish "search isn't finding it
+  because the page genuinely doesn't match" from "search isn't
+  finding it because the semantic pass is on the hashed fallback".
+- **New MCP tool `brain_get_page_history(id, limit?)`.** Returns
+  the Git commits that touched a single page, newest first, each
+  `{sha, ts, message, files_changed}`. Pair with
+  `brain_restore_page` for accident-recovery.
+- **New MCP tool `brain_restore_page(id, sha)`.** Replaces the
+  current page content with the version at the given Git sha and
+  records a `revert: restored …` commit on top. Never destructive
+  to history.
+- **"Update vault templates" button in Settings → Danger.** Pulls
+  the bundled `AGENTS.md` / `CLAUDE.md` into the vault's
+  `00_meta/` from the current binary, with per-file delta in the
+  success toast (e.g. `AGENTS.md: overwritten (10411 → 10750 B);
+  CLAUDE.md: unchanged`). `.mcp.json` is deliberately not touched
+  so the user's bearer token / external MCP servers / routing
+  rules survive. Confirmation flow uses a new in-app
+  `ConfirmDialog` modal (replaces `window.confirm()`, which some
+  Tauri builds silently suppress).
+
+### Changed
+
+- **`unregistered-type` lint promoted from Warning to Error.** A
+  page whose frontmatter type is not one of `entity`, `concept`,
+  `source`, `topic` now blocks the auto-commit until corrected.
+  The error message lists the four valid singular forms verbatim
+  so an LLM agent can fix the page in one round-trip without an
+  extra lookup. Schema integrity over commit availability — drift
+  no longer accumulates silently.
+- **`brain_write_page` no longer self-commits.** The watcher
+  (5 s idle debounce) is now the single source of commits for
+  MCP-driven writes. Pre-0.2.17 every `brain_write_page` emitted
+  its own immediate commit plus the watcher's follow-up commit,
+  producing duplicate entries in wiki history.
+- **`brain_memory_system_prompt` rewritten.** Removed the obsolete
+  `notes/<slug>` bucket suggestion that pre-0.2.17 trained agents
+  to write outside the four registered subdirs (those writes then
+  escaped the lint walker and accumulated as orphan files). The
+  prompt now steers single-fact memos into a `## Notes` section
+  on the relevant `entities/<person>` page. Three regression
+  tests pin the four-bucket contract.
+- **Hybrid-search snippet markers deduplicated and capped.** FTS5
+  used to wrap every occurrence of every query token in `«…»`; on
+  pages where the user's name appeared dozens of times this
+  produced very noisy snippets. The post-processor now keeps
+  markers only for the first occurrence of each distinct token
+  and caps at 3 distinct tokens per snippet, preserving the "why
+  did this page rank" signal without the repetition.
+- **`brain_search` description rewritten** to spell out the hybrid
+  pattern (FTS5 BM25 + sqlite-vec KNN over bge-m3, fused via
+  RRF) and to point at `brain_embedding_status` as the
+  diagnostic when semantic matching seems off.
+- **Updated `00_meta/AGENTS.md` template** with the new tools, the
+  rollback workflow, the table-cell pipe-collision warning, and
+  explicit Error-severity guidance for plural-type drift.
+
+### Fixed
+
+- **Graph labels and edges shrink along with nodes when zooming
+  in.** The v0.2.14 zoom-aware sizing only scaled node width/
+  height; labels (`font-size`), label haloes
+  (`text-outline-width`), edge widths and arrow heads stayed at
+  base size and grew linearly with `cy.zoom()`. The handler now
+  applies the same `1 / √zoom` factor to all four properties.
+- **New `wikilink-pipe-in-table-cell` lint warning.** Catches the
+  GFM table-cell collision where `[[id|alias]]` shares its `|`
+  separator with the table syntax and breaks rendering. Pre-empts
+  the issue at write time so the agent can switch to the
+  un-aliased `[[id]]` form inside table cells.
+- **Buttons no longer wrap their label.** Multi-word button labels
+  ("Update vault templates", "Rebuild index", "Re-register MCP")
+  now stay on a single line via `whitespace-nowrap` + `shrink-0`
+  in the base Button styles. Visible on the screenshots Pascal
+  shared from the Danger zone.
+- **Empty orphan `02_wiki/notes/` directory cleaned up.** The
+  combination of the obsolete `notes/<slug>` system-prompt
+  suggestion and BRAIN's path-creating write logic produced an
+  empty directory that nothing in the codebase removed. Fixed by
+  patching the prompt; existing vaults can remove the dir
+  manually (lint does not walk it, so nothing references it).
+
+### Migration notes
+
+- **`unregistered-type` is now an Error.** Vaults with pre-existing
+  plural-form `type:` values (`entities`, `concepts`, …) will see
+  their auto-commits blocked on first run until the drift is
+  fixed. The error message tells the agent exactly what to do;
+  alternatively run a brief MCP session: *"call
+  `brain_lint_report`, for every `unregistered-type` error
+  rewrite the page via `brain_write_page` with the singular form,
+  repeat until clean"*.
+- **Update vault templates** to pull the new `AGENTS.md` into
+  existing vaults: Settings → Danger zone → "Update vault
+  templates". Optional — the old `AGENTS.md` is still functional,
+  just lacks the new tool documentation and rollback workflow.
+- **No schema or DB migration.** Drop-in update.
+
 ## [0.2.16] — 2026-05-11
 
 ### Added

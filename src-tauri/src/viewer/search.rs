@@ -149,6 +149,15 @@ fn search_hybrid(db: &DbHandle, vault: &Path, query: &str) -> ViewerResult<Vec<S
                     .get(&id)
                     .cloned()
                     .unwrap_or((None, None, String::new()));
+                // Post-process FTS5's snippet markers so a query token
+                // that recurs many times in a single page (e.g. the
+                // user's own name on their entity page) gets
+                // highlighted only on its first occurrence per snippet,
+                // and at most MAX_DISTINCT_MARKER_TOKENS distinct
+                // tokens are highlighted at all. Pre-0.2.17 every
+                // match was wrapped, which made shared-token snippets
+                // visually noisy.
+                let snippet = limit_snippet_markers(&snippet, MAX_DISTINCT_MARKER_TOKENS);
                 SearchHit {
                     title: title.unwrap_or_else(|| id.clone()),
                     path: path.unwrap_or_default(),
@@ -326,6 +335,67 @@ fn build_snippet(body: &str, needle: &str) -> Option<String> {
     Some(format!("…{}…", body[start..end].replace('\n', " ")))
 }
 
+/// Maximum distinct query-token highlights kept inside a single FTS5
+/// snippet. FTS5 wraps every occurrence of every matching token in
+/// `«…»`, which on a vault where one of the query tokens is the user's
+/// own name produces snippets like `«Pascal» dropped «Pascal» note,
+/// «Pascal» wrote …` — visually noisy and not informative. Three
+/// distinct tokens, first occurrence each, is enough to show why the
+/// page ranked.
+const MAX_DISTINCT_MARKER_TOKENS: usize = 3;
+
+/// Walks an FTS5-produced snippet and keeps highlight markers only for
+/// the first `max_distinct` distinct (case-insensitive) tokens it sees;
+/// drops the markers around every later occurrence of an already-seen
+/// token, and drops them entirely for tokens beyond the cap. The text
+/// content of the snippet is preserved verbatim — only the `«` / `»`
+/// characters are removed. Marker pairs are assumed well-formed
+/// (FTS5's `snippet()` produces matched pairs in row order); an
+/// unterminated `«` at the end of the snippet is silently dropped to
+/// keep the output renderable.
+fn limit_snippet_markers(snippet: &str, max_distinct: usize) -> String {
+    let mut out = String::with_capacity(snippet.len());
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut chars = snippet.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '«' {
+            out.push(c);
+            continue;
+        }
+        // Collect everything up to the closing »; if the source is
+        // malformed (no closing marker), we drop the opener.
+        let mut token = String::new();
+        let mut closed = false;
+        for inner in chars.by_ref() {
+            if inner == '»' {
+                closed = true;
+                break;
+            }
+            token.push(inner);
+        }
+        if !closed {
+            // Unterminated marker — drop both the opener and the
+            // trailing partial content so the snippet stays clean.
+            out.push_str(&token);
+            continue;
+        }
+        let key = token.to_lowercase();
+        let already_seen = !seen.insert(key);
+        // Keep the markers only for the first occurrence of each
+        // distinct token AND only while we are under the cap. Once we
+        // are over the cap (or this token was marked before), keep the
+        // text and drop the markers.
+        if !already_seen && seen.len() <= max_distinct {
+            out.push('«');
+            out.push_str(&token);
+            out.push('»');
+        } else {
+            out.push_str(&token);
+        }
+    }
+    out
+}
+
 fn walk_pages<F>(vault: &Path, mut callback: F) -> ViewerResult<()>
 where
     F: FnMut(&str, &Path, &str, &crate::wiki::page::ParsedPage),
@@ -378,6 +448,53 @@ mod tests {
             format!("---\nid: {sub}/{slug}\ntype: entity\ntitle: {title}\ncreated: 2026-04-29\nupdated: 2026-04-29\n---\n\n{body}\n"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn limit_snippet_markers_keeps_first_occurrence_of_each_distinct_token() {
+        // Repeating a single token within one snippet — FTS5 marks
+        // every occurrence; the post-processor keeps only the first.
+        let input = "the «pascal» went to «helsinki» and «pascal» came back";
+        let out = limit_snippet_markers(input, 3);
+        assert_eq!(out, "the «pascal» went to «helsinki» and pascal came back");
+    }
+
+    #[test]
+    fn limit_snippet_markers_caps_at_max_distinct_tokens() {
+        // Four distinct match tokens but cap is 2 → only the first two
+        // get markers, the rest keep their text but lose their wrap.
+        let input = "«alpha» «beta» «gamma» «delta» «alpha»";
+        let out = limit_snippet_markers(input, 2);
+        assert_eq!(out, "«alpha» «beta» gamma delta alpha");
+    }
+
+    #[test]
+    fn limit_snippet_markers_dedupe_is_case_insensitive() {
+        // The same word in different cases counts as one distinct
+        // token — otherwise "Pascal", "pascal", "PASCAL" would each
+        // burn a slot in the cap.
+        let input = "«Pascal» visited «pascal» and «PASCAL» too";
+        let out = limit_snippet_markers(input, 3);
+        assert_eq!(out, "«Pascal» visited pascal and PASCAL too");
+    }
+
+    #[test]
+    fn limit_snippet_markers_preserves_non_marker_characters() {
+        // Surrounding whitespace, punctuation, and ellipsis from
+        // FTS5's `snippet()` must pass through untouched.
+        let input = " … context before «match» context after … ";
+        let out = limit_snippet_markers(input, 3);
+        assert_eq!(out, " … context before «match» context after … ");
+    }
+
+    #[test]
+    fn limit_snippet_markers_drops_unterminated_opener_gracefully() {
+        // Defensive: an unterminated `«` (shouldn't happen in
+        // practice with FTS5's snippet) must not crash and must not
+        // produce a half-marker in the output.
+        let input = "well-formed «match» and then dangling «end-of-snippet";
+        let out = limit_snippet_markers(input, 3);
+        assert_eq!(out, "well-formed «match» and then dangling end-of-snippet");
     }
 
     #[test]

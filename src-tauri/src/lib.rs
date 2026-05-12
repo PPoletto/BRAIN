@@ -118,6 +118,7 @@ pub fn run() {
             onboarding::commands::finish_onboarding,
             onboarding::commands::bootstrap_app,
             onboarding::commands::reset_brain,
+            onboarding::commands::update_vault_templates,
             // Mount (S01) / Tray (S07)
             tray::commands::tray_status,
             tray::commands::eject_brain,

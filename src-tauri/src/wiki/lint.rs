@@ -114,20 +114,55 @@ pub fn lint(vault: &Path) -> WikiResult<LintReport> {
                 message: "frontmatter has no 'title' field".into(),
             });
         }
-        // Type-registry check. Pure warning: parse() already accepted
-        // the page and the indexer has indexed it. We only flag that
-        // the value isn't one of the canonical singular forms so a
-        // follow-up brain_write_page can correct it. No error path —
-        // see `lint_does_not_block_commit_on_unregistered_type_warning`.
-        if !KNOWN_TYPES.contains(&parsed.frontmatter.page_type.as_str()) {
+        // Table-cell wikilink-alias collision. Markdown tables split
+        // cells on `|`; the aliased wikilink form `[[id|alias]]`
+        // shares that separator, so a line that is both a table row
+        // *and* contains an aliased wikilink renders broken cells.
+        // We approximate "table row" by the cheap heuristic
+        // `trimmed line starts with '|'` — this catches the standard
+        // GFM table syntax (header / separator / body rows all start
+        // with `|`) without needing a full Markdown AST. False
+        // positives on text that *looks* like a row but isn't (e.g. a
+        // markdown blockquote-with-pipes) are acceptable: the
+        // warning's fix advice (use un-aliased `[[id]]` form here)
+        // is harmless even in that edge case.
+        if body_has_aliased_wikilink_in_table_row(&parsed.body) {
             warnings.push(LintWarning {
+                path: file.to_string_lossy().to_string(),
+                kind: "wikilink-pipe-in-table-cell".into(),
+                message:
+                    "aliased wikilink `[[id|alias]]` found inside a Markdown table row — \
+                     the `|` collides with the cell separator and breaks rendering. \
+                     Use the un-aliased form `[[id]]` inside table cells, or move the \
+                     reference out of the table."
+                        .into(),
+            });
+        }
+        // Type-registry check, promoted to Error in 0.2.17. The page
+        // is still on disk (parse() accepted it, indexer ran), but
+        // the auto-commit watcher will refuse to commit while any
+        // page carries an unregistered type, and brain_write_page
+        // surfaces this directly to the writing agent as a hard
+        // failure on the next round-trip. The intent is to make
+        // schema drift impossible to ignore — LLM agents that see
+        // the explicit, actionable error in their write-response
+        // converge on the correct singular form within one extra
+        // call, instead of letting plural values accumulate silently.
+        if !KNOWN_TYPES.contains(&parsed.frontmatter.page_type.as_str()) {
+            errors.push(LintError {
                 path: file.to_string_lossy().to_string(),
                 kind: "unregistered-type".into(),
                 message: format!(
-                    "frontmatter type '{}' is not in the registered set {:?}; \
-                     change it to one of those, or place the artifact under \
-                     01_raw/ if it doesn't fit any wiki category",
-                    parsed.frontmatter.page_type, KNOWN_TYPES,
+                    "frontmatter type '{}' is not a registered page type. \
+                     Valid types are singular: 'entity', 'concept', 'source', 'topic'. \
+                     Fix: rewrite this page via brain_write_page with the corrected \
+                     singular form in the YAML frontmatter — the directory name is \
+                     plural (entities/, concepts/, ...) but the frontmatter type \
+                     must be the singular. If the artifact does not fit any of the \
+                     four categories, place it under 01_raw/ instead of inventing \
+                     a fifth type — new types are a deliberate code change, not a \
+                     per-page choice.",
+                    parsed.frontmatter.page_type,
                 ),
             });
         }
@@ -153,6 +188,18 @@ pub fn lint(vault: &Path) -> WikiResult<LintReport> {
     }
 
     Ok(LintReport { errors, warnings })
+}
+
+/// True iff any line of `body` looks like a Markdown table row
+/// (starts with `|` after trimming whitespace) *and* contains an
+/// aliased wikilink (`[[...|...]]`). The two together break GFM
+/// table rendering because the alias-pipe is consumed by the cell
+/// splitter. Plain `[[id]]` (un-aliased) inside a table row is fine
+/// — only the pipe-carrying form is flagged.
+fn body_has_aliased_wikilink_in_table_row(body: &str) -> bool {
+    let aliased = Regex::new(r"\[\[[^\]]+\|[^\]]+\]\]").expect("regex");
+    body.lines()
+        .any(|line| line.trim_start().starts_with('|') && aliased.is_match(line))
 }
 
 fn count_non_canonical_links(body: &str) -> usize {
@@ -296,12 +343,94 @@ mod tests {
     }
 
     #[test]
-    fn lint_warns_when_frontmatter_type_is_not_in_registered_set() {
+    fn lint_warns_when_aliased_wikilink_appears_in_a_markdown_table_cell() {
+        // Real-world trap: Markdown tables use `|` as cell separator,
+        // but the aliased wiki-link form `[[entities/foo|Display]]`
+        // also uses `|` between the target and the alias. When an
+        // agent writes a comparison table like
+        //   | Person | Role |
+        //   |--------|------|
+        //   | [[entities/dan|Dan]] | CEO |
+        // the table parser splits the cell at the alias-pipe and
+        // renders broken cells. The fix is for the agent to use the
+        // un-aliased form `[[entities/dan]]` (or escape) inside table
+        // cells — this lint surfaces the issue at write time so the
+        // agent can switch to the safe form without the user
+        // discovering broken rendering later.
         let tmp = make_vault();
-        // `entities` (plural) is not in KNOWN_TYPES — exactly the
-        // schema-drift case the user hit when an MCP agent matched the
-        // type-field to the directory name instead of the canonical
-        // singular form.
+        write_page(
+            tmp.path(),
+            "entities",
+            "alice",
+            &page(
+                "entities/alice",
+                "| col1 | col2 |\n|------|------|\n| [[entities/bob|Bob]] | yes |\n",
+            ),
+        );
+        write_page(
+            tmp.path(),
+            "entities",
+            "bob",
+            &page("entities/bob", "hi"),
+        );
+        let report = lint(tmp.path()).unwrap();
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.kind == "wikilink-pipe-in-table-cell"),
+            "expected wikilink-pipe-in-table-cell warning, got: {:#?}",
+            report.warnings
+        );
+        // It is a warning, not an error — auto-commit must keep running.
+        assert!(report.is_clean(), "must not block commits: {:#?}", report.errors);
+    }
+
+    #[test]
+    fn lint_does_not_warn_for_aliased_wikilinks_outside_tables() {
+        // Sanity: outside a table-row context the aliased form is
+        // perfectly fine and is exactly what `normalize_internal_links`
+        // produces for `[Text](path)` rewrites. We must not double-
+        // flag every alias in the vault.
+        let tmp = make_vault();
+        write_page(
+            tmp.path(),
+            "entities",
+            "alice",
+            &page(
+                "entities/alice",
+                "Some prose linking to [[entities/bob|Bob]] inline.\n",
+            ),
+        );
+        write_page(
+            tmp.path(),
+            "entities",
+            "bob",
+            &page("entities/bob", "hi"),
+        );
+        let report = lint(tmp.path()).unwrap();
+        assert!(
+            report
+                .warnings
+                .iter()
+                .all(|w| w.kind != "wikilink-pipe-in-table-cell"),
+            "inline aliased links must not trigger the table-cell warning: {:#?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn lint_errors_when_frontmatter_type_is_not_in_registered_set() {
+        // Promoted from Warning to Error in 0.2.17. The user's
+        // experience with the warning-level rule was that schema
+        // drift kept accumulating because agents could ignore the
+        // signal. Error severity flips that: drift blocks the auto-
+        // commit and the agent gets an explicit, actionable failure
+        // in its write-response, which it can correct on the next
+        // call. The trade-off — a stale unregistered-type anywhere
+        // in the vault blocks ALL auto-commits until fixed — is
+        // accepted: schema integrity over commit availability.
+        let tmp = make_vault();
         write_page(
             tmp.path(),
             "entities",
@@ -311,16 +440,22 @@ mod tests {
         let report = lint(tmp.path()).unwrap();
         assert!(
             report
-                .warnings
+                .errors
                 .iter()
-                .any(|w| w.kind == "unregistered-type"),
-            "expected an unregistered-type warning, got warnings = {:#?}",
-            report.warnings
+                .any(|e| e.kind == "unregistered-type"),
+            "expected an unregistered-type error, got errors = {:#?}",
+            report.errors
         );
     }
 
     #[test]
-    fn lint_does_not_block_commit_on_unregistered_type_warning() {
+    fn lint_blocks_commit_on_unregistered_type_error() {
+        // Companion to the rule above: the auto-commit watcher uses
+        // `report.is_clean()` to decide whether to commit, and the
+        // MCP write_page tool surfaces page-scoped errors as a hard
+        // failure. Both paths key off the Error severity — verify it
+        // here so a future "soften to warning again" refactor
+        // immediately trips this test.
         let tmp = make_vault();
         write_page(
             tmp.path(),
@@ -329,15 +464,42 @@ mod tests {
             &page_with_type("entities/alice", "entities", "hi"),
         );
         let report = lint(tmp.path()).unwrap();
-        // The rule is a Warning, not an Error — auto-commit must keep
-        // running so the user can correct the field via the next edit
-        // or have an agent fix it via brain_write_page. Blocking would
-        // strand the page in a half-saved state.
         assert!(
-            report.is_clean(),
-            "unregistered type must not produce an Error: {:#?}",
-            report.errors
+            !report.is_clean(),
+            "unregistered type must produce an Error that blocks the commit, not a passive warning"
         );
+    }
+
+    #[test]
+    fn lint_unregistered_type_error_message_names_the_valid_singular_forms_and_the_fix() {
+        // The error message is the *only* thing an LLM agent sees on
+        // failure. It has to spell out exactly what the registered
+        // singular forms are, and how to fix the page in one round-
+        // trip — otherwise the agent burns calls guessing. This
+        // test pins the message contract so a future code cleanup
+        // doesn't trim away the actionable parts by accident.
+        let tmp = make_vault();
+        write_page(
+            tmp.path(),
+            "entities",
+            "alice",
+            &page_with_type("entities/alice", "entities", "hi"),
+        );
+        let report = lint(tmp.path()).unwrap();
+        let msg = report
+            .errors
+            .iter()
+            .find(|e| e.kind == "unregistered-type")
+            .map(|e| e.message.as_str())
+            .expect("unregistered-type error present");
+        // The offending value must appear, so the LLM knows which
+        // page-write was the culprit.
+        assert!(msg.contains("entities"), "message must name the offending value: {msg}");
+        // The four singular forms must be listed — otherwise the
+        // agent has to fetch them from somewhere else.
+        for t in &["entity", "concept", "source", "topic"] {
+            assert!(msg.contains(t), "valid type '{t}' must be listed in error message: {msg}");
+        }
     }
 
     #[test]

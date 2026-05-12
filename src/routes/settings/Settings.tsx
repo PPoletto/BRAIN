@@ -10,6 +10,7 @@ import {
 import { Tabs } from "../../components/ui/Tabs";
 import { Button } from "../../components/ui/Button";
 import { Card, CardDescription, CardHeader, CardTitle } from "../../components/ui/Card";
+import { ConfirmDialog } from "../../components/ui/ConfirmDialog";
 import { ErrorBanner } from "../../components/ui/ErrorBanner";
 import { useAsyncAction } from "../../components/ui/useAsyncAction";
 import { useToast } from "../../components/ui/toast-context";
@@ -34,6 +35,13 @@ export function Settings() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const { push } = useToast();
+  // Confirmation dialog state for the two destructive operations in the
+  // Danger zone. Drives the in-UI <ConfirmDialog>. Replaces the pre-
+  // 0.2.17 use of `window.confirm()` which: (a) some Tauri builds
+  // silently suppress, (b) can't carry rich body content like a list
+  // of files-to-overwrite, (c) doesn't match the BRAIN visual style.
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [confirmUpdateTemplates, setConfirmUpdateTemplates] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -105,16 +113,65 @@ export function Settings() {
   );
 
   function resetBrain() {
-    const ok = window.confirm(
-      "Reset BRAIN?\n\n" +
-        "BRAIN will:\n" +
-        "  • Eject the current vault (unmount)\n" +
-        "  • Forget the saved vault path\n" +
-        "  • Send you back to the onboarding wizard\n\n" +
-        "Your data on disk is NOT deleted.",
-    );
-    if (!ok) return;
-    void resetAction.trigger();
+    setConfirmReset(true);
+  }
+
+  async function confirmResetAccepted() {
+    try {
+      await resetAction.trigger();
+    } finally {
+      setConfirmReset(false);
+    }
+  }
+
+  // Refresh the bundled AGENTS.md / CLAUDE.md in the vault's 00_meta/
+  // from the current binary. The action pushes its own success toast
+  // with a per-file delta in the `detail` field — important here
+  // because the user is overwriting potentially-edited files and
+  // deserves to see exactly which files changed and by how many
+  // bytes, not a generic "done". We bypass useAsyncAction's static
+  // `success` string for that reason: there's no way to feed a
+  // dynamic value through that field, and the pre-0.2.17 version
+  // rendered a content-less toast which the user (rightly) reported
+  // as missing feedback.
+  const updateTemplatesAction = useAsyncAction(
+    async () => {
+      const report = await commands.updateVaultTemplates();
+      const detail = report
+        .map((e) => {
+          const file = e.path.split(/[\\/]/).pop() ?? e.path;
+          if (e.action === "unchanged") return `${file}: unchanged`;
+          return `${file}: ${e.action} (${e.size_before} → ${e.size_after} B)`;
+        })
+        .join("\n");
+      const changedCount = report.filter((e) => e.action !== "unchanged").length;
+      const message =
+        changedCount === 0
+          ? "Vault templates already up-to-date"
+          : `Vault templates updated · ${changedCount} file${
+              changedCount === 1 ? "" : "s"
+            } changed`;
+      push({ kind: "success", message, detail });
+      return report;
+    },
+    {
+      pending: "Refreshing vault templates…",
+      // success deliberately omitted — pushed manually above with the
+      // dynamic per-file delta in the detail field.
+      errorPrefix: "Update failed",
+    },
+  );
+
+  function updateVaultTemplates() {
+    setConfirmUpdateTemplates(true);
+  }
+
+  async function confirmUpdateTemplatesAccepted() {
+    try {
+      await updateTemplatesAction.trigger();
+    } finally {
+      setConfirmUpdateTemplates(false);
+    }
   }
 
   const mcpJsonSnippet = hint
@@ -165,10 +222,73 @@ export function Settings() {
           )}
           {active === "memory" && <MemoryTab prompt={memoryPrompt} copy={copy} />}
           {active === "danger" && (
-            <DangerTab onReset={resetBrain} resetting={resetAction.loading} />
+            <DangerTab
+              onReset={resetBrain}
+              resetting={resetAction.loading}
+              onUpdateTemplates={updateVaultTemplates}
+              updatingTemplates={updateTemplatesAction.loading}
+            />
           )}
         </div>
       </div>
+      {/*
+        Confirmation dialogs for the Danger zone. Rendered at the route
+        root so the overlay covers the whole settings surface, not just
+        the panel column. They sit outside the scrollable container on
+        purpose — a tall page that's been scrolled should not be able
+        to push the dialog out of view.
+      */}
+      <ConfirmDialog
+        open={confirmUpdateTemplates}
+        title="Update vault templates"
+        confirmLabel="Overwrite templates"
+        tone="destructive"
+        loading={updateTemplatesAction.loading}
+        onConfirm={() => void confirmUpdateTemplatesAccepted()}
+        onCancel={() => setConfirmUpdateTemplates(false)}
+      >
+        <p>
+          BRAIN will overwrite the following files in your vault's{" "}
+          <code className="font-mono">00_meta/</code> folder with the versions
+          bundled in the current release:
+        </p>
+        <ul className="ml-4 list-disc space-y-0.5">
+          <li>
+            <code className="font-mono">AGENTS.md</code> — conventions for LLM
+            agents
+          </li>
+          <li>
+            <code className="font-mono">CLAUDE.md</code> — companion file for
+            Claude Code
+          </li>
+        </ul>
+        <p>
+          <strong>Any local edits to those two files will be lost.</strong>{" "}
+          Your <code className="font-mono">.mcp.json</code> (bearer token, MCP
+          server config) is <strong>not</strong> touched, and no wiki page is
+          touched either.
+        </p>
+      </ConfirmDialog>
+      <ConfirmDialog
+        open={confirmReset}
+        title="Reset BRAIN"
+        confirmLabel="Reset BRAIN"
+        tone="destructive"
+        loading={resetAction.loading}
+        onConfirm={() => void confirmResetAccepted()}
+        onCancel={() => setConfirmReset(false)}
+      >
+        <p>BRAIN will:</p>
+        <ul className="ml-4 list-disc space-y-0.5">
+          <li>Eject the current vault (unmount)</li>
+          <li>Forget the saved vault path</li>
+          <li>Unregister BRAIN from every LLM client</li>
+          <li>Send you back to the onboarding wizard</li>
+        </ul>
+        <p className="text-neutral-400">
+          Your data on disk is <strong>not</strong> deleted.
+        </p>
+      </ConfirmDialog>
     </div>
   );
 }
@@ -666,28 +786,68 @@ function SetupAccordion({
 function DangerTab({
   onReset,
   resetting,
+  onUpdateTemplates,
+  updatingTemplates,
 }: {
   onReset: () => void;
   resetting: boolean;
+  onUpdateTemplates: () => void;
+  updatingTemplates: boolean;
 }) {
   return (
-    <Card tone="danger">
-      <CardHeader>
-        <div>
-          <CardTitle>
-            <span className="text-red-300">Reset BRAIN</span>
-          </CardTitle>
-          <CardDescription>
-            Eject the current vault, forget its location, unregister BRAIN from
-            every LLM client, and re-launch the onboarding wizard. Your vault
-            data on disk is <strong>not</strong> deleted.
-          </CardDescription>
-        </div>
-        <Button variant="destructive" onClick={onReset} loading={resetting}>
-          {resetting ? "Resetting…" : "Reset BRAIN"}
-        </Button>
-      </CardHeader>
-    </Card>
+    <div className="space-y-4">
+      {/*
+        "Update vault templates" sits under Danger because it
+        overwrites AGENTS.md / CLAUDE.md in 00_meta/ with the
+        bundled copies — any local edits the user made to those
+        two files are lost. The .mcp.json (bearer token, MCP
+        server config) is deliberately untouched on this path so
+        the user's external integration setup survives. Wiki
+        content is also untouched.
+      */}
+      <Card tone="danger">
+        <CardHeader>
+          <div>
+            <CardTitle>
+              <span className="text-red-300">Update vault templates</span>
+            </CardTitle>
+            <CardDescription>
+              Overwrite <code className="font-mono">00_meta/AGENTS.md</code>{" "}
+              and <code className="font-mono">00_meta/CLAUDE.md</code> with the
+              versions bundled in the current BRAIN release. Use this after a
+              BRAIN upgrade to pull new agent conventions into an existing
+              vault. Local edits to those two files will be{" "}
+              <strong>lost</strong>; the rest of the vault (wiki content,{" "}
+              <code className="font-mono">.mcp.json</code>) is untouched.
+            </CardDescription>
+          </div>
+          <Button
+            variant="destructive"
+            onClick={onUpdateTemplates}
+            loading={updatingTemplates}
+          >
+            {updatingTemplates ? "Updating…" : "Update vault templates"}
+          </Button>
+        </CardHeader>
+      </Card>
+      <Card tone="danger">
+        <CardHeader>
+          <div>
+            <CardTitle>
+              <span className="text-red-300">Reset BRAIN</span>
+            </CardTitle>
+            <CardDescription>
+              Eject the current vault, forget its location, unregister BRAIN
+              from every LLM client, and re-launch the onboarding wizard. Your
+              vault data on disk is <strong>not</strong> deleted.
+            </CardDescription>
+          </div>
+          <Button variant="destructive" onClick={onReset} loading={resetting}>
+            {resetting ? "Resetting…" : "Reset BRAIN"}
+          </Button>
+        </CardHeader>
+      </Card>
+    </div>
   );
 }
 
