@@ -13,6 +13,10 @@ import navigator from "cytoscape-navigator";
 // background).
 import "cytoscape-navigator/cytoscape.js-navigator.css";
 import { commands } from "../lib/commands";
+import {
+  decideLabelOpacity,
+  hubDegreeThreshold,
+} from "../lib/graphLabelVisibility";
 
 cytoscape.use(fcose);
 cytoscape.use(dagre as unknown as cytoscape.Ext);
@@ -399,6 +403,25 @@ export function GraphCanvas({
       // (mouse vs trackpad) and respects ctrlKey wheel events
       // (browser-normalised pinch-to-zoom on macOS trackpads).
       userZoomingEnabled: false,
+      // Performance flags for dense vaults. Cytoscape's defaults
+      // assume hundreds of elements; on Pascal's 362-node /
+      // 2105-edge graph the per-frame redraw during a pan or zoom
+      // gesture dropped the UI to a crawl. The three flags below
+      // are "during-interaction-only" — when the camera is
+      // stationary the render is identical to the default, so
+      // small graphs (~50 nodes) see no visual change.
+      //
+      //  - hideEdgesOnViewport: drop edges while the user pans
+      //    or zooms, snap them back when the gesture ends.
+      //    2000+ edges are the dominant cost in a dense graph.
+      //  - hideLabelsOnViewport: same, for the ~N text renders
+      //    cytoscape would otherwise repaint every frame.
+      //  - textureOnViewport: pan/zoom moves a snapshot texture
+      //    instead of triggering a vector redraw; minor
+      //    "pixelation" during gesture, sharp again on release.
+      hideEdgesOnViewport: true,
+      hideLabelsOnViewport: true,
+      textureOnViewport: true,
       style: [
         {
           selector: "node",
@@ -688,9 +711,27 @@ export function GraphCanvas({
     // font-size, text-outline-width, edge width and arrow-scale
     // keeps the visual hierarchy consistent across the whole
     // zoom range.
+    // Hub-degree cutoff for the zoom-aware label staffelung. Computed
+    // once per cy build (degrees don't change during pan/zoom). The
+    // policy itself lives in `graphLabelVisibility.ts` so it stays
+    // unit-testable; here we just feed the result into a
+    // `text-opacity` style every zoom frame.
+    const nodeCount = cy.nodes().length;
+    const degrees: number[] = [];
+    cy.nodes().forEach((n) => {
+      // Body-form arrow (no implicit return) — cytoscape's forEach
+      // callback is typed `(ele) => boolean | void` (returning `false`
+      // would early-exit the iteration), and an expression-form
+      // `(n) => degrees.push(...)` would implicitly return the
+      // `push` length and trip the type check.
+      degrees.push(n.degree(false));
+    });
+    const hubThreshold = hubDegreeThreshold(degrees);
+
     let zoomRafId = 0;
     const updateZoomScaledSizes = () => {
-      const scale = 1 / Math.sqrt(cy.zoom());
+      const zoom = cy.zoom();
+      const scale = 1 / Math.sqrt(zoom);
       cy.nodes().style({
         width: (ele: cytoscape.NodeSingular) =>
           Math.min(14 + ele.degree(false) * 1.5, 38) * scale,
@@ -703,6 +744,21 @@ export function GraphCanvas({
         // font and turns into a chunky black box around each
         // label at high zoom.
         "text-outline-width": 2 * scale,
+        // Zoom-aware label visibility: small graphs always show
+        // every label, dense graphs staffel labels by zoom level
+        // and node degree. The policy is implemented as a pure
+        // helper in `graphLabelVisibility.ts` (with unit tests
+        // pinning the boundaries), and the helper returns 0 or 1
+        // which cytoscape interprets as `text-opacity`. No
+        // intermediate fades — clean appear/disappear at the
+        // boundaries.
+        "text-opacity": (ele: cytoscape.NodeSingular) =>
+          decideLabelOpacity({
+            nodeCount,
+            zoom,
+            degree: ele.degree(false),
+            hubThreshold,
+          }),
       });
       cy.edges().style({
         width: 2 * scale,
@@ -715,6 +771,12 @@ export function GraphCanvas({
       cancelAnimationFrame(zoomRafId);
       zoomRafId = requestAnimationFrame(updateZoomScaledSizes);
     });
+    // Apply the policy once on initial render too. Without this the
+    // labels briefly paint at their default opacity (= 1) between the
+    // cy build and the first `zoom` event fired by fit() — on a dense
+    // vault that's a ~200 ms flash of unreadable label soup before
+    // staffelung kicks in.
+    requestAnimationFrame(updateZoomScaledSizes);
 
     // Sync the mini-map navigator to the *current* showMinimap
     // state. Decoupled from the showMinimap prop so a toggle does

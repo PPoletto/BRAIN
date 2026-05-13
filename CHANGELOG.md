@@ -6,6 +6,31 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.18] — 2026-05-12
+
+### Performance
+
+- **Graph stays responsive on dense vaults.** Pascal's vault grew to
+  362 nodes / 2105 edges and the Force-layout view became
+  unbedienbar — labels stacked into illegible soup and pan/zoom
+  dropped to single-digit FPS. Two interlocking changes mitigate
+  both effects without touching the small-vault experience:
+  - **Cytoscape on-interaction render flags**: `hideEdgesOnViewport`,
+    `hideLabelsOnViewport`, and `textureOnViewport` are now all
+    `true`. Edges and labels are dropped during pan / zoom and
+    snapped back when the gesture stops; the camera moves a texture
+    snapshot instead of triggering a vector redraw. Visual identity
+    at rest is unchanged.
+  - **Zoom-aware label staffelung** (new `src/lib/graphLabelVisibility.ts`):
+    small vaults (< 80 nodes) keep every label visible at every zoom
+    level. Larger vaults staffel by zoom + node degree — overview
+    zoom shows colored dots only, mid-zoom keeps the top-15 % of
+    nodes by degree labeled (the structural anchors), and zooming in
+    past 1.0 brings every label back inside the viewport. Helper is
+    a pure function with seven unit tests pinning the boundary
+    semantics so a future refactor can't silently drop the
+    small-vault bypass.
+
 ## [0.2.17] — 2026-05-12
 
 ### Added
