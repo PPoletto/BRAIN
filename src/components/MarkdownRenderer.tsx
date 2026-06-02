@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { unified } from "unified";
 import remarkParse from "remark-parse";
 import remarkGfm from "remark-gfm";
@@ -87,8 +87,32 @@ function pageIdFromHref(href: string): string | null {
 /// markdown link syntax LLM agents tend to emit by default. Without (2)
 /// the webview navigated to an unmatched route and the user saw the
 /// "Unexpected Application Error" overlay.
+/// Search-URL template used by the right-click "Search in browser"
+/// action. Google was picked for ubiquity (every default browser
+/// knows how to open it). Open issue if Pascal wants this
+/// user-configurable via Settings.
+const SEARCH_URL = (q: string) =>
+  `https://www.google.com/search?q=${encodeURIComponent(q)}`;
+
+type ContextMenuState = {
+  x: number;
+  y: number;
+  selection: string;
+};
+
 export function MarkdownRenderer({ source, onWikiLinkClick }: Props) {
   const [html, setHtml] = useState<string>("");
+  // Custom right-click menu state. Lives in MarkdownRenderer
+  // (rather than a generic global hook) because the only place
+  // BRAIN currently shows readable prose is inside this component,
+  // and the menu's actions ("Search in browser", "Copy") only make
+  // sense when the user has selected text from the rendered body.
+  // null = no menu visible.
+  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  // Ref on the menu so the click-outside listener can ignore clicks
+  // that landed on the menu itself (otherwise picking a menu item
+  // would close the menu BEFORE the item's onClick fired).
+  const menuRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const pre = preprocessWikiLinks(source);
@@ -102,6 +126,62 @@ export function MarkdownRenderer({ source, onWikiLinkClick }: Props) {
       .then((file) => setHtml(String(file)))
       .catch((err) => setHtml(`<pre>${String(err)}</pre>`));
   }, [source]);
+
+  // Dismiss the context menu on outside click or Esc. Adding
+  // listeners only while the menu is open keeps the listener
+  // surface small and avoids reacting to clicks in unrelated UI.
+  useEffect(() => {
+    if (!contextMenu) return;
+    function onClick(e: MouseEvent) {
+      // Ignore clicks that land on the menu itself — those are
+      // menu-item activations and they own the close themselves.
+      if (menuRef.current && menuRef.current.contains(e.target as Node)) return;
+      setContextMenu(null);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setContextMenu(null);
+    }
+    window.addEventListener("mousedown", onClick);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onClick);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [contextMenu]);
+
+  function handleContextMenu(e: React.MouseEvent<HTMLDivElement>) {
+    const sel = window.getSelection()?.toString().trim() ?? "";
+    // No selection → let the webview show its native context menu
+    // (or nothing — Tauri 2 has no native context menu by default,
+    // but that's the platform choice, not our concern). We only
+    // intercept when the user has something to act on.
+    if (!sel) return;
+    e.preventDefault();
+    // Clamp position so the menu doesn't fall off-screen on a
+    // right-edge or bottom-edge click.
+    const MENU_W = 200;
+    const MENU_H = 88;
+    const x = Math.min(e.clientX, window.innerWidth - MENU_W - 8);
+    const y = Math.min(e.clientY, window.innerHeight - MENU_H - 8);
+    setContextMenu({ x, y, selection: sel });
+  }
+
+  function searchInBrowser() {
+    if (!contextMenu) return;
+    const url = SEARCH_URL(contextMenu.selection);
+    void openShell(url).catch((err) => {
+      console.warn("[BRAIN] failed to open search in browser", err);
+    });
+    setContextMenu(null);
+  }
+
+  function copySelection() {
+    if (!contextMenu) return;
+    void navigator.clipboard.writeText(contextMenu.selection).catch((err) => {
+      console.warn("[BRAIN] clipboard write failed", err);
+    });
+    setContextMenu(null);
+  }
 
   function handleClick(e: React.MouseEvent<HTMLDivElement>) {
     const anchor = (e.target as HTMLElement | null)?.closest("a");
@@ -161,10 +241,44 @@ export function MarkdownRenderer({ source, onWikiLinkClick }: Props) {
   }
 
   return (
-    <div
-      className="prose-brain px-6 py-5"
-      onClick={handleClick}
-      dangerouslySetInnerHTML={{ __html: html }}
-    />
+    <>
+      <div
+        className="prose-brain px-6 py-5"
+        onClick={handleClick}
+        onContextMenu={handleContextMenu}
+        dangerouslySetInnerHTML={{ __html: html }}
+      />
+      {contextMenu && (
+        <div
+          ref={menuRef}
+          role="menu"
+          aria-label="Selection actions"
+          className="fixed z-50 min-w-[200px] rounded-md border border-neutral-700 bg-neutral-900 py-1 text-sm shadow-2xl"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+        >
+          <button
+            type="button"
+            role="menuitem"
+            onClick={searchInBrowser}
+            className="block w-full px-3 py-1.5 text-left text-neutral-100 hover:bg-neutral-800"
+            // Stop propagation so the window-level mousedown
+            // listener doesn't see this click and prematurely close
+            // the menu before the action runs.
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            Search in browser
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={copySelection}
+            className="block w-full px-3 py-1.5 text-left text-neutral-100 hover:bg-neutral-800"
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            Copy
+          </button>
+        </div>
+      )}
+    </>
   );
 }

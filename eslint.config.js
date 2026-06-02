@@ -43,6 +43,7 @@ export default [
         cancelAnimationFrame: "readonly",
         EventTarget: "readonly",
         AbortController: "readonly",
+        Node: "readonly",
       },
     },
     plugins: {

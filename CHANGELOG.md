@@ -6,6 +6,64 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.19] — 2026-05-12
+
+### Fixed
+
+- **Browse view text is selectable again.** `ResizableSplit` had
+  `select-none` on its outer container so the panel-splitter drag
+  wouldn't snag mid-row text. That class was always-on, and it
+  cascaded down into the Tier1 markdown body — the user couldn't
+  highlight a found term to look it up elsewhere. `select-none` is
+  now applied only while the splitter is actually being dragged.
+- **MCP server recovers from a vault-disk unplug/replug without a
+  Claude restart.** The `brain mcp` subprocess opened its SQLite
+  handle once at startup and cached it for the whole process
+  lifetime. When the vault USB stick was pulled, the cached
+  `rusqlite::Connection`'s file descriptor died; replugging
+  restored the path but not the fd, so every tool call returned an
+  IO error until the user fully restarted Claude. The subprocess
+  now self-heals: before each request it probes the cached
+  connection (`SELECT 1`) and the vault marker, drops a stale
+  handle when the disk is gone, and reopens cleanly once the disk
+  is back. No signal from the GUI is required — the subprocess
+  can't receive one, so it heals autonomously. (New
+  `DbHandle::is_alive()` liveness probe + `maybe_reopen_db` in the
+  MCP dispatch loop, six new tests covering open / drop / keep /
+  unplug-then-replug.)
+
+### Added
+
+- **Right-click "Search in browser" + "Copy" on selected text.**
+  When the user right-clicks on a non-empty selection inside the
+  markdown body, an in-app menu appears with two items: "Search in
+  browser" (opens the OS default browser to a Google query for the
+  selection via the Tauri shell plugin) and "Copy" (writes the
+  selection to the clipboard). Esc / outside-click dismiss. No
+  menu is shown when the selection is empty, so the user still
+  gets whatever native context-menu behaviour the webview offers
+  for the unselected case.
+
+### Changed
+
+- **Graph label staffelung — hubs are always labeled.** Pascal's
+  "zoom-out feels empty" feedback on the 0.2.18 policy: at deep
+  zoom-out even the structural-anchor hubs were hidden, leaving
+  the overview as a soup of colored dots without text references.
+  The revised policy keeps hub labels (top-15 % by degree)
+  visible at every zoom level and only staffel-ts the long-tail
+  non-hub labels: they appear when the user zooms past 0.7 (was
+  1.0 in 0.2.18). Small vaults (< 80 nodes) continue to show
+  every label at every zoom, unchanged.
+
+### Migration notes
+
+- No breaking changes, no schema or DB migration. Drop-in update.
+- The MCP self-heal is transparent — existing registrations need
+  no change. The fix only takes effect once this build's
+  `brain mcp` binary is the one Claude launches, so restart Claude
+  (or its MCP host) once after upgrading.
+
 ## [0.2.18] — 2026-05-12
 
 ### Performance

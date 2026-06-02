@@ -3,20 +3,19 @@
 /// isolation from cytoscape — the GraphCanvas integration only has to
 /// translate the helper's verdict into a `text-opacity` style.
 ///
-/// Design intent:
+/// Design intent (revised in 0.2.19 after Pascal's "zoom-out feels
+/// empty" feedback on the 0.2.18 staffelung):
 ///   - Small vaults (< LABEL_DENSITY_THRESHOLD nodes) keep every label
 ///     visible at every zoom level. The whole staffelung exists to
 ///     make 200+-node graphs readable; on a fresh ~30-node vault we
 ///     do not want the user to see labels appear and disappear.
-///   - Larger vaults staffel labels by zoom:
-///       zoom < HIDE_ALL_BELOW          → no labels (overview, dots only)
-///       HIDE_ALL_BELOW ≤ zoom < SHOW_ALL_AT
-///                                       → only "hub" nodes (top
-///                                         HUB_PERCENTILE by degree)
-///                                         keep their labels — pulls
-///                                         the structural anchors out
-///                                         of the visual noise
-///       zoom ≥ SHOW_ALL_AT             → every label visible
+///   - Larger vaults staffel non-hub labels by zoom; hub nodes (top
+///     HUB_PERCENTILE by degree) stay labeled at every zoom level
+///     because they are the structural anchors a user navigates
+///     overview by. The 0.2.18 version hid even hubs below a zoom
+///     floor, which left the overview camera looking like an empty
+///     dot soup. Now: hubs always; non-hubs only at zoom ≥
+///     SHOW_ALL_LABELS_AT_OR_ABOVE_ZOOM.
 
 /// Below this node count, label staffelung is bypassed entirely.
 /// 80 is the empirical knee point where label collisions start to
@@ -29,11 +28,12 @@ export const LABEL_DENSITY_THRESHOLD = 80;
 /// drops the long tail.
 export const HUB_PERCENTILE = 0.15;
 
-/// Zoom-level boundaries for the label-staffelung. Values are
-/// cytoscape `zoom` units — 1.0 ≈ "default fit", smaller numbers
-/// are zoomed out further.
-export const HIDE_ALL_LABELS_BELOW_ZOOM = 0.5;
-export const SHOW_ALL_LABELS_AT_OR_ABOVE_ZOOM = 1.0;
+/// Zoom level at which non-hub labels appear. Below this we show
+/// only the hubs (always); at or above this every label inside the
+/// viewport is visible. Set to 0.7 so labels start appearing well
+/// before the user is fully zoomed in — the 0.2.18 value (1.0) felt
+/// too aggressive on dense vaults at default fit zoom.
+export const SHOW_ALL_LABELS_AT_OR_ABOVE_ZOOM = 0.7;
 
 /// Compute the degree value at which a node is considered a "hub"
 /// (top HUB_PERCENTILE). The threshold is the degree of the node at
@@ -67,8 +67,14 @@ export function decideLabelOpacity(args: {
   // Small graphs: always show every label. The staffelung is a
   // density mitigation, not a default UX choice.
   if (nodeCount < LABEL_DENSITY_THRESHOLD) return 1;
-  if (zoom < HIDE_ALL_LABELS_BELOW_ZOOM) return 0;
-  if (zoom >= SHOW_ALL_LABELS_AT_OR_ABOVE_ZOOM) return 1;
-  // Middle band: only hubs get labels.
-  return degree >= hubThreshold ? 1 : 0;
+  // Hubs stay labeled at every zoom level — they are the
+  // structural anchors a user uses to find their way around in
+  // the overview. (0.2.18 hid hubs below a zoom floor too, which
+  // produced a visually empty overview.)
+  if (degree >= hubThreshold) return 1;
+  // Non-hub labels appear once the user has zoomed in past the
+  // detail threshold — at that point the viewport contains a
+  // small enough neighbourhood that label collisions are
+  // unlikely.
+  return zoom >= SHOW_ALL_LABELS_AT_OR_ABOVE_ZOOM ? 1 : 0;
 }

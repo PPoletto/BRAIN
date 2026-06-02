@@ -1,6 +1,5 @@
 import { describe, it, expect } from "vitest";
 import {
-  HIDE_ALL_LABELS_BELOW_ZOOM,
   SHOW_ALL_LABELS_AT_OR_ABOVE_ZOOM,
   LABEL_DENSITY_THRESHOLD,
   hubDegreeThreshold,
@@ -38,27 +37,52 @@ describe("decideLabelOpacity", () => {
     expect(decideLabelOpacity({ nodeCount: small, zoom: 2.0, degree: 50, hubThreshold: hub })).toBe(1);
   });
 
-  it("hides all labels in dense graphs when zoomed out below the threshold", () => {
-    // Even a degree-100 hub disappears when the camera is too far
-    // out — at this point labels would just be visual noise.
+  it("keeps hub labels visible in dense graphs even when zoomed out far", () => {
+    // The 0.2.19 rule: hubs are the structural anchors of the
+    // overview, so they stay labeled at every zoom level. Without
+    // this the overview camera on a 300+-node vault looked like
+    // empty dot soup (Pascal's "zoom-out feels empty" feedback).
     expect(
       decideLabelOpacity({
         nodeCount: 300,
-        zoom: HIDE_ALL_LABELS_BELOW_ZOOM - 0.01,
-        degree: 100,
+        zoom: 0.1,
+        degree: hub + 10,
+        hubThreshold: hub,
+      }),
+    ).toBe(1);
+    expect(
+      decideLabelOpacity({
+        nodeCount: 300,
+        zoom: 0.3,
+        degree: hub,
+        hubThreshold: hub,
+      }),
+    ).toBe(1);
+  });
+
+  it("hides non-hub labels below SHOW_ALL_AT in a dense graph", () => {
+    // Non-hubs (the long-tail nodes) only get labels once the user
+    // is zoomed in past the detail threshold. Below it, only the
+    // top-degree anchors stay readable.
+    const below = SHOW_ALL_LABELS_AT_OR_ABOVE_ZOOM - 0.01;
+    expect(
+      decideLabelOpacity({
+        nodeCount: 300,
+        zoom: below,
+        degree: hub - 1,
         hubThreshold: hub,
       }),
     ).toBe(0);
-  });
-
-  it("shows only hub labels in the middle zoom band of a dense graph", () => {
-    // Mid-zoom: structural anchors stay labeled, long tail goes
-    // dark. The user can still see the shape of the graph and read
-    // the hub names without label collisions.
-    const mid = (HIDE_ALL_LABELS_BELOW_ZOOM + SHOW_ALL_LABELS_AT_OR_ABOVE_ZOOM) / 2;
-    expect(decideLabelOpacity({ nodeCount: 300, zoom: mid, degree: hub, hubThreshold: hub })).toBe(1);
-    expect(decideLabelOpacity({ nodeCount: 300, zoom: mid, degree: hub + 5, hubThreshold: hub })).toBe(1);
-    expect(decideLabelOpacity({ nodeCount: 300, zoom: mid, degree: hub - 1, hubThreshold: hub })).toBe(0);
+    // The hub at the same zoom is unaffected — both ends of the
+    // policy hold simultaneously.
+    expect(
+      decideLabelOpacity({
+        nodeCount: 300,
+        zoom: below,
+        degree: hub,
+        hubThreshold: hub,
+      }),
+    ).toBe(1);
   });
 
   it("shows every label in a dense graph once the user zooms past SHOW_ALL_AT", () => {

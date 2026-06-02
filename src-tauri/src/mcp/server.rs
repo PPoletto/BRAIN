@@ -69,31 +69,30 @@ struct RpcError {
 
 /// Entrypoint for `brain mcp`. Reads env, then runs the dispatch loop.
 pub fn run_stdio() -> std::io::Result<()> {
-    let vault_path = std::env::var("BRAIN_VAULT_PATH")
+    // The configured vault path from the registration env var. We
+    // deliberately do NOT `is_vault`-filter it once at startup:
+    //   - the disk may be absent at launch (Claude started before the
+    //     USB stick was plugged in) and appear later, and
+    //   - it may be present at launch, then get unplugged and
+    //     replugged mid-session.
+    // Both cases need the path to stay known so we can re-probe it per
+    // request. Liveness is decided dynamically by `maybe_reopen_db`
+    // plus the `is_vault` guard inside `call_tool`, never captured
+    // once.
+    let configured_vault = std::env::var("BRAIN_VAULT_PATH")
         .map(PathBuf::from)
-        .ok()
-        .filter(|p| is_vault(p));
+        .ok();
 
-    // Open the SQLite index — same DB the GUI uses, opened in WAL mode so
-    // both processes can read concurrently. Without this handle the search
-    // tool falls back to a substring walk over the markdown files, which
-    // misses tokenised matches (e.g. query "spec driven development" did
-    // not hit the page id "spec-driven-development"). If the index is
-    // empty (GUI hasn't run a rebuild yet, or a fresh vault), we kick off
-    // a one-shot rebuild here so the LLM never sees zero hits on a vault
-    // that demonstrably has matching pages on disk.
-    let db = vault_path
-        .as_ref()
-        .and_then(|v| match crate::db::DbHandle::open(v) {
-            Ok(handle) => {
-                ensure_index_built(&handle, v);
-                Some(handle)
-            }
-            Err(err) => {
-                tracing::warn!(?err, "could not open SQLite for MCP search; falling back");
-                None
-            }
-        });
+    // SQLite index handle — same DB the GUI uses, WAL mode for
+    // concurrent reads. Opened lazily and self-healing across vault
+    // disk unplug/replug (see `maybe_reopen_db`): a cached
+    // `rusqlite::Connection` keeps a file descriptor that dies when
+    // the vault disk is pulled, and replugging restores the path but
+    // not the fd — so without the self-heal every tool call
+    // IO-errored until the user fully restarted Claude. Starts `None`
+    // and is (re)opened on the first request where the vault is
+    // reachable.
+    let mut db: Option<crate::db::DbHandle> = None;
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -104,6 +103,12 @@ pub fn run_stdio() -> std::io::Result<()> {
         if line.trim().is_empty() {
             continue;
         }
+        // Resolve the vault's current reachability and self-heal the
+        // DB handle BEFORE dispatch. Cheap when nothing changed (one
+        // `is_vault` stat + one `SELECT 1` liveness probe); only pays
+        // the full reopen cost when the disk state actually flipped.
+        let vault_now = configured_vault.as_deref().filter(|p| is_vault(p));
+        maybe_reopen_db(&mut db, vault_now);
         let response_line = match serde_json::from_str::<RpcRequest>(&line) {
             Ok(req) => {
                 // Wrap dispatch so a panic anywhere in `handle_request` (or
@@ -119,7 +124,7 @@ pub fn run_stdio() -> std::io::Result<()> {
                     &id_for_panic,
                     &method_for_log,
                     std::panic::AssertUnwindSafe(|| {
-                        handle_request(&req, vault_path.as_deref(), db.as_ref())
+                        handle_request(&req, vault_now, db.as_ref())
                     }),
                 )
             }
@@ -216,6 +221,49 @@ fn handle_request(
 /// vaults, important for never-mounted-by-GUI vaults so MCP search has
 /// real data to query. We deliberately skip a full rebuild when the
 /// index already has rows — the GUI's wiki watcher keeps it fresh.
+/// Self-heals the MCP subprocess's cached DB handle across vault disk
+/// unplug/replug. Called once per request, before dispatch:
+///
+///   - `vault_now == None` (disk not currently a vault — unplugged, or
+///     never present): drop any handle we hold. A stale handle would
+///     keep a dead file descriptor; dropping it means the next replug
+///     reopens cleanly, and in the meantime the `is_vault` guard in
+///     `call_tool` reports BRAIN_VAULT_DISCONNECTED instead of a
+///     cryptic IO error.
+///   - `vault_now == Some(v)` (disk reachable): keep a live handle as
+///     is (`is_alive` short-circuits, so steady-state cost is one
+///     `SELECT 1`); reopen when the handle is missing or its probe
+///     fails (the replug case — path is back, fd is dead).
+///
+/// This is the entire fix for "MCP returns IO error after USB replug
+/// until Claude is restarted": the subprocess can't receive a signal
+/// from the GUI when the GUI remounts, so it heals itself.
+fn maybe_reopen_db(
+    db: &mut Option<crate::db::DbHandle>,
+    vault_now: Option<&std::path::Path>,
+) {
+    let Some(vault) = vault_now else {
+        // Disk gone — drop the (now-dead) handle.
+        *db = None;
+        return;
+    };
+    // Disk reachable. A live handle needs nothing.
+    if db.as_ref().is_some_and(|h| h.is_alive()) {
+        return;
+    }
+    // Missing or stale handle → (re)open against the reachable vault.
+    match crate::db::DbHandle::open(vault) {
+        Ok(handle) => {
+            ensure_index_built(&handle, vault);
+            *db = Some(handle);
+        }
+        Err(err) => {
+            tracing::warn!(?err, "MCP DB (re)open failed; search falls back to file walk");
+            *db = None;
+        }
+    }
+}
+
 fn ensure_index_built(db: &crate::db::DbHandle, vault: &std::path::Path) {
     let count: i64 = db
         .with(|conn| {
@@ -2339,6 +2387,74 @@ mod tests {
         assert!(pages[1].get("page").is_none(), "missing entries omit the page payload");
         assert_eq!(pages[2].get("id").and_then(|v| v.as_str()), Some("entities/bob"));
         assert_eq!(pages[2].get("found").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn maybe_reopen_db_opens_a_handle_when_the_vault_is_reachable_and_none_held() {
+        // Cold start path: db starts None, vault is present → handle
+        // gets opened. This is also the "disk plugged in after Claude
+        // launched" recovery case.
+        use tempfile::TempDir;
+        use crate::vault::layout::ensure_skeleton;
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        seed_marker(tmp.path());
+        let mut db: Option<crate::db::DbHandle> = None;
+        maybe_reopen_db(&mut db, Some(tmp.path()));
+        assert!(db.is_some(), "handle must be opened when vault reachable");
+        assert!(db.as_ref().unwrap().is_alive());
+    }
+
+    #[test]
+    fn maybe_reopen_db_drops_the_handle_when_the_vault_disk_is_gone() {
+        // Unplug path: vault_now is None (is_vault failed upstream) →
+        // the cached handle is dropped so the next replug reopens
+        // cleanly and the is_vault guard reports a clean disconnect
+        // instead of a dead-fd IO error.
+        use tempfile::TempDir;
+        use crate::vault::layout::ensure_skeleton;
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        seed_marker(tmp.path());
+        let mut db: Option<crate::db::DbHandle> = Some(crate::db::DbHandle::open(tmp.path()).unwrap());
+        maybe_reopen_db(&mut db, None);
+        assert!(db.is_none(), "handle must be dropped when vault unreachable");
+    }
+
+    #[test]
+    fn maybe_reopen_db_keeps_a_live_handle_in_steady_state() {
+        // Steady state: vault reachable, handle alive → the handle
+        // stays Some and alive (the is_alive short-circuit avoids a
+        // needless reopen on every request).
+        use tempfile::TempDir;
+        use crate::vault::layout::ensure_skeleton;
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        seed_marker(tmp.path());
+        let mut db: Option<crate::db::DbHandle> = Some(crate::db::DbHandle::open(tmp.path()).unwrap());
+        maybe_reopen_db(&mut db, Some(tmp.path()));
+        assert!(db.is_some(), "live handle must be kept");
+        assert!(db.as_ref().unwrap().is_alive());
+    }
+
+    #[test]
+    fn maybe_reopen_db_reopens_after_a_drop_simulating_unplug_then_replug() {
+        // Full cycle: open → unplug (drop) → replug (reopen). This is
+        // the exact sequence Pascal hit. After the replug the handle
+        // is live again without any process restart.
+        use tempfile::TempDir;
+        use crate::vault::layout::ensure_skeleton;
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        seed_marker(tmp.path());
+        let mut db: Option<crate::db::DbHandle> = Some(crate::db::DbHandle::open(tmp.path()).unwrap());
+        // Unplug.
+        maybe_reopen_db(&mut db, None);
+        assert!(db.is_none());
+        // Replug.
+        maybe_reopen_db(&mut db, Some(tmp.path()));
+        assert!(db.is_some(), "handle must reopen on replug");
+        assert!(db.as_ref().unwrap().is_alive());
     }
 
     #[test]

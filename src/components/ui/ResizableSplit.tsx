@@ -65,7 +65,15 @@ export function ResizableSplit({
   return (
     <div
       ref={containerRef}
-      className={`flex h-full w-full select-none ${className}`}
+      // `select-none` is applied ONLY while the user is dragging
+      // the splitter handle — otherwise the page-wide
+      // `user-select: none` cascades into the child panels and
+      // makes the markdown body in Browse/Tier1 unselectable.
+      // Pre-0.2.19 the class was always on, which caused Pascal's
+      // "I cannot mark text to search it in a browser" report.
+      // The drag itself still needs the suppression so the cursor
+      // doesn't snag the text mid-drag, hence the conditional.
+      className={`flex h-full w-full ${dragging ? "select-none" : ""} ${className}`}
       style={{ cursor: dragging ? "col-resize" : undefined }}
     >
       <div style={{ width }} className="h-full shrink-0 overflow-hidden">
