@@ -6,6 +6,75 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.20] — 2026-06-20
+
+### Fixed
+
+- **MCP server survives a vault-disk stale handle (standby/resume,
+  long uptime, USB unplug) without hanging or needing a Claude
+  restart.** Bug report: after a resume the `brain mcp` subprocess's
+  SQLite handle on drive `E:` went stale; all index tools
+  (`brain_search`, `brain_query`, `brain_list_pages`,
+  `brain_list_tags`) returned `SQLITE_IOERR`, and eventually even
+  `brain_ping` timed out for 4 minutes. Two root causes, both fixed:
+  - **`brain_ping` regression (introduced in 0.2.19).** The
+    0.2.19 self-heal ran a pre-flight `is_vault` stat + `SELECT 1`
+    liveness probe before *every* request, so ping paid a
+    filesystem stat and a DB query — and a stale-handle hang on
+    either wedged the single-threaded loop. The pre-flight probe is
+    gone. `brain_ping`, `initialize`, `tools/list` and notifications
+    are now answered before any vault/DB access, so ping always
+    responds instantly even while the index DB is dead.
+  - **No bound on a wedged syscall.** DB operations now run on a
+    worker thread bounded by an 8 s timeout (`DbHandle::with_timeout`).
+    A hung kernel read on a stale handle can no longer block the
+    dispatch loop: the op returns `BRAIN_INDEX_TIMEOUT`, the handle
+    is abandoned, and the next call reopens a fresh connection. On a
+    fatal connection error (`SQLITE_IOERR` / `NOTADB` / `CANTOPEN`)
+    the handle is dropped, reopened, and the op retried once —
+    transparent self-heal across an unplug/replug. `busy_timeout`
+    (5 s) is also set so GUI-writer lock contention no longer
+    fast-fails with `SQLITE_BUSY`.
+- **`brain_embedding_status.chunk_count_indexed` is never a silent
+  `null`.** It now reports a number, or an explicit
+  `{ "error": "…" }` object when the count can't be read — the bug
+  report flagged `null` as indistinguishable from "index genuinely
+  empty".
+- **`model_dir` in `brain_embedding_status` no longer shows mixed
+  path separators** (`E:/04_models\bge-m3`). Display paths are
+  normalised to forward slashes. Cosmetic; real filesystem access
+  always used native separators and was never affected.
+
+### Changed
+
+- **MCP DB access is now reactive, not pre-flight.** Every
+  index-backed tool runs through a single `db_op` choke-point that
+  owns the open / timeout / reopen-on-IOERR policy. `brain_search`
+  runs the hybrid (FTS5 + vector) path through it and falls back
+  explicitly to the filesystem brute-force walk on any DB failure;
+  `brain_list_pages` falls back to the filesystem listing. The
+  v0.2.19 `maybe_reopen_db` pre-flight + `DbHandle::is_alive` probe
+  are removed.
+
+### Migration notes
+
+- No breaking changes, no schema/DB migration. Drop-in update.
+- The fix lives in the `brain mcp` subprocess, so it only takes
+  effect once Claude (or the MCP host) launches the new binary —
+  **restart Claude / the MCP host once after upgrading.**
+
+### Residual notes
+
+- The `is_vault` stat, the `has_full_model` model-file stats, and the
+  brute-force search filesystem walk still touch the disk
+  synchronously. On a fast-failing drive (USB) that's sub-ms; on a
+  truly hung network mount they could delay the *individual*
+  vault-touching request (ping stays unaffected). Bounding those is a
+  noted follow-up.
+- One worker thread leaks per timeout event (it's blocked in the
+  kernel and clears itself once the OS errors the syscall). Rare and
+  self-clearing for a personal-scale local server.
+
 ## [0.2.19] — 2026-05-12
 
 ### Fixed

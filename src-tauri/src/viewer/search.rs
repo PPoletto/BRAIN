@@ -69,11 +69,27 @@ pub fn search_with_db(
 /// with `k=60` per the canonical RRF paper. RRF is robust against
 /// score-scale mismatches between BM25 and cosine.
 fn search_hybrid(db: &DbHandle, vault: &Path, query: &str) -> ViewerResult<Vec<SearchHit>> {
+    db.with(|conn| search_hybrid_on_conn(conn, vault, query).map_err(crate::db::DbError::from))
+        .map_err(|err| super::ViewerError::Io(std::io::Error::other(err.to_string())))
+}
+
+/// The connection-only core of hybrid search. Split out from
+/// [`search_hybrid`] so the MCP server can run it through its
+/// timeout/reopen wrapper (`db_op`) — that wrapper owns the
+/// `&mut Option<DbHandle>` and therefore must call into a function that
+/// takes a bare `&Connection`. The embedder work (model load + embed)
+/// is included here so it, too, is covered by the MCP timeout boundary;
+/// it does no DB I/O of its own.
+pub fn search_hybrid_on_conn(
+    conn: &rusqlite::Connection,
+    vault: &Path,
+    query: &str,
+) -> rusqlite::Result<Vec<SearchHit>> {
     let embedder = crate::embedding::for_vault(vault);
     let q_vec = embedder.embed(query);
     let q = sanitize_fts_query(query);
 
-    let result = db.with(|conn| {
+    {
         // FTS5 candidates.
         let mut stmt = conn.prepare(
             "SELECT pf.id, p.title, p.path, snippet(pages_fts, 2, '«', '»', ' … ', 24) \
@@ -170,8 +186,7 @@ fn search_hybrid(db: &DbHandle, vault: &Path, query: &str) -> ViewerResult<Vec<S
         hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         hits.truncate(20);
         Ok(hits)
-    });
-    result.map_err(|err| super::ViewerError::Io(std::io::Error::other(err.to_string())))
+    }
 }
 
 /// KNN top-K via sqlite-vec. Aggregates chunks → pages by best chunk rank.
@@ -279,7 +294,7 @@ fn sanitize_fts_query(raw: &str) -> String {
     }
 }
 
-fn search_brute_force(vault: &Path, query: &str) -> ViewerResult<Vec<SearchHit>> {
+pub fn search_brute_force(vault: &Path, query: &str) -> ViewerResult<Vec<SearchHit>> {
     let needle = query.to_lowercase();
     let mut hits: Vec<SearchHit> = Vec::new();
 

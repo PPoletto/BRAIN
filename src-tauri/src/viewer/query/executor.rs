@@ -34,21 +34,7 @@ pub fn run(db: &DbHandle, query: &str) -> Result<Vec<QueryHit>, ExecError> {
     let expr = parse(query)?;
     let compiled = compile(&expr);
     let hits = db
-        .with(|conn| {
-            let mut stmt = conn.prepare(&compiled.sql)?;
-            let rows = stmt
-                .query_map(params_from_iter(compiled.params.iter()), |row| {
-                    Ok(QueryHit {
-                        id: row.get(0)?,
-                        r#type: row.get(1)?,
-                        path: row.get::<_, String>(2)?,
-                        title: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                        updated_at: row.get(6)?,
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
-        })
+        .with(|conn| run_compiled_on_conn(conn, &compiled).map_err(crate::db::DbError::from))
         .map_err(|e| match e {
             crate::db::DbError::Rusqlite(r) => ExecError::Db(r),
             crate::db::DbError::Io(e) => {
@@ -56,6 +42,38 @@ pub fn run(db: &DbHandle, query: &str) -> Result<Vec<QueryHit>, ExecError> {
             }
         })?;
     Ok(hits)
+}
+
+/// Connection-only query runner. Parses + compiles the query string,
+/// then executes against a bare `&Connection`. Split out so the MCP
+/// server can run it through its timeout/reopen wrapper (`db_op`),
+/// which hands closures a `&Connection` rather than a `DbHandle`.
+/// Parse errors surface as `ExecError::Query`; DB errors as
+/// `rusqlite::Error` (the caller maps them to `DbError` for `db_op`).
+pub fn run_on_conn(conn: &rusqlite::Connection, query: &str) -> Result<Vec<QueryHit>, ExecError> {
+    let expr = parse(query)?;
+    let compiled = compile(&expr);
+    run_compiled_on_conn(conn, &compiled).map_err(ExecError::Db)
+}
+
+/// Shared execution core for both `run` and `run_on_conn`.
+fn run_compiled_on_conn(
+    conn: &rusqlite::Connection,
+    compiled: &super::sql::CompiledQuery,
+) -> rusqlite::Result<Vec<QueryHit>> {
+    let mut stmt = conn.prepare(&compiled.sql)?;
+    let rows = stmt
+        .query_map(params_from_iter(compiled.params.iter()), |row| {
+            Ok(QueryHit {
+                id: row.get(0)?,
+                r#type: row.get(1)?,
+                path: row.get::<_, String>(2)?,
+                title: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                updated_at: row.get(6)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 #[cfg(test)]

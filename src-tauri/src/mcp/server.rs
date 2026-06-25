@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::vault::layout::{is_vault, raw_dir, wiki_dir};
+use crate::vault::layout::{raw_dir, wiki_dir};
 use crate::viewer::{graph, search, tree};
 use crate::wiki::{history as wiki_history, lint, page};
 
@@ -103,12 +103,17 @@ pub fn run_stdio() -> std::io::Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        // Resolve the vault's current reachability and self-heal the
-        // DB handle BEFORE dispatch. Cheap when nothing changed (one
-        // `is_vault` stat + one `SELECT 1` liveness probe); only pays
-        // the full reopen cost when the disk state actually flipped.
-        let vault_now = configured_vault.as_deref().filter(|p| is_vault(p));
-        maybe_reopen_db(&mut db, vault_now);
+        // NO pre-flight DB/vault probe here (removed in 0.2.20). The
+        // v0.2.19 version ran `is_vault` + a `SELECT 1` liveness probe
+        // before EVERY request — which made `brain_ping` pay a
+        // filesystem stat and a DB query, and a stale-handle hang on
+        // either wedged the whole single-threaded loop (the reported
+        // 4-minute ping timeout). Now `handle_request` resolves the
+        // vault lazily and only for vault-touching tools, and DB ops
+        // run through `db_op`'s timeout/reopen wrapper. The configured
+        // path is passed UNFILTERED (no `is_vault` here) so the
+        // disconnect decision happens downstream where it can be
+        // bounded.
         let response_line = match serde_json::from_str::<RpcRequest>(&line) {
             Ok(req) => {
                 // Wrap dispatch so a panic anywhere in `handle_request` (or
@@ -124,7 +129,7 @@ pub fn run_stdio() -> std::io::Result<()> {
                     &id_for_panic,
                     &method_for_log,
                     std::panic::AssertUnwindSafe(|| {
-                        handle_request(&req, vault_now, db.as_ref())
+                        handle_request(&req, configured_vault.as_deref(), &mut db)
                     }),
                 )
             }
@@ -170,7 +175,7 @@ pub fn run_stdio() -> std::io::Result<()> {
 fn handle_request(
     req: &RpcRequest,
     vault: Option<&std::path::Path>,
-    db: Option<&crate::db::DbHandle>,
+    db: &mut Option<crate::db::DbHandle>,
 ) -> String {
     // JSON-RPC 2.0 §4.1: a Request object without an `id` member is a
     // Notification, and the Server MUST NOT reply to it. We catch every
@@ -193,75 +198,169 @@ fn handle_request(
             }),
         ),
         "tools/list" => ok_response(&id, json!({ "tools": tool_descriptors() })),
-        "tools/call" => match vault {
-            Some(v) => match call_tool(&req.params, v, db) {
-                Ok(payload) => ok_response(
+        "tools/call" => {
+            // `brain_ping` is answered here, BEFORE the vault gate and
+            // before `call_tool` — it is a pure liveness probe and must
+            // never touch the filesystem or DB, even when no vault is
+            // configured or the disk is hung. This is the contract the
+            // 0.2.19 pre-flight probe accidentally broke; keeping ping
+            // above the gate is what restores "ping always answers".
+            let tool_name = req.params.get("name").and_then(Value::as_str).unwrap_or("");
+            if tool_name == "brain_ping" {
+                return ok_response(
                     &id,
                     json!({
-                        "content": [{ "type": "text", "text": payload }],
+                        "content": [{ "type": "text", "text": brain_ping_payload() }],
                         "isError": false
                     }),
-                ),
-                Err(err) => ok_response(
-                    &id,
-                    json!({
-                        "content": [{ "type": "text", "text": err }],
-                        "isError": true
-                    }),
-                ),
-            },
-            None => error_response(&id, -32000, "no Brain vault is mounted on this host", None),
-        },
+                );
+            }
+            match vault {
+                Some(v) => match call_tool(&req.params, v, db) {
+                    Ok(payload) => ok_response(
+                        &id,
+                        json!({
+                            "content": [{ "type": "text", "text": payload }],
+                            "isError": false
+                        }),
+                    ),
+                    Err(err) => ok_response(
+                        &id,
+                        json!({
+                            "content": [{ "type": "text", "text": err }],
+                            "isError": true
+                        }),
+                    ),
+                },
+                None => {
+                    error_response(&id, -32000, "no Brain vault is mounted on this host", None)
+                }
+            }
+        }
         "ping" => ok_response(&id, json!({})),
         _ => error_response(&id, -32601, &format!("method not found: {}", req.method), None),
     }
+}
+
+/// The `brain_ping` payload. Pure in-memory — server identity, compiled
+/// version, process uptime. No filesystem, no DB. Shared by the
+/// `handle_request` fast path and kept as a function so the contract
+/// (zero I/O) is obvious and testable.
+fn brain_ping_payload() -> String {
+    serde_json::to_string(&json!({
+        "status": "ok",
+        "server": SERVER_NAME,
+        "version": SERVER_VERSION,
+        "uptime_seconds": process_uptime_seconds(),
+    }))
+    .unwrap_or_default()
 }
 
 /// Builds (or refreshes) the SQLite index if it's empty. Cheap on small
 /// vaults, important for never-mounted-by-GUI vaults so MCP search has
 /// real data to query. We deliberately skip a full rebuild when the
 /// index already has rows — the GUI's wiki watcher keeps it fresh.
-/// Self-heals the MCP subprocess's cached DB handle across vault disk
-/// unplug/replug. Called once per request, before dispatch:
+/// Timeout budget for a single DB operation in the MCP subprocess.
+/// Strictly greater than `DbHandle`'s `busy_timeout` (5 s) so a
+/// legitimate lock wait against the GUI writer is never misread as a
+/// wedged disk and abandoned.
+const DB_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Runs a DB operation with the full resilience policy. This is the
+/// single choke-point every index-backed MCP tool goes through, and it
+/// owns the `&mut Option<DbHandle>` so it can drop/reopen the handle:
 ///
-///   - `vault_now == None` (disk not currently a vault — unplugged, or
-///     never present): drop any handle we hold. A stale handle would
-///     keep a dead file descriptor; dropping it means the next replug
-///     reopens cleanly, and in the meantime the `is_vault` guard in
-///     `call_tool` reports BRAIN_VAULT_DISCONNECTED instead of a
-///     cryptic IO error.
-///   - `vault_now == Some(v)` (disk reachable): keep a live handle as
-///     is (`is_alive` short-circuits, so steady-state cost is one
-///     `SELECT 1`); reopen when the handle is missing or its probe
-///     fails (the replug case — path is back, fd is dead).
+///   1. Open lazily if we hold no handle (and build the index on first
+///      open). A failed open returns a clean error string.
+///   2. Run `f` on a worker thread bounded by `DB_OP_TIMEOUT`
+///      (`with_timeout`). On timeout: abandon the handle (`*db = None`,
+///      per the orphaned-thread contract — the wedged worker still holds
+///      its mutex) and return `BRAIN_INDEX_TIMEOUT`. No retry: a retry
+///      would just wedge again.
+///   3. On a fatal connection error (`SQLITE_IOERR` / `NOTADB` /
+///      `CANTOPEN` — the stale-handle symptoms), drop + reopen + run
+///      `f` exactly once more. This is the transparent self-heal across
+///      a disk unplug/replug.
+///   4. On a non-fatal error (bad SQL, missing table), return it as-is
+///      WITHOUT touching the handle — never reopen-loop on a logic bug.
 ///
-/// This is the entire fix for "MCP returns IO error after USB replug
-/// until Claude is restarted": the subprocess can't receive a signal
-/// from the GUI when the GUI remounts, so it heals itself.
-fn maybe_reopen_db(
+/// `f` must be `Clone` (it may run twice) and `Send + 'static` (it runs
+/// on the worker thread and may outlive this frame on timeout).
+fn db_op<F, T>(
     db: &mut Option<crate::db::DbHandle>,
-    vault_now: Option<&std::path::Path>,
-) {
-    let Some(vault) = vault_now else {
-        // Disk gone — drop the (now-dead) handle.
-        *db = None;
-        return;
-    };
-    // Disk reachable. A live handle needs nothing.
-    if db.as_ref().is_some_and(|h| h.is_alive()) {
-        return;
-    }
-    // Missing or stale handle → (re)open against the reachable vault.
-    match crate::db::DbHandle::open(vault) {
-        Ok(handle) => {
-            ensure_index_built(&handle, vault);
-            *db = Some(handle);
+    vault: &std::path::Path,
+    op_name: &str,
+    f: F,
+) -> Result<T, String>
+where
+    F: Fn(&rusqlite::Connection) -> crate::db::DbResult<T> + Clone + Send + 'static,
+    T: Send + 'static,
+{
+    // Ensure we hold a handle (open + first-run index build).
+    if db.is_none() {
+        match crate::db::DbHandle::open(vault) {
+            Ok(handle) => {
+                ensure_index_built(&handle, vault);
+                *db = Some(handle);
+            }
+            Err(err) => {
+                return Err(format!(
+                    "BRAIN index temporarily unavailable ({op_name}): {err}"
+                ));
+            }
         }
-        Err(err) => {
-            tracing::warn!(?err, "MCP DB (re)open failed; search falls back to file walk");
+    }
+    let handle = db.as_ref().expect("handle present after open").clone();
+    match handle.with_timeout(DB_OP_TIMEOUT, f.clone()) {
+        Err(crate::db::DbTimeout) => {
+            // Abandon the wedged handle — the worker still holds its
+            // mutex and would block any future lock on it.
             *db = None;
+            Err(format!(
+                "BRAIN_INDEX_TIMEOUT: the index did not respond within {}s during {op_name}; \
+                 the vault disk may be hung. Try again, or reconnect the drive.",
+                DB_OP_TIMEOUT.as_secs()
+            ))
         }
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) if crate::db::is_connection_fatal(&err) => {
+            // Stale connection — drop, reopen, retry once.
+            tracing::warn!(?err, op = op_name, "DB op hit a fatal connection error; reopening");
+            *db = None;
+            match crate::db::DbHandle::open(vault) {
+                Ok(reopened) => {
+                    let result = reopened.with_timeout(DB_OP_TIMEOUT, f);
+                    *db = Some(reopened);
+                    match result {
+                        Err(crate::db::DbTimeout) => {
+                            *db = None;
+                            Err(format!(
+                                "BRAIN_INDEX_TIMEOUT: the index did not respond within {}s during \
+                                 {op_name} (after reconnect); the vault disk may be hung.",
+                                DB_OP_TIMEOUT.as_secs()
+                            ))
+                        }
+                        Ok(Ok(value)) => Ok(value),
+                        Ok(Err(e)) => Err(format!("{op_name}: {e}")),
+                    }
+                }
+                Err(e) => Err(format!(
+                    "BRAIN index unavailable after reconnect ({op_name}): {e}"
+                )),
+            }
+        }
+        Ok(Err(err)) => Err(format!("{op_name}: {err}")),
     }
+}
+
+/// Normalises a path to forward-slash form for display in tool
+/// responses. `Path::join` on Windows mixes separators when the base
+/// came from an env var with `/` (e.g. `E:/04_models` joined with
+/// `bge-m3` → `E:/04_models\bge-m3`), which the bug report flagged as
+/// confusing. Display-only — never use this for actual filesystem
+/// access (the real `Path` keeps native separators and resolves fine).
+fn display_path(p: &std::path::Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
 }
 
 fn ensure_index_built(db: &crate::db::DbHandle, vault: &std::path::Path) {
@@ -589,7 +688,7 @@ fn tool_descriptors() -> Vec<Value> {
 fn call_tool(
     params: &Value,
     vault: &std::path::Path,
-    db: Option<&crate::db::DbHandle>,
+    db: &mut Option<crate::db::DbHandle>,
 ) -> Result<String, String> {
     let name = params
         .get("name")
@@ -597,19 +696,10 @@ fn call_tool(
         .ok_or_else(|| "missing 'name'".to_string())?;
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
-    // Liveness probe runs before the vault-disconnect guard: a
-    // hanging or unmounted disk is *exactly* the situation where the
-    // agent needs to tell server-up-but-vault-down apart from
-    // server-down. Always succeeds, no I/O.
-    if name == "brain_ping" {
-        return Ok(serde_json::to_string(&json!({
-            "status": "ok",
-            "server": SERVER_NAME,
-            "version": SERVER_VERSION,
-            "uptime_seconds": process_uptime_seconds(),
-        }))
-        .unwrap_or_default());
-    }
+    // NOTE: `brain_ping` is handled upstream in `handle_request`, before
+    // the vault gate and before this function — it must never reach the
+    // `is_vault` stat below or any DB code. Do not re-add a ping branch
+    // here.
 
     // Fail fast when the vault is no longer reachable (typical cause:
     // user pulled the SSD without ejecting). Without this guard the
@@ -631,11 +721,28 @@ fn call_tool(
     match name {
         "brain_search" => {
             let q = args.get("query").and_then(Value::as_str).unwrap_or("");
-            // Prefer the FTS5 path when the index handle is available — it
-            // tokenises hyphenated ids correctly so "spec driven development"
-            // matches "spec-driven-development". When `db` is None we fall
-            // back to the brute-force walker so the LLM still gets results.
-            let hits = search::search_with_db(vault, q, db).map_err(|e| e.to_string())?;
+            if q.trim().is_empty() {
+                return Ok(serde_json::to_string_pretty(&Vec::<search::SearchHit>::new())
+                    .unwrap_or_default());
+            }
+            // Run the hybrid (FTS5 + vector) path through db_op so it is
+            // timeout-bounded and self-heals on a stale connection. On
+            // any DB-side failure (timeout, IOERR-after-reopen, empty
+            // index) fall back EXPLICITLY to the filesystem brute-force
+            // walker so the LLM still gets results — the same graceful
+            // degradation `search_with_db` did internally, but now the
+            // timeout boundary lives here where we own `&mut db`.
+            let query_owned = q.to_string();
+            let vault_owned = vault.to_path_buf();
+            let hybrid = db_op(db, vault, "brain_search", move |conn| {
+                search::search_hybrid_on_conn(conn, &vault_owned, &query_owned)
+                    .map_err(crate::db::DbError::from)
+            });
+            let hits = match hybrid {
+                Ok(hits) if !hits.is_empty() => hits,
+                // Empty hybrid result or any DB error → brute-force walk.
+                _ => search::search_brute_force(vault, q).map_err(|e| e.to_string())?,
+            };
             Ok(serde_json::to_string_pretty(&hits).unwrap_or_default())
         }
         "brain_get_page" => {
@@ -1043,12 +1150,20 @@ fn call_tool(
             Ok(serde_json::to_string_pretty(&g).unwrap_or_default())
         }
         "brain_query" => {
-            let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-            let handle = db.ok_or_else(|| {
-                "brain_query requires the SQLite index — vault not indexed yet".to_string()
+            let query = args
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let hits = db_op(db, vault, "brain_query", move |conn| {
+                crate::viewer::query::executor::run_on_conn(conn, &query).map_err(|e| match e {
+                    crate::viewer::query::executor::ExecError::Db(r) => crate::db::DbError::from(r),
+                    // Parse errors are not DB errors — surface them as an
+                    // Io-wrapped string so db_op returns them verbatim
+                    // (and never reopen-loops on a bad query).
+                    other => crate::db::DbError::Io(std::io::Error::other(other.to_string())),
+                })
             })?;
-            let hits = crate::viewer::query::executor::run(handle, query)
-                .map_err(|e| e.to_string())?;
             Ok(serde_json::to_string_pretty(&hits).unwrap_or_default())
         }
         "brain_embedding_status" => {
@@ -1059,48 +1174,37 @@ fn call_tool(
             let embedder = crate::embedding::for_vault(vault);
             let model_dir = crate::vault::layout::models_dir(vault).join("bge-m3");
             let semantic = embedder.name() == "bge-m3";
-            // Chunk count is best-effort: if the DB isn't open yet
-            // (unindexed vault) we still want the rest of the
-            // response, so we report `null` instead of failing.
-            let chunk_count_indexed = match db {
-                Some(handle) => handle
-                    .with(|conn| {
-                        Ok(conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| {
-                            r.get::<_, i64>(0)
-                        })?)
-                    })
-                    .ok(),
-                None => None,
+            // Chunk count via db_op (timeout-bounded, self-healing).
+            // Reported as a number on success, or an explicit
+            // `{ "error": "<msg>" }` object on failure — never a silent
+            // `null` (which the bug report flagged as indistinguishable
+            // from "index genuinely empty").
+            let chunk_count_indexed = match db_op(db, vault, "brain_embedding_status", |conn| {
+                Ok(conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get::<_, i64>(0))?)
+            }) {
+                Ok(n) => json!(n),
+                Err(msg) => json!({ "error": msg }),
             };
             Ok(serde_json::to_string_pretty(&json!({
                 "embedder": embedder.name(),
                 "semantic": semantic,
-                "model_dir": model_dir.to_string_lossy(),
+                "model_dir": display_path(&model_dir),
                 "dim": embedder.dim(),
                 "chunk_count_indexed": chunk_count_indexed,
             }))
             .unwrap_or_default())
         }
         "brain_list_tags" => {
-            // Requires the DB index: tags are stored in the
-            // `page_tags` relation, not parsed live from disk. If the
-            // index isn't open yet (unindexed vault), surface the
-            // same descriptive error pattern as `brain_query`.
-            let handle = db.ok_or_else(|| {
-                "brain_list_tags requires the SQLite index — vault not indexed yet".to_string()
+            let rows = db_op(db, vault, "brain_list_tags", |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT tag, COUNT(*) AS count FROM page_tags \
+                     GROUP BY tag ORDER BY count DESC, tag ASC",
+                )?;
+                let mapped: Result<Vec<(String, i64)>, _> = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+                    .collect();
+                Ok(mapped?)
             })?;
-            let rows = handle
-                .with(|conn| {
-                    let mut stmt = conn.prepare(
-                        "SELECT tag, COUNT(*) AS count FROM page_tags \
-                         GROUP BY tag ORDER BY count DESC, tag ASC",
-                    )?;
-                    let mapped: Result<Vec<(String, i64)>, _> = stmt
-                        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
-                        .collect();
-                    Ok(mapped?)
-                })
-                .map_err(|e: crate::db::DbError| e.to_string())?;
             let tags: Vec<Value> = rows
                 .into_iter()
                 .map(|(tag, count)| json!({ "tag": tag, "count": count }))
@@ -1141,7 +1245,7 @@ fn call_tool(
 fn list_pages_dispatch(
     args: &Value,
     vault: &std::path::Path,
-    db: Option<&crate::db::DbHandle>,
+    db: &mut Option<crate::db::DbHandle>,
 ) -> Result<String, String> {
     const BUCKETS: [&str; 4] = ["entities", "concepts", "sources", "topics"];
 
@@ -1169,12 +1273,15 @@ fn list_pages_dispatch(
         }
     }
 
-    // Collect (bucket, id) pairs from whichever source is fastest.
-    let pairs: Vec<(String, String)> = if let Some(handle) = db {
-        list_page_ids_via_db(handle).map_err(|e| e.to_string())?
-    } else {
-        list_page_ids_via_filesystem(vault).map_err(|e| e.to_string())?
-    };
+    // Collect (bucket, id) pairs. Prefer the DB fastpath (timeout-
+    // bounded + self-healing via db_op); on ANY DB failure (timeout,
+    // IOERR-after-reopen, unindexed vault) fall back to the filesystem
+    // walk so the listing still works while the index is unavailable.
+    let pairs: Vec<(String, String)> =
+        match db_op(db, vault, "brain_list_pages", list_page_ids_on_conn) {
+            Ok(pairs) => pairs,
+            Err(_) => list_page_ids_via_filesystem(vault).map_err(|e| e.to_string())?,
+        };
 
     // Server-side filtering — saves both bytes on the wire and tokens
     // for the LLM.
@@ -1231,24 +1338,22 @@ fn list_pages_dispatch(
 /// already used by `tree::list_tree`. Unknown buckets are silently
 /// dropped — they shouldn't occur unless the index drifts from the
 /// filesystem schema.
-fn list_page_ids_via_db(
-    handle: &crate::db::DbHandle,
+fn list_page_ids_on_conn(
+    conn: &rusqlite::Connection,
 ) -> crate::db::DbResult<Vec<(String, String)>> {
-    handle.with(|conn| {
-        let mut stmt = conn.prepare("SELECT id FROM pages")?;
-        let rows = stmt.query_map([], |row| {
-            let id: String = row.get(0)?;
-            Ok(id)
-        })?;
-        let mut out = Vec::new();
-        for r in rows {
-            let id = r?;
-            if let Some((bucket, _)) = id.split_once('/') {
-                out.push((bucket.to_string(), id));
-            }
+    let mut stmt = conn.prepare("SELECT id FROM pages")?;
+    let rows = stmt.query_map([], |row| {
+        let id: String = row.get(0)?;
+        Ok(id)
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        let id = r?;
+        if let Some((bucket, _)) = id.split_once('/') {
+            out.push((bucket.to_string(), id));
         }
-        Ok(out)
-    })
+    }
+    Ok(out)
 }
 
 /// Filesystem fallback for vaults that haven't been DB-indexed yet.
@@ -1360,7 +1465,7 @@ mod tests {
             method: "initialize".into(),
             params: json!({}),
         };
-        let resp = handle_request(&req, None, None);
+        let resp = handle_request(&req, None, &mut None);
         assert!(resp.contains(PROTOCOL_VERSION));
         assert!(resp.contains(&format!("\"name\":\"{SERVER_NAME}\"")));
     }
@@ -1378,7 +1483,7 @@ mod tests {
             method: "tools/list".into(),
             params: json!({}),
         };
-        let resp = handle_request(&req, None, None);
+        let resp = handle_request(&req, None, &mut None);
         for name in [
             "brain_ping",
             "brain_search",
@@ -1413,7 +1518,7 @@ mod tests {
             method: "tools/call".into(),
             params: json!({"name": "brain_list_pages", "arguments": {}}),
         };
-        let resp = handle_request(&req, None, None);
+        let resp = handle_request(&req, None, &mut None);
         assert!(resp.contains("no Brain vault is mounted"));
     }
 
@@ -1425,7 +1530,7 @@ mod tests {
             method: "does_not_exist".into(),
             params: json!({}),
         };
-        let resp = handle_request(&req, None, None);
+        let resp = handle_request(&req, None, &mut None);
         assert!(resp.contains("method not found"));
     }
 
@@ -1440,7 +1545,7 @@ mod tests {
             method: "notifications/initialized".into(),
             params: json!({}),
         };
-        let resp = handle_request(&req, None, None);
+        let resp = handle_request(&req, None, &mut None);
         assert!(
             resp.is_empty(),
             "notifications must yield zero bytes, got: '{resp}'"
@@ -1455,7 +1560,7 @@ mod tests {
             method: "notifications/cancelled".into(),
             params: json!({}),
         };
-        let resp = handle_request(&req, None, None);
+        let resp = handle_request(&req, None, &mut None);
         assert!(resp.is_empty(), "unknown notifications must not get a response");
     }
 
@@ -1470,7 +1575,7 @@ mod tests {
             method: "notifications/something".into(),
             params: json!({}),
         };
-        let resp = handle_request(&req, None, None);
+        let resp = handle_request(&req, None, &mut None);
         assert!(resp.is_empty());
     }
 
@@ -1498,7 +1603,7 @@ mod tests {
                 "arguments": { "id": "entities/alice" }
             }),
             tmp.path(),
-            None,
+            &mut None,
         )
         .expect("brain_get_context should succeed");
         // Sanity: outbound list must contain the two wiki links.
@@ -1542,7 +1647,7 @@ mod tests {
                 "arguments": {}
             }),
             tmp.path(),
-            None,
+            &mut None,
         )
         .expect("brain_lint_report should succeed");
         assert!(
@@ -1584,6 +1689,7 @@ mod tests {
         .unwrap();
         let db = crate::db::DbHandle::open(tmp.path()).unwrap();
         crate::db::pages_index::rebuild(&db, tmp.path()).unwrap();
+        let mut db = Some(db);
 
         let result = call_tool(
             &json!({
@@ -1591,7 +1697,7 @@ mod tests {
                 "arguments": { "query": "spec driven development" }
             }),
             tmp.path(),
-            Some(&db),
+            &mut db,
         )
         .expect("brain_search should succeed");
         assert!(
@@ -1616,7 +1722,7 @@ mod tests {
                 "arguments": { "query": "anything" }
             }),
             tmp.path(),
-            None,
+            &mut None,
         )
         .expect_err("disconnected vault must reject the call");
         assert!(
@@ -1701,12 +1807,13 @@ mod tests {
     fn list_pages_call(
         vault: &std::path::Path,
         args: Value,
-        db: Option<&crate::db::DbHandle>,
+        db: Option<crate::db::DbHandle>,
     ) -> Value {
+        let mut db = db;
         let result = call_tool(
             &json!({ "name": "brain_list_pages", "arguments": args }),
             vault,
-            db,
+            &mut db,
         )
         .expect("brain_list_pages should succeed");
         serde_json::from_str(&result).expect("result must be valid JSON")
@@ -1723,7 +1830,7 @@ mod tests {
         crate::db::pages_index::rebuild(&db, tmp.path()).unwrap();
 
         let fs_result = list_pages_call(tmp.path(), json!({}), None);
-        let db_result = list_pages_call(tmp.path(), json!({}), Some(&db));
+        let db_result = list_pages_call(tmp.path(), json!({}), Some(db));
 
         // Set-equality per bucket so ordering doesn't matter.
         for bucket in ["entities", "concepts", "sources", "topics"] {
@@ -1854,7 +1961,7 @@ mod tests {
                 "arguments": { "id": "entities/alice" }
             }),
             tmp.path(),
-            None,
+            &mut None,
         )
         .expect("brain_page_exists should succeed");
         let parsed: Value = serde_json::from_str(&result).expect("must be valid JSON");
@@ -1875,7 +1982,7 @@ mod tests {
                 "arguments": { "id": "entities/never-created" }
             }),
             tmp.path(),
-            None,
+            &mut None,
         )
         .expect("brain_page_exists must succeed even for missing pages — the missing case is data, not error");
         let parsed: Value = serde_json::from_str(&result).expect("must be valid JSON");
@@ -1899,7 +2006,7 @@ mod tests {
                 "arguments": { "id": "../../etc/passwd" }
             }),
             tmp.path(),
-            None,
+            &mut None,
         )
         .expect_err("path traversal must reject");
         assert!(err.contains(".."));
@@ -1921,7 +2028,7 @@ mod tests {
                 "arguments": {}
             }),
             tmp.path(),
-            None,
+            &mut None,
         )
         .expect_err("missing id must reject");
         assert!(err.to_lowercase().contains("id"));
@@ -1942,7 +2049,7 @@ mod tests {
                 "arguments": { "id": "entities/alice" }
             }),
             tmp.path(),
-            None,
+            &mut None,
         )
         .expect_err("disconnected vault must reject");
         assert!(err.starts_with("BRAIN_VAULT_DISCONNECTED:"));
@@ -1971,7 +2078,7 @@ mod tests {
                 }
             }),
             tmp.path(),
-            None,
+            &mut None,
         )
         .expect_err("page with broken links must fail lint");
 
@@ -2029,7 +2136,7 @@ mod tests {
                 "arguments": { "id": "entities/alice" }
             }),
             tmp.path(),
-            None,
+            &mut None,
         )
         .expect("brain_get_page_history must succeed");
         let parsed: serde_json::Value = serde_json::from_str(&ok).expect("JSON");
@@ -2074,7 +2181,7 @@ mod tests {
                 "arguments": { "id": "entities/alice", "sha": v1_sha }
             }),
             tmp.path(),
-            None,
+            &mut None,
         )
         .expect("brain_restore_page must succeed");
         // The response surfaces the source sha so the agent can quote
@@ -2101,7 +2208,7 @@ mod tests {
                 "arguments": { "id": "../../../etc/passwd", "sha": "deadbeef" }
             }),
             tmp.path(),
-            None,
+            &mut None,
         )
         .expect_err("traversal id must be rejected");
         assert!(err.contains(".."));
@@ -2148,7 +2255,7 @@ mod tests {
                 }
             }),
             tmp.path(),
-            None,
+            &mut None,
         )
         .expect("batch with self-resolving links must succeed");
 
@@ -2193,7 +2300,7 @@ mod tests {
                 }
             }),
             tmp.path(),
-            None,
+            &mut None,
         )
         .expect_err("malformed page must abort the whole batch");
         assert!(err.contains("entities/bad"), "error should name the offending id: {err}");
@@ -2224,7 +2331,7 @@ mod tests {
         let ok = call_tool(
             &json!({ "name": "brain_embedding_status", "arguments": {} }),
             tmp.path(),
-            None,
+            &mut None,
         )
         .expect("brain_embedding_status must succeed regardless of model presence");
         let parsed: serde_json::Value = serde_json::from_str(&ok).expect("response is JSON");
@@ -2261,6 +2368,16 @@ mod tests {
             parsed.get("dim").and_then(|v| v.as_i64()),
             Some(1024),
             "dim is 1024 across both embedders"
+        );
+        // chunk_count_indexed must NEVER be a silent null — on a fresh
+        // (but openable) vault db_op opens lazily and the count is a
+        // number (0). The bug report flagged null as indistinguishable
+        // from "index genuinely empty"; we now always give a number or
+        // an explicit {error} object.
+        let ci = parsed.get("chunk_count_indexed").expect("field present");
+        assert!(
+            ci.is_number() || ci.get("error").is_some(),
+            "chunk_count_indexed must be a number or an error object, never null: {ci}"
         );
     }
 
@@ -2304,11 +2421,12 @@ mod tests {
         .unwrap();
         let db = crate::db::DbHandle::open(tmp.path()).unwrap();
         crate::db::pages_index::rebuild(&db, tmp.path()).unwrap();
+        let mut db = Some(db);
 
         let ok = call_tool(
             &json!({ "name": "brain_list_tags", "arguments": {} }),
             tmp.path(),
-            Some(&db),
+            &mut db,
         )
         .expect("brain_list_tags must succeed on a populated vault");
         let parsed: serde_json::Value = serde_json::from_str(&ok).expect("response is JSON");
@@ -2373,7 +2491,7 @@ mod tests {
                 }
             }),
             tmp.path(),
-            None,
+            &mut None,
         )
         .expect("brain_get_pages must succeed even with mixed found/missing");
         let parsed: serde_json::Value = serde_json::from_str(&ok).expect("response is JSON");
@@ -2390,109 +2508,81 @@ mod tests {
     }
 
     #[test]
-    fn maybe_reopen_db_opens_a_handle_when_the_vault_is_reachable_and_none_held() {
-        // Cold start path: db starts None, vault is present → handle
-        // gets opened. This is also the "disk plugged in after Claude
-        // launched" recovery case.
+    fn db_op_opens_a_handle_lazily_when_none_is_held() {
+        // Cold start / first DB call: db starts None, vault present →
+        // db_op opens the handle, runs the op, leaves the handle cached.
         use tempfile::TempDir;
         use crate::vault::layout::ensure_skeleton;
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
         seed_marker(tmp.path());
         let mut db: Option<crate::db::DbHandle> = None;
-        maybe_reopen_db(&mut db, Some(tmp.path()));
-        assert!(db.is_some(), "handle must be opened when vault reachable");
-        assert!(db.as_ref().unwrap().is_alive());
+        let n = db_op(&mut db, tmp.path(), "test", |conn| {
+            Ok(conn.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))?)
+        })
+        .expect("db_op opens lazily and runs the op");
+        assert_eq!(n, 1);
+        assert!(db.is_some(), "handle must be cached after first op");
     }
 
     #[test]
-    fn maybe_reopen_db_drops_the_handle_when_the_vault_disk_is_gone() {
-        // Unplug path: vault_now is None (is_vault failed upstream) →
-        // the cached handle is dropped so the next replug reopens
-        // cleanly and the is_vault guard reports a clean disconnect
-        // instead of a dead-fd IO error.
+    fn db_op_keeps_the_handle_on_a_non_fatal_sql_error() {
+        // A logic error (missing table) is NOT a dead connection — it
+        // must surface as an error WITHOUT dropping/reopening the
+        // handle (otherwise a bad query would trigger an endless
+        // reopen loop).
         use tempfile::TempDir;
         use crate::vault::layout::ensure_skeleton;
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
         seed_marker(tmp.path());
-        let mut db: Option<crate::db::DbHandle> = Some(crate::db::DbHandle::open(tmp.path()).unwrap());
-        maybe_reopen_db(&mut db, None);
-        assert!(db.is_none(), "handle must be dropped when vault unreachable");
-    }
-
-    #[test]
-    fn maybe_reopen_db_keeps_a_live_handle_in_steady_state() {
-        // Steady state: vault reachable, handle alive → the handle
-        // stays Some and alive (the is_alive short-circuit avoids a
-        // needless reopen on every request).
-        use tempfile::TempDir;
-        use crate::vault::layout::ensure_skeleton;
-        let tmp = TempDir::new().unwrap();
-        ensure_skeleton(tmp.path()).unwrap();
-        seed_marker(tmp.path());
-        let mut db: Option<crate::db::DbHandle> = Some(crate::db::DbHandle::open(tmp.path()).unwrap());
-        maybe_reopen_db(&mut db, Some(tmp.path()));
-        assert!(db.is_some(), "live handle must be kept");
-        assert!(db.as_ref().unwrap().is_alive());
-    }
-
-    #[test]
-    fn maybe_reopen_db_reopens_after_a_drop_simulating_unplug_then_replug() {
-        // Full cycle: open → unplug (drop) → replug (reopen). This is
-        // the exact sequence Pascal hit. After the replug the handle
-        // is live again without any process restart.
-        use tempfile::TempDir;
-        use crate::vault::layout::ensure_skeleton;
-        let tmp = TempDir::new().unwrap();
-        ensure_skeleton(tmp.path()).unwrap();
-        seed_marker(tmp.path());
-        let mut db: Option<crate::db::DbHandle> = Some(crate::db::DbHandle::open(tmp.path()).unwrap());
-        // Unplug.
-        maybe_reopen_db(&mut db, None);
-        assert!(db.is_none());
-        // Replug.
-        maybe_reopen_db(&mut db, Some(tmp.path()));
-        assert!(db.is_some(), "handle must reopen on replug");
-        assert!(db.as_ref().unwrap().is_alive());
-    }
-
-    #[test]
-    fn brain_ping_returns_status_ok_with_server_version_for_health_checks() {
-        // The user's pain point: after ~80 successive writes the MCP
-        // server went silent for the 4-minute IPC timeout with no
-        // intermediate "is it alive?" signal. brain_ping is the
-        // cheap, no-vault-required liveness probe — agents can call
-        // it between bulk-ingest batches and notice a hang within
-        // seconds instead of minutes. Must not require a mounted
-        // vault (the disk could be the thing that's hanging).
-        let result = call_tool(
-            &json!({
-                "name": "brain_ping",
-                "arguments": {}
-            }),
-            std::path::Path::new("/path/that/will/not/exist/and/should/not/matter"),
-            None,
+        let mut db: Option<crate::db::DbHandle> =
+            Some(crate::db::DbHandle::open(tmp.path()).unwrap());
+        let err = db_op(&mut db, tmp.path(), "test", |conn| {
+            conn.query_row("SELECT * FROM table_that_does_not_exist", [], |_| Ok(()))?;
+            Ok(())
+        })
+        .expect_err("missing table is an error");
+        assert!(err.contains("test"), "error names the op: {err}");
+        assert!(
+            db.is_some(),
+            "a non-fatal SQL error must not drop the handle (no reopen-loop)"
         );
-        // Errors here would mean ping piggybacked on the vault-
-        // disconnect guard — which would defeat its purpose.
-        let ok = result.expect("brain_ping must succeed regardless of vault state");
-        let parsed: serde_json::Value = serde_json::from_str(&ok).expect("response is JSON");
-        assert_eq!(parsed.get("status").and_then(|v| v.as_str()), Some("ok"));
-        assert_eq!(
-            parsed.get("server").and_then(|v| v.as_str()),
-            Some("BRAIN"),
-            "server identity stays in the ping so an agent talking to multiple MCP hosts can tell which one answered"
-        );
-        assert_eq!(
-            parsed.get("version").and_then(|v| v.as_str()),
-            Some(env!("CARGO_PKG_VERSION")),
-            "version must match the compiled CARGO_PKG_VERSION"
+    }
+
+    #[test]
+    fn brain_ping_is_answered_without_touching_the_vault_or_db() {
+        // The core regression guard for the 0.2.20 fix: ping is served
+        // by handle_request BEFORE the vault gate. Even with a vault
+        // path that is NOT a vault and no DB handle, ping must return
+        // a clean status payload — never BRAIN_VAULT_DISCONNECTED, and
+        // never reaching is_vault or any DB code (which could hang on a
+        // stale disk).
+        let req = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(7)),
+            method: "tools/call".into(),
+            params: json!({ "name": "brain_ping", "arguments": {} }),
+        };
+        let resp = handle_request(
+            &req,
+            Some(std::path::Path::new("/path/that/is/not/a/vault")),
+            &mut None,
         );
         assert!(
-            parsed.get("uptime_seconds").and_then(|v| v.as_u64()).is_some(),
-            "uptime_seconds must be present and numeric"
+            !resp.contains("BRAIN_VAULT_DISCONNECTED"),
+            "ping must not hit the vault-disconnect guard: {resp}"
         );
+        // Unwrap the JSON-RPC envelope → result.content[0].text → ping payload.
+        let env: serde_json::Value = serde_json::from_str(&resp).expect("envelope is JSON");
+        let text = env["result"]["content"][0]["text"]
+            .as_str()
+            .expect("ping payload text present");
+        let ping: serde_json::Value = serde_json::from_str(text).expect("ping payload is JSON");
+        assert_eq!(ping["status"], "ok");
+        assert_eq!(ping["server"], "BRAIN");
+        assert_eq!(ping["version"], env!("CARGO_PKG_VERSION"));
+        assert!(ping["uptime_seconds"].as_u64().is_some());
     }
 
     #[test]
@@ -2530,7 +2620,7 @@ mod tests {
                 }
             }),
             tmp.path(),
-            None,
+            &mut None,
         )
         .expect("alice writes cleanly even when bob has a broken link");
 
@@ -2575,7 +2665,7 @@ mod tests {
                 }
             }),
             tmp.path(),
-            None,
+            &mut None,
         )
         .expect("write succeeds");
 
@@ -2610,7 +2700,7 @@ mod tests {
                 }
             }),
             tmp.path(),
-            None,
+            &mut None,
         )
         .expect("missing-title is a warning, write must succeed");
         assert!(
@@ -2642,7 +2732,7 @@ mod tests {
                 }
             }),
             tmp.path(),
-            None,
+            &mut None,
         )
         .expect_err("plural type must surface as a hard error, not a warning");
         assert!(err.contains("unregistered-type"), "error must name the lint kind: {err}");
@@ -2671,7 +2761,7 @@ mod tests {
                 }
             }),
             tmp.path(),
-            None,
+            &mut None,
         )
         .unwrap_err();
         assert!(err.contains(".."));
