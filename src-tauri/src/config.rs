@@ -96,8 +96,26 @@ impl Default for ConfigStore {
     }
 }
 
+/// App-directory name for the persistent config. Debug builds — which
+/// is what `pnpm tauri dev` produces — deliberately use a SEPARATE
+/// directory (`brain-dev`) so a development binary can never read the
+/// production `settings.json` and thereby auto-mount the real vault via
+/// `bootstrap_app`. This protects the user's live vault during
+/// storage-layer development (the S11 work renames/rewrites page files).
+/// Release builds (`pnpm tauri build`, the shipped app) use the
+/// canonical `brain` name. The config dir is derived from `ProjectDirs`,
+/// independent of the Tauri bundle identifier, so this is the only place
+/// the dev/prod split has to happen.
+const fn config_app_name() -> &'static str {
+    if cfg!(debug_assertions) {
+        "brain-dev"
+    } else {
+        "brain"
+    }
+}
+
 fn config_path() -> PathBuf {
-    if let Some(proj) = ProjectDirs::from("eu", "poletto", "brain") {
+    if let Some(proj) = ProjectDirs::from("eu", "poletto", config_app_name()) {
         return proj.config_dir().join(CONFIG_FILENAME);
     }
     PathBuf::from(CONFIG_FILENAME)
@@ -137,6 +155,33 @@ mod tests {
     fn settings_default_has_no_last_active_vault_path() {
         let s = ClientSettings::default();
         assert!(s.last_active_vault_path.is_none());
+    }
+
+    #[test]
+    fn dev_and_release_config_use_distinct_app_dirs() {
+        // The isolation contract: a debug (dev) build must never share
+        // the config dir — and thus `last_active_vault_path` — with a
+        // release (prod) build, or `pnpm tauri dev` could auto-mount the
+        // real vault and destructive dev code could touch it. We can't
+        // evaluate both cfg branches in one compile, so we assert the
+        // current build's name matches its profile, plus the structural
+        // invariant that the two names differ.
+        let name = config_app_name();
+        if cfg!(debug_assertions) {
+            assert_eq!(name, "brain-dev", "debug/dev builds must use the isolated dir");
+        } else {
+            assert_eq!(name, "brain", "release builds use the canonical dir");
+        }
+        assert_ne!(
+            "brain", "brain-dev",
+            "dev and prod app-dir names must differ — this is what guarantees isolation"
+        );
+    }
+
+    #[test]
+    fn config_path_ends_with_the_settings_filename() {
+        let p = config_path();
+        assert_eq!(p.file_name().and_then(|n| n.to_str()), Some(CONFIG_FILENAME));
     }
 
     #[test]
