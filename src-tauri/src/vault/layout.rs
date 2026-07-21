@@ -31,6 +31,31 @@ pub fn wiki_dir(vault: &Path) -> PathBuf {
     vault.join(WIKI_DIR)
 }
 
+/// The on-disk path of a page, relative to `02_wiki/`, for a given
+/// page id. THE single source of truth for "id → filename" — every
+/// site that reads, writes, or resolves a page file must go through
+/// here (or [`page_path_for_id`]) rather than hand-building
+/// `format!("{id}.md")`, so the upcoming opaque/encrypted layout
+/// (S11) can be introduced in exactly one place.
+///
+/// Plaintext layout (today, and the default): the relative path is
+/// simply `<id>.md` (e.g. `entities/alice` → `entities/alice.md`).
+/// The opaque layout (`<type>/<HMAC(id)>.md`) will slot in here once
+/// the S11 key infrastructure exists; until then this is a pure
+/// centralisation with no behaviour change.
+pub fn page_relpath_for_id(id: &str) -> String {
+    format!("{id}.md")
+}
+
+/// Absolute on-disk path of a page for a given id — `wiki_dir(vault)`
+/// joined with [`page_relpath_for_id`]. Use this for filesystem reads
+/// and writes; use `page_relpath_for_id` when you need the repo-
+/// relative path (e.g. matching git diff deltas or reading a blob by
+/// path).
+pub fn page_path_for_id(vault: &Path, id: &str) -> PathBuf {
+    wiki_dir(vault).join(page_relpath_for_id(id))
+}
+
 pub fn db_dir(vault: &Path) -> PathBuf {
     vault.join(DB_DIR)
 }
@@ -81,6 +106,24 @@ pub fn ensure_skeleton(vault: &Path) -> VaultResult<()> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn page_relpath_for_id_is_the_plaintext_id_dot_md() {
+        // Pins the plaintext-layout contract. When the opaque/HMAC
+        // layout lands (S11), this test is the tripwire that forces a
+        // conscious decision rather than a silent behaviour change.
+        assert_eq!(page_relpath_for_id("entities/alice"), "entities/alice.md");
+        assert_eq!(page_relpath_for_id("concepts/nl-spec"), "concepts/nl-spec.md");
+    }
+
+    #[test]
+    fn page_path_for_id_is_wiki_dir_joined_with_relpath() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(
+            page_path_for_id(tmp.path(), "entities/alice"),
+            wiki_dir(tmp.path()).join("entities/alice.md"),
+        );
+    }
 
     #[test]
     fn ensure_skeleton_creates_all_top_dirs_and_wiki_subdirs() {

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tauri::State;
 
 use crate::error::{BrainError, BrainResult};
-use crate::vault::layout::wiki_dir;
+use crate::vault::layout::page_path_for_id;
 
 use super::graph::{self, GraphData, GraphFilters};
 use super::search::{self, BacklinkInfo, SearchHit};
@@ -182,7 +182,7 @@ pub fn open_page_in_external_editor(
     id: String,
 ) -> BrainResult<()> {
     let vault = current_vault(&state)?;
-    let path = wiki_dir(&vault).join(format!("{id}.md"));
+    let path = page_path_for_id(&vault, &id);
     if !path.exists() {
         return Err(BrainError::Internal(format!("page not found: {id}")));
     }

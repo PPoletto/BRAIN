@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::vault::layout::{raw_dir, wiki_dir};
+use crate::vault::layout::{page_path_for_id, page_relpath_for_id, raw_dir, wiki_dir};
 use crate::viewer::{graph, search, tree};
 use crate::wiki::{history as wiki_history, lint, page};
 
@@ -805,7 +805,7 @@ fn call_tool(
             if id.contains("..") {
                 return Err("id may not contain '..'".to_string());
             }
-            let target = wiki_dir(vault).join(format!("{id}.md"));
+            let target = page_path_for_id(vault, id);
             let exists = target.is_file();
             Ok(serde_json::to_string(&json!({
                 "id": id,
@@ -852,7 +852,7 @@ fn call_tool(
             } else {
                 rebuild_page_file(content, &normalized_body)
             };
-            let target = wiki_dir(vault).join(format!("{id}.md"));
+            let target = page_path_for_id(vault, id);
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
@@ -943,11 +943,10 @@ fn call_tool(
             // (entities/alice.md) that git stores. Accepts either form
             // — agents in the wild send both depending on whether
             // they've stripped extensions or not.
-            let page_path = if id.ends_with(".md") {
-                id.to_string()
-            } else {
-                format!("{id}.md")
-            };
+            // Accept both `entities/alice` and `entities/alice.md`;
+            // route through the resolver so the repo-relative path stays
+            // consistent with how pages are actually stored on disk.
+            let page_path = page_relpath_for_id(id.strip_suffix(".md").unwrap_or(id));
             let history = wiki_history::history_for_page(
                 &wiki_dir(vault),
                 &page_path,
@@ -975,13 +974,9 @@ fn call_tool(
             if sha.is_empty() {
                 return Err("'sha' must not be empty".to_string());
             }
-            // Same id normalisation as brain_get_page_history — the
-            // restore_page backend wants the path-with-extension form.
-            let page_path = if id.ends_with(".md") {
-                id.to_string()
-            } else {
-                format!("{id}.md")
-            };
+            // Same id normalisation as brain_get_page_history — route
+            // through the resolver for the repo-relative path.
+            let page_path = page_relpath_for_id(id.strip_suffix(".md").unwrap_or(id));
             wiki_history::restore_page(&wiki_dir(vault), sha, &page_path)
                 .map_err(|e| e.to_string())?;
             // Report the new revert-commit sha so the agent can quote
@@ -1036,7 +1031,7 @@ fn call_tool(
                 } else {
                     rebuild_page_file(content, &normalized_body)
                 };
-                let target = wiki_dir(vault).join(format!("{id}.md"));
+                let target = page_path_for_id(vault, id);
                 let previous_size_bytes = std::fs::metadata(&target)
                     .map(|m| m.len() as i64)
                     .unwrap_or(0);

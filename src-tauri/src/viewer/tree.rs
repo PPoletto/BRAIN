@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::vault::layout::{wiki_dir, WIKI_SUBDIRS};
+use crate::vault::layout::{page_path_for_id, wiki_dir, WIKI_SUBDIRS};
 use crate::wiki::page::{id_from_path, parse};
 
 use super::{ViewerError, ViewerResult};
@@ -71,7 +71,7 @@ fn collect_ids(dir: &Path, sub: &str, out: &mut Vec<String>) -> ViewerResult<()>
 }
 
 pub fn read_page(vault: &Path, id: &str) -> ViewerResult<PageView> {
-    let path = wiki_dir(vault).join(format!("{id}.md"));
+    let path = page_path_for_id(vault, id);
     if !path.exists() {
         return Err(ViewerError::PageNotFound(id.to_string()));
     }
