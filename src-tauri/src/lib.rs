@@ -1,6 +1,7 @@
 //! Brain Client library — wires together Tauri, modules and commands.
 
 pub mod config;
+pub mod crypto;
 pub mod db;
 pub mod embedding;
 pub mod error;

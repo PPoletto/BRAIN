@@ -93,6 +93,18 @@ chrono = { version = "0.4", features = ["serde", "clock"] }
 hex = "0.4"
 sha2 = "0.10"
 
+# Content encryption (S11 vault sync). Pure-Rust, no OpenSSL:
+#  - XChaCha20-Poly1305 AEAD with a 192-bit nonce, so the
+#    deterministic (HMAC-derived) nonce a git clean/smudge filter
+#    needs has no realistic collision concern — unlike AES-GCM's
+#    96-bit nonce, where a derived-nonce collision is catastrophic.
+#  - HKDF to derive the content / filename-HMAC / nonce keys from
+#    one master key; HMAC-SHA256 for the deterministic nonce and the
+#    opaque filename tokens.
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+
 # HTTP server for MCP
 axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }
 tower = "0.5"
