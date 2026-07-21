@@ -56,6 +56,25 @@ pub fn page_path_for_id(vault: &Path, id: &str) -> PathBuf {
     wiki_dir(vault).join(page_relpath_for_id(id))
 }
 
+/// Repo-relative path for a page id in the OPAQUE (encrypted) layout:
+/// `<type>/<token>.md`. The leading directory component (`entities`,
+/// `concepts`, …) is a category, not PII, so it stays in the clear —
+/// the graph and type filters keep working on a fresh clone. The
+/// human-readable slug is replaced by `token`, the keyed HMAC of the
+/// full id (see `crypto::DerivedKeys::filename_token`), which hides
+/// the person/customer name. The caller supplies the precomputed
+/// token so this function stays crypto-free (no key handling here).
+///
+/// Not wired into the read/write path yet — that switch, together with
+/// the on-disk rename, is the destructive convert (S11 phase 5). This
+/// is only the naming rule the convert will apply.
+pub fn opaque_relpath_for_id(id: &str, token: &str) -> String {
+    match id.split_once('/') {
+        Some((type_dir, _slug)) => format!("{type_dir}/{token}.md"),
+        None => format!("{token}.md"),
+    }
+}
+
 pub fn db_dir(vault: &Path) -> PathBuf {
     vault.join(DB_DIR)
 }
@@ -123,6 +142,30 @@ mod tests {
             page_path_for_id(tmp.path(), "entities/alice"),
             wiki_dir(tmp.path()).join("entities/alice.md"),
         );
+    }
+
+    #[test]
+    fn opaque_relpath_preserves_type_dir_and_hides_the_slug() {
+        // Category dir stays; the human-readable slug is gone, replaced
+        // by the opaque token.
+        let p = opaque_relpath_for_id("entities/michael-simon", "deadbeef");
+        assert_eq!(p, "entities/deadbeef.md");
+        assert!(!p.contains("michael"), "person name must not leak into the path");
+    }
+
+    #[test]
+    fn opaque_relpath_handles_each_registered_type() {
+        for t in ["entities", "concepts", "sources", "topics"] {
+            assert_eq!(
+                opaque_relpath_for_id(&format!("{t}/whatever"), "tok"),
+                format!("{t}/tok.md"),
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_relpath_for_an_id_without_a_type_dir_is_just_the_token() {
+        assert_eq!(opaque_relpath_for_id("loose-id", "tok"), "tok.md");
     }
 
     #[test]
