@@ -27,6 +27,8 @@
 //! nonce is designed for exactly this — random/derived nonces — and is
 //! pure-Rust with no OpenSSL dependency.
 
+pub mod keychain;
+
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
@@ -211,6 +213,42 @@ pub fn check_canary(keys: &DerivedKeys, stored_canary: &[u8]) -> bool {
     matches!(keys.decrypt(stored_canary), Ok(pt) if pt == CANARY_PLAINTEXT)
 }
 
+/// Cheap check whether `blob` carries our encryption magic — i.e. it
+/// looks like a BRAIN-encrypted blob rather than plaintext.
+pub fn looks_encrypted(blob: &[u8]) -> bool {
+    blob.len() >= 4 && blob[..4] == *MAGIC
+}
+
+/// git clean filter: working tree (plaintext) → committed blob
+/// (ciphertext). Deterministic, so re-cleaning unchanged content
+/// yields identical output and git sees no phantom diff. Defensive
+/// pass-through if the input already looks encrypted (should not
+/// happen — the working tree is plaintext by contract — but avoids
+/// a catastrophic double-encryption if it ever does).
+pub fn filter_clean(keys: &DerivedKeys, input: &[u8]) -> Vec<u8> {
+    if looks_encrypted(input) {
+        return input.to_vec();
+    }
+    keys.encrypt(input)
+}
+
+/// git smudge filter: committed blob (ciphertext) → working tree
+/// (plaintext). Three cases:
+/// - a valid BRAIN blob → decrypt.
+/// - plaintext that was never encrypted (a file committed before
+///   encryption was enabled) → pass through unchanged, so a vault
+///   mid-conversion still checks out cleanly.
+/// - a blob with our magic but a wrong key / tamper / bad version →
+///   `Err`, so the caller fails loudly (git aborts the checkout)
+///   instead of writing unreadable bytes into the working tree.
+pub fn filter_smudge(keys: &DerivedKeys, input: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    match keys.decrypt(input) {
+        Ok(plaintext) => Ok(plaintext),
+        Err(CryptoError::NotEncrypted) => Ok(input.to_vec()),
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,6 +369,43 @@ mod tests {
             a.filename_token("entities/alice"),
             b.filename_token("entities/alice")
         );
+    }
+
+    #[test]
+    fn clean_encrypts_and_smudge_restores() {
+        let k = keys();
+        let plaintext = b"---\nid: entities/alice\ntype: entity\n---\n\nbody\n";
+        let cleaned = filter_clean(&k, plaintext);
+        assert!(looks_encrypted(&cleaned), "clean output must be ciphertext");
+        assert_eq!(filter_smudge(&k, &cleaned).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn smudge_passes_through_legacy_plaintext_unchanged() {
+        // A file committed before encryption was enabled arrives at
+        // smudge as plaintext — it must check out unchanged so a
+        // mid-conversion vault still works.
+        let k = keys();
+        let plain = b"never encrypted markdown";
+        assert_eq!(filter_smudge(&k, plain).unwrap(), plain);
+    }
+
+    #[test]
+    fn clean_does_not_double_encrypt_an_already_ciphertext_blob() {
+        let k = keys();
+        let once = filter_clean(&k, b"content");
+        let twice = filter_clean(&k, &once);
+        assert_eq!(once, twice, "clean must be idempotent on ciphertext");
+    }
+
+    #[test]
+    fn smudge_fails_loudly_on_wrong_key() {
+        let a = MasterKey::from_bytes([1u8; 32]).derive();
+        let b = MasterKey::from_bytes([2u8; 32]).derive();
+        let cleaned = filter_clean(&a, b"secret");
+        // b's key can't decrypt a's blob — must Err, not silently emit
+        // ciphertext into the working tree.
+        assert!(filter_smudge(&b, &cleaned).is_err());
     }
 
     #[test]
