@@ -27,6 +27,7 @@
 //! nonce is designed for exactly this — random/derived nonces — and is
 //! pure-Rust with no OpenSSL dependency.
 
+pub mod gitfilter;
 pub mod keychain;
 
 use chacha20poly1305::aead::Aead;

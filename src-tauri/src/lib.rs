@@ -36,6 +36,16 @@ pub fn run_mcp_stdio() -> std::io::Result<()> {
     mcp::server::run_stdio()
 }
 
+/// Entry point for `brain git-filter clean|smudge` — the brain-crypt
+/// git clean/smudge filter invoked by git inside an encrypted vault.
+/// Returns the process exit code (0 = ok; non-zero aborts git's
+/// operation so plaintext is never committed and garbage never checked
+/// out). Delegates to [`crypto::gitfilter::run`].
+pub fn run_git_filter(mode: Option<&str>) -> i32 {
+    configure_libgit2();
+    crypto::gitfilter::run(mode)
+}
+
 /// Disables libgit2's owner-validation check. On exFAT-formatted external
 /// drives the OS does not surface a meaningful Unix owner, so libgit2's
 /// strict CVE-2022-24765 workaround refuses to open the wiki repo with
