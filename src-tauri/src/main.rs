@@ -23,6 +23,9 @@ fn main() {
             args.get(3).map(String::as_str),
         ));
     }
+    if args.get(1).map(String::as_str) == Some("remote-cred") {
+        std::process::exit(brain_lib::run_remote_cred(args.get(2).map(String::as_str)));
+    }
     if args.get(1).map(String::as_str) == Some("sync") {
         std::process::exit(brain_lib::run_sync(args.get(2).map(String::as_str)));
     }

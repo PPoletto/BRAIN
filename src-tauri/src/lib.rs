@@ -131,6 +131,43 @@ pub fn run_remote_add(vault_arg: Option<&str>, url: Option<&str>) -> i32 {
     }
 }
 
+/// Entry point for `brain remote-cred <vault-path>` — store the remote
+/// credential (PAT) in the OS keychain. The PAT is read from STDIN (not a
+/// CLI arg) so it never lands in shell history. Returns a process exit
+/// code.
+pub fn run_remote_cred(vault_arg: Option<&str>) -> i32 {
+    configure_libgit2();
+    let Some(vault_arg) = vault_arg else {
+        eprintln!("usage: brain remote-cred <vault-path>   (PAT is read from stdin)");
+        return 2;
+    };
+    let vault = std::path::Path::new(vault_arg);
+    if !vault::layout::is_vault(vault) {
+        eprintln!("remote-cred: '{}' is not a BRAIN vault", vault.display());
+        return 3;
+    }
+    let mut pat = String::new();
+    if std::io::stdin().read_line(&mut pat).is_err() {
+        eprintln!("remote-cred: could not read the PAT from stdin");
+        return 4;
+    }
+    let pat = pat.trim();
+    if pat.is_empty() {
+        eprintln!("remote-cred: no PAT provided on stdin");
+        return 4;
+    }
+    match wiki::sync::set_remote_credential(&vault::layout::wiki_dir(vault), pat) {
+        Ok(()) => {
+            println!("remote credential stored in the OS keychain for this vault");
+            0
+        }
+        Err(e) => {
+            eprintln!("remote-cred failed: {e}");
+            5
+        }
+    }
+}
+
 /// Entry point for `brain sync <vault-path>` — fetch → merge → push
 /// (S11 phase 6). Returns a process exit code.
 pub fn run_sync(vault_arg: Option<&str>) -> i32 {
