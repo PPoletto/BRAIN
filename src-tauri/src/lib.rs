@@ -105,6 +105,57 @@ pub fn run_convert(vault_arg: Option<&str>) -> i32 {
     0
 }
 
+/// Entry point for `brain remote-add <vault-path> <url>` — attach the
+/// sync remote (S11 phase 6). Enforces the encryption coupling for
+/// network URLs. Returns a process exit code.
+pub fn run_remote_add(vault_arg: Option<&str>, url: Option<&str>) -> i32 {
+    configure_libgit2();
+    let (Some(vault_arg), Some(url)) = (vault_arg, url) else {
+        eprintln!("usage: brain remote-add <vault-path> <url>");
+        return 2;
+    };
+    let vault = std::path::Path::new(vault_arg);
+    if !vault::layout::is_vault(vault) {
+        eprintln!("remote-add: '{}' is not a BRAIN vault", vault.display());
+        return 3;
+    }
+    match wiki::sync::set_remote(&vault::layout::wiki_dir(vault), url) {
+        Ok(()) => {
+            println!("remote '{}' set to {url}", wiki::sync::DEFAULT_REMOTE);
+            0
+        }
+        Err(e) => {
+            eprintln!("remote-add failed: {e}");
+            4
+        }
+    }
+}
+
+/// Entry point for `brain sync <vault-path>` — fetch → merge → push
+/// (S11 phase 6). Returns a process exit code.
+pub fn run_sync(vault_arg: Option<&str>) -> i32 {
+    configure_libgit2();
+    let Some(vault_arg) = vault_arg else {
+        eprintln!("usage: brain sync <vault-path>");
+        return 2;
+    };
+    let vault = std::path::Path::new(vault_arg);
+    if !vault::layout::is_vault(vault) {
+        eprintln!("sync: '{}' is not a BRAIN vault", vault.display());
+        return 3;
+    }
+    match wiki::sync::sync(&vault::layout::wiki_dir(vault)) {
+        Ok(outcome) => {
+            println!("sync: {outcome:?}");
+            0
+        }
+        Err(e) => {
+            eprintln!("sync failed: {e}");
+            4
+        }
+    }
+}
+
 /// Disables libgit2's owner-validation check. On exFAT-formatted external
 /// drives the OS does not surface a meaningful Unix owner, so libgit2's
 /// strict CVE-2022-24765 workaround refuses to open the wiki repo with

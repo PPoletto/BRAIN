@@ -130,6 +130,21 @@ pub(crate) fn blob_to_worktree_with_store(
     }
 }
 
+/// Inverse of [`blob_to_worktree`]: turn working-tree bytes into the form
+/// that belongs in a committed blob. Encrypted vault → ciphertext
+/// (`filter_clean`); plaintext vault → identity. Used by the merge to
+/// re-stage a conflict-resolved file as the correct blob.
+pub(crate) fn worktree_to_blob_with_store(
+    wiki: &Path,
+    bytes: &[u8],
+    store: &impl MasterKeyStore,
+) -> WikiResult<Vec<u8>> {
+    match resolve_keys(wiki, store)? {
+        Some(keys) => Ok(filter_clean(&keys, bytes)),
+        None => Ok(bytes.to_vec()),
+    }
+}
+
 /// Resolve the vault's derived keys: `None` if the vault is plaintext,
 /// `Some` if encrypted and the key is available. `Err` if the vault is
 /// encrypted but the key is missing/unreadable — callers MUST propagate

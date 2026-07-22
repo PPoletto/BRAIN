@@ -33,6 +33,37 @@ use super::MasterKey;
 /// `vault_id` is the per-entry account, so distinct vaults never collide.
 const SERVICE: &str = "eu.poletto.brain.vault-master-key";
 
+/// Keychain service for the git remote credential (a GitHub PAT or
+/// equivalent), kept OUT of the repo and distinct from the master key so
+/// a leaked PAT never exposes vault content and vice-versa. Keyed by the
+/// same `vault_id` account.
+const PAT_SERVICE: &str = "eu.poletto.brain.git-pat";
+
+/// Store (or overwrite) the git remote credential for `account`
+/// (a vault_id from [`vault_account`]).
+pub fn store_git_pat(account: &str, pat: &str) -> Result<(), KeychainError> {
+    keyring::Entry::new(PAT_SERVICE, account)?.set_password(pat)?;
+    Ok(())
+}
+
+/// Load the git remote credential for `account`. `Ok(None)` when none is
+/// stored (a vault with no configured remote credential on this machine).
+pub fn load_git_pat(account: &str) -> Result<Option<String>, KeychainError> {
+    match keyring::Entry::new(PAT_SERVICE, account)?.get_password() {
+        Ok(pat) => Ok(Some(pat)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Remove the stored git remote credential for `account` (idempotent).
+pub fn delete_git_pat(account: &str) -> Result<(), KeychainError> {
+    match keyring::Entry::new(PAT_SERVICE, account)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum KeychainError {
     #[error("keychain: {0}")]

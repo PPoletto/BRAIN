@@ -68,7 +68,10 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 hf-hub = { version = "0.4", default-features = false, features = ["ureq", "native-tls"] }
 
 # Wiki / Git
-git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
+# `https` enables the remote transport for S11 sync. On Windows this uses
+# WinHTTP + schannel (no OpenSSL at runtime); macOS uses SecureTransport;
+# Linux uses OpenSSL (add openssl handling if/when a Linux build needs it).
+git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2", "https"] }
 notify = "6.1"
 notify-debouncer-full = "0.3"
 
