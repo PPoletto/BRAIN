@@ -1,7 +1,7 @@
 //! Wiki filesystem watcher that drives the auto-commit pipeline (S03).
 //!
 //! Wraps `notify-debouncer-full` with a 5 s idle window. On debounce: runs
-//! `lint::lint`. If lint passes, calls `git::commit_all` with a structured
+//! `lint::lint`. If lint passes, calls `encryption::commit_wiki` with a structured
 //! message. If lint fails, increments an error counter and emits a
 //! `wiki-lint-error` event so the frontend / tray can surface it.
 //!
@@ -194,7 +194,9 @@ fn run_lint_and_commit(wiki: &Path) -> super::WikiResult<LintCommit> {
         return Ok(LintCommit::NoChanges);
     }
     let message = build_commit_message(&summary);
-    match git::commit_all(wiki, &message)? {
+    // commit_wiki (not git::commit_all) so an encrypted vault stores
+    // ciphertext — this is what keeps encryption sticky across edits.
+    match super::encryption::commit_wiki(wiki, &message)? {
         Some(sha) => Ok(LintCommit::Committed {
             commit: CommitInfo {
                 sha,

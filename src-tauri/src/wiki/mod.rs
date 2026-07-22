@@ -30,6 +30,9 @@ pub enum WikiError {
 
     #[error("page not found: {0}")]
     PageNotFound(String),
+
+    #[error("encryption: {0}")]
+    Encryption(String),
 }
 
 pub type WikiResult<T> = Result<T, WikiError>;

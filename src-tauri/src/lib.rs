@@ -72,9 +72,10 @@ pub fn run_convert(vault_arg: Option<&str>) -> i32 {
             return 4;
         }
     };
-    let keys = key.derive();
-    if let Err(e) = wiki::encryption::renormalize_and_commit(&vault::layout::wiki_dir(vault), &keys)
-    {
+    if let Err(e) = wiki::encryption::commit_wiki(
+        &vault::layout::wiki_dir(vault),
+        "encrypt: enable content encryption",
+    ) {
         eprintln!("convert: re-encrypting the vault content failed: {e:#}");
         return 5;
     }

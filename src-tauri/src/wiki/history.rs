@@ -8,7 +8,7 @@ use std::path::Path;
 use git2::{ObjectType, Repository, ResetType};
 use serde::Serialize;
 
-use super::git::{commit_all, init_repo};
+use super::git::init_repo;
 use super::{WikiError, WikiResult};
 
 #[derive(Debug, Clone, Serialize)]
@@ -298,10 +298,13 @@ pub fn restore_page(wiki_path: &Path, sha: &str, page: &str) -> WikiResult<()> {
     if let Some(parent) = target_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&target_path, blob.content())?;
+    // In an encrypted vault the committed blob is ciphertext — decrypt to
+    // plaintext before writing the working-tree file.
+    let worktree_bytes = crate::wiki::encryption::blob_to_worktree(wiki_path, blob.content())?;
+    std::fs::write(&target_path, &worktree_bytes)?;
 
     let message = format!("revert: restored {page} from {}", short_sha(sha));
-    commit_all(wiki_path, &message)?;
+    crate::wiki::encryption::commit_wiki(wiki_path, &message)?;
     Ok(())
 }
 
@@ -327,6 +330,9 @@ pub fn hard_reset(wiki_path: &Path, sha: &str) -> WikiResult<()> {
     };
     let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
     repo.commit(Some("HEAD"), &sig, &sig, &message, &tree, &parent_refs)?;
+    // In an encrypted vault the hard reset checked out ciphertext blobs
+    // verbatim — re-materialise the working tree as plaintext.
+    crate::wiki::encryption::smudge_worktree_from_head(wiki_path)?;
     Ok(())
 }
 
@@ -341,6 +347,7 @@ fn short_sha(sha: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wiki::git::commit_all;
     use tempfile::TempDir;
 
     fn touch(dir: &Path, name: &str, content: &str) {
