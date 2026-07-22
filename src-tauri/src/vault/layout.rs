@@ -31,18 +31,15 @@ pub fn wiki_dir(vault: &Path) -> PathBuf {
     vault.join(WIKI_DIR)
 }
 
-/// The on-disk path of a page, relative to `02_wiki/`, for a given
-/// page id. THE single source of truth for "id → filename" — every
-/// site that reads, writes, or resolves a page file must go through
-/// here (or [`page_path_for_id`]) rather than hand-building
-/// `format!("{id}.md")`, so the upcoming opaque/encrypted layout
-/// (S11) can be introduced in exactly one place.
-///
-/// Plaintext layout (today, and the default): the relative path is
+/// The PLAINTEXT-layout on-disk path of a page relative to `02_wiki/`:
 /// simply `<id>.md` (e.g. `entities/alice` → `entities/alice.md`).
-/// The opaque layout (`<type>/<HMAC(id)>.md`) will slot in here once
-/// the S11 key infrastructure exists; until then this is a pure
-/// centralisation with no behaviour change.
+///
+/// This is the plaintext primitive only. Encrypted vaults use the
+/// opaque layout `<type>/<HMAC(id)>.md`, and callers that must work in
+/// BOTH modes go through [`crate::wiki::encryption::page_relpath`] /
+/// `page_path` (which loads the key and picks the layout) — NOT this
+/// function directly. Using this on an encrypted vault would point at
+/// the wrong (non-existent, name-leaking) file.
 pub fn page_relpath_for_id(id: &str) -> String {
     format!("{id}.md")
 }
@@ -65,9 +62,10 @@ pub fn page_path_for_id(vault: &Path, id: &str) -> PathBuf {
 /// the person/customer name. The caller supplies the precomputed
 /// token so this function stays crypto-free (no key handling here).
 ///
-/// Not wired into the read/write path yet — that switch, together with
-/// the on-disk rename, is the destructive convert (S11 phase 5). This
-/// is only the naming rule the convert will apply.
+/// Live as of S11 phase 5b: [`crate::wiki::encryption::page_relpath`]
+/// calls this for encrypted vaults, and the convert-time rename
+/// (`wiki::encryption::rename_pages_to_opaque`) moves existing files
+/// onto these paths.
 pub fn opaque_relpath_for_id(id: &str, token: &str) -> String {
     match id.split_once('/') {
         Some((type_dir, _slug)) => format!("{type_dir}/{token}.md"),

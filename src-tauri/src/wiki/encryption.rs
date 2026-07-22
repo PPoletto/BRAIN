@@ -23,12 +23,12 @@
 //! Filenames are NOT changed here — opaque HMAC filenames are the
 //! separate phase 5b.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::crypto::gitfilter;
 use crate::crypto::keychain::{self, KeyringStore, MasterKeyStore};
 use crate::crypto::{filter_clean, filter_smudge, DerivedKeys, MasterKey};
-use crate::vault::layout::wiki_dir;
+use crate::vault::layout::{opaque_relpath_for_id, page_relpath_for_id, wiki_dir};
 
 use super::{WikiError, WikiResult};
 
@@ -134,8 +134,10 @@ pub(crate) fn blob_to_worktree_with_store(
 /// `Some` if encrypted and the key is available. `Err` if the vault is
 /// encrypted but the key is missing/unreadable — callers MUST propagate
 /// this and abort rather than fall back to plaintext.
-fn resolve_keys(wiki: &Path, store: &impl MasterKeyStore) -> WikiResult<Option<DerivedKeys>> {
-    let vault = wiki.parent().unwrap_or(wiki);
+fn resolve_keys_for_vault(
+    vault: &Path,
+    store: &impl MasterKeyStore,
+) -> WikiResult<Option<DerivedKeys>> {
     if !is_encrypted(vault) {
         return Ok(None);
     }
@@ -149,6 +151,43 @@ fn resolve_keys(wiki: &Path, store: &impl MasterKeyStore) -> WikiResult<Option<D
             )
         })?;
     Ok(Some(key.derive()))
+}
+
+/// [`resolve_keys_for_vault`] given a wiki dir (`<vault>/02_wiki`) rather
+/// than the vault root. Git operations know the wiki dir; the vault is
+/// its parent.
+fn resolve_keys(wiki: &Path, store: &impl MasterKeyStore) -> WikiResult<Option<DerivedKeys>> {
+    resolve_keys_for_vault(wiki.parent().unwrap_or(wiki), store)
+}
+
+/// Resolve a page id to its repo-relative path, honouring the vault's
+/// encryption mode. Plaintext vault: `<id>.md`. Encrypted vault:
+/// `<type>/<HMAC-token>.md` — the opaque layout that hides the human
+/// slug (the person/customer name) from anyone who obtains a copy of the
+/// repo. Deterministic and index-independent: the same id always maps to
+/// the same path, so reads, writes and history all agree without a
+/// lookup table. THE single id→path entry point for encrypted-aware
+/// callers (plain [`page_relpath_for_id`] is only correct for a known
+/// plaintext vault).
+pub fn page_relpath(vault: &Path, id: &str) -> WikiResult<String> {
+    page_relpath_with_store(vault, id, &KeyringStore)
+}
+
+pub(crate) fn page_relpath_with_store(
+    vault: &Path,
+    id: &str,
+    store: &impl MasterKeyStore,
+) -> WikiResult<String> {
+    match resolve_keys_for_vault(vault, store)? {
+        Some(keys) => Ok(opaque_relpath_for_id(id, &keys.filename_token(id))),
+        None => Ok(page_relpath_for_id(id)),
+    }
+}
+
+/// Absolute on-disk path of a page id in `vault` — `wiki_dir(vault)`
+/// joined with [`page_relpath`].
+pub fn page_path(vault: &Path, id: &str) -> WikiResult<std::path::PathBuf> {
+    Ok(wiki_dir(vault).join(page_relpath(vault, id)?))
 }
 
 /// Overwrite every `*.md` index entry (matching the `.gitattributes`
@@ -222,6 +261,69 @@ pub(crate) fn smudge_worktree_from_head_with_store(
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&abs, &plaintext)?;
+    }
+    Ok(())
+}
+
+/// Rename every page file to its opaque path `<type>/<token>.md`, based
+/// on the id in the file's frontmatter. This is the convert-time step
+/// that stops person/customer names leaking through *file paths* (the
+/// content is already hidden by encryption). Idempotent — files already
+/// at their opaque path are skipped — and content-loss-safe: it is a
+/// plain filesystem rename, and the logical id lives in the frontmatter
+/// so the mapping is fully reversible. Files whose frontmatter can't be
+/// parsed (a stray non-page `.md`) are left untouched. Returns the
+/// number of files renamed. The caller's subsequent [`commit_wiki`]
+/// records the renames and encrypts the content.
+pub fn rename_pages_to_opaque(wiki: &Path, keys: &DerivedKeys) -> WikiResult<usize> {
+    // Collect (old_abs → new_abs) first so the walk never trips over a
+    // file it just renamed.
+    let mut moves: Vec<(PathBuf, PathBuf)> = Vec::new();
+    collect_page_renames(wiki, wiki, keys, &mut moves)?;
+    let mut renamed = 0;
+    for (old_abs, new_abs) in moves {
+        if old_abs == new_abs {
+            continue;
+        }
+        if let Some(parent) = new_abs.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::rename(&old_abs, &new_abs)?;
+        renamed += 1;
+    }
+    Ok(renamed)
+}
+
+fn collect_page_renames(
+    wiki: &Path,
+    dir: &Path,
+    keys: &DerivedKeys,
+    out: &mut Vec<(PathBuf, PathBuf)>,
+) -> WikiResult<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            collect_page_renames(wiki, &path, keys, out)?;
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        // Read the plaintext working-tree file; skip anything that isn't a
+        // parseable page (no frontmatter id → not ours to rename).
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(parsed) = crate::wiki::page::parse(&raw) else {
+            continue;
+        };
+        let id = parsed.frontmatter.id;
+        let new_rel = opaque_relpath_for_id(&id, &keys.filename_token(&id));
+        out.push((path, wiki.join(new_rel)));
     }
     Ok(())
 }
@@ -438,6 +540,52 @@ mod tests {
         commit_wiki_with_store(&wiki, "plain commit", &store).unwrap();
         let blob = head_blob(&wiki, "entities/x.md");
         assert!(!looks_encrypted(&blob), "plaintext vault stores plaintext blobs");
+    }
+
+    #[test]
+    fn page_relpath_is_plaintext_id_when_vault_not_encrypted() {
+        let tmp = vault_with_repo();
+        let store = MemStore::default();
+        assert_eq!(
+            page_relpath_with_store(tmp.path(), "entities/alice", &store).unwrap(),
+            "entities/alice.md"
+        );
+    }
+
+    #[test]
+    fn page_relpath_is_opaque_token_when_vault_encrypted() {
+        let tmp = vault_with_repo();
+        let store = MemStore::default();
+        let key = enable_encryption(tmp.path(), &store, &PathBuf::from("/opt/brain/brain")).unwrap();
+        let token = key.derive().filename_token("entities/michael-simon");
+        let rel = page_relpath_with_store(tmp.path(), "entities/michael-simon", &store).unwrap();
+        assert_eq!(rel, format!("entities/{token}.md"), "opaque layout is <type>/<token>.md");
+        assert!(!rel.contains("michael"), "person name must not leak into the path");
+    }
+
+    #[test]
+    fn rename_pages_to_opaque_moves_files_and_hides_names_reversibly() {
+        let tmp = vault_with_repo();
+        let wiki = wiki_dir(tmp.path());
+        let page = "---\nid: entities/michael-simon\ntype: entity\ntitle: Michael\n---\n\nbody\n";
+        std::fs::write(wiki.join("entities").join("michael-simon.md"), page).unwrap();
+        let store = MemStore::default();
+        let key = enable_encryption(tmp.path(), &store, &PathBuf::from("/opt/brain/brain")).unwrap();
+        let keys = key.derive();
+
+        assert_eq!(rename_pages_to_opaque(&wiki, &keys).unwrap(), 1);
+        assert!(
+            !wiki.join("entities").join("michael-simon.md").exists(),
+            "the human-named file must be gone"
+        );
+        let token = keys.filename_token("entities/michael-simon");
+        let opaque = wiki.join("entities").join(format!("{token}.md"));
+        assert!(opaque.exists(), "file must now live at the opaque path");
+        // Content untouched, id still recoverable from frontmatter (reversible).
+        let raw = std::fs::read_to_string(&opaque).unwrap();
+        assert!(raw.contains("id: entities/michael-simon"), "id stays in frontmatter");
+        // Idempotent.
+        assert_eq!(rename_pages_to_opaque(&wiki, &keys).unwrap(), 0, "second run is a no-op");
     }
 
     #[test]

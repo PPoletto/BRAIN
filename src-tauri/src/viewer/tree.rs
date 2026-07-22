@@ -4,8 +4,8 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::vault::layout::{page_path_for_id, wiki_dir, WIKI_SUBDIRS};
-use crate::wiki::page::{id_from_path, parse};
+use crate::vault::layout::{wiki_dir, WIKI_SUBDIRS};
+use crate::wiki::page::parse;
 
 use super::{ViewerError, ViewerResult};
 
@@ -38,7 +38,7 @@ pub fn list_tree(vault: &Path) -> ViewerResult<WikiTree> {
             continue;
         }
         let mut ids = Vec::new();
-        collect_ids(&dir, sub, &mut ids)?;
+        collect_ids(&dir, &mut ids)?;
         ids.sort();
         match *sub {
             "entities" => tree.entities = ids,
@@ -51,27 +51,32 @@ pub fn list_tree(vault: &Path) -> ViewerResult<WikiTree> {
     Ok(tree)
 }
 
-fn collect_ids(dir: &Path, sub: &str, out: &mut Vec<String>) -> ViewerResult<()> {
+fn collect_ids(dir: &Path, out: &mut Vec<String>) -> ViewerResult<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let p = entry.path();
         if p.is_dir() {
-            collect_ids(&p, sub, out)?;
+            collect_ids(&p, out)?;
             continue;
         }
         if p.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
-        if let Some(rel) = p.file_name().and_then(|n| n.to_str()) {
-            let id = format!("{sub}/{}", id_from_path(Path::new(rel)));
-            out.push(id);
+        // The logical id comes from the FRONTMATTER, not the filename —
+        // under the opaque (encrypted) layout the filename is an HMAC
+        // token, so deriving the id from it would be wrong. Reading the
+        // frontmatter is correct in both layouts. Files that aren't
+        // parseable pages are skipped.
+        let raw = std::fs::read_to_string(&p)?;
+        if let Ok(parsed) = parse(&raw) {
+            out.push(parsed.frontmatter.id);
         }
     }
     Ok(())
 }
 
 pub fn read_page(vault: &Path, id: &str) -> ViewerResult<PageView> {
-    let path = page_path_for_id(vault, id);
+    let path = crate::wiki::encryption::page_path(vault, id)?;
     if !path.exists() {
         return Err(ViewerError::PageNotFound(id.to_string()));
     }

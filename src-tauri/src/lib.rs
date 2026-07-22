@@ -72,12 +72,27 @@ pub fn run_convert(vault_arg: Option<&str>) -> i32 {
             return 4;
         }
     };
-    if let Err(e) = wiki::encryption::commit_wiki(
-        &vault::layout::wiki_dir(vault),
-        "encrypt: enable content encryption",
-    ) {
+    let keys = key.derive();
+    let wiki = vault::layout::wiki_dir(vault);
+    // Rename page files to opaque HMAC names so person/customer names
+    // don't leak through file paths (content is already hidden by
+    // encryption). Reversible — the id stays in the frontmatter.
+    match wiki::encryption::rename_pages_to_opaque(&wiki, &keys) {
+        Ok(n) => {
+            if n > 0 {
+                println!("Renamed {n} page file(s) to opaque names.");
+            }
+        }
+        Err(e) => {
+            eprintln!("convert: opaque-filename rename failed: {e:#}");
+            return 5;
+        }
+    }
+    if let Err(e) =
+        wiki::encryption::commit_wiki(&wiki, "encrypt: enable content encryption + opaque filenames")
+    {
         eprintln!("convert: re-encrypting the vault content failed: {e:#}");
-        return 5;
+        return 6;
     }
     println!("BRAIN vault content encryption enabled.");
     println!();

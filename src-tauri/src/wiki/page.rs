@@ -1,7 +1,5 @@
 //! Wiki page parsing — frontmatter + body + wiki link extraction.
 
-use std::path::Path;
-
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value as YamlValue;
@@ -154,12 +152,6 @@ fn page_id_from_markdown_target(raw: &str) -> Option<String> {
     }
 
     Some(stripped.to_string())
-}
-
-/// Computes the canonical page-id from a path relative to `02_wiki/`.
-pub fn id_from_path(rel: &Path) -> String {
-    let s = rel.to_string_lossy().replace('\\', "/");
-    s.strip_suffix(".md").unwrap_or(&s).to_string()
 }
 
 /// Rewrites every standard markdown link whose target is a wiki page-id
@@ -340,12 +332,6 @@ mod tests {
     fn parse_rejects_unclosed_frontmatter_block() {
         let err = parse("---\nid: x\ntype: entity\n").unwrap_err();
         assert!(matches!(err, WikiError::Lint(_)));
-    }
-
-    #[test]
-    fn id_from_path_strips_md_suffix_and_normalizes_separators() {
-        let id = id_from_path(Path::new("entities/dan-shapiro.md"));
-        assert_eq!(id, "entities/dan-shapiro");
     }
 
     #[test]
