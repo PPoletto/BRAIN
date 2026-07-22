@@ -31,9 +31,24 @@ pub fn init_repo(wiki_path: &Path) -> WikiResult<Repository> {
 /// SHA (hex string). Skips the commit when nothing changed.
 pub fn commit_all(wiki_path: &Path, message: &str) -> WikiResult<Option<String>> {
     let repo = init_repo(wiki_path)?;
-
     let mut index = repo.index()?;
     index.add_all(["."].iter(), IndexAddOption::DEFAULT, None)?;
+    commit_index(&repo, &mut index, message)
+}
+
+/// Writes the caller-populated `index` to a tree and commits it on HEAD,
+/// returning the commit SHA. Skips (returns `None`) when the resulting
+/// tree equals HEAD's — so identical content never produces an empty
+/// commit. Does **not** stage anything itself: the caller decides what
+/// the index holds. This is the seam the encrypting-commit path uses to
+/// commit ciphertext blobs it has staged by hand (git2 will not run our
+/// external clean filter), while [`commit_all`] uses it after a plain
+/// `add_all`.
+pub fn commit_index(
+    repo: &Repository,
+    index: &mut git2::Index,
+    message: &str,
+) -> WikiResult<Option<String>> {
     index.write()?;
     let tree_id = index.write_tree()?;
     let tree = repo.find_tree(tree_id)?;

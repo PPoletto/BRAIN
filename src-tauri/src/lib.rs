@@ -46,6 +46,49 @@ pub fn run_git_filter(mode: Option<&str>) -> i32 {
     crypto::gitfilter::run(mode)
 }
 
+/// Entry point for `brain convert <vault-path>` — enables content
+/// encryption on an existing vault (S11 phase 5). git-crypt-style:
+/// working tree stays plaintext, committed blobs become ciphertext.
+/// Content-loss-safe (working-tree files are never deleted, only
+/// re-staged). Prints the recovery key for the user to save. Returns
+/// a process exit code.
+pub fn run_convert(vault_arg: Option<&str>) -> i32 {
+    configure_libgit2();
+    let Some(vault_arg) = vault_arg else {
+        eprintln!("usage: brain convert <vault-path>");
+        return 2;
+    };
+    let vault = std::path::Path::new(vault_arg);
+    if !vault::layout::is_vault(vault) {
+        eprintln!("convert: '{}' is not a BRAIN vault", vault.display());
+        return 3;
+    }
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("brain"));
+    let store = crypto::keychain::KeyringStore;
+    let key = match wiki::encryption::enable_encryption(vault, &store, &exe) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("convert: encryption setup failed: {e:#}");
+            return 4;
+        }
+    };
+    let keys = key.derive();
+    if let Err(e) = wiki::encryption::renormalize_and_commit(&vault::layout::wiki_dir(vault), &keys)
+    {
+        eprintln!("convert: re-encrypting the vault content failed: {e:#}");
+        return 5;
+    }
+    println!("BRAIN vault content encryption enabled.");
+    println!();
+    println!("RECOVERY KEY — store this in your password manager NOW.");
+    println!("Losing it makes any pushed/backed-up copy permanently unreadable:");
+    println!("  {}", key.to_hex());
+    println!();
+    println!("The working tree stays plaintext on this machine; committed git");
+    println!("blobs are now encrypted. Rebuild the index on next app launch.");
+    0
+}
+
 /// Disables libgit2's owner-validation check. On exFAT-formatted external
 /// drives the OS does not surface a meaningful Unix owner, so libgit2's
 /// strict CVE-2022-24765 workaround refuses to open the wiki repo with

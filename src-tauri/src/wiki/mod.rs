@@ -4,6 +4,7 @@
 //! pipeline, lint, history reading, restore and hard-reset.
 
 pub mod commands;
+pub mod encryption;
 pub mod git;
 pub mod history;
 pub mod lint;

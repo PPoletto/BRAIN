@@ -22,7 +22,20 @@ pub const FILTER_NAME: &str = "brain-crypt";
 /// validate the entered key before mounting. Not `*.md`, so the filter
 /// itself never touches it — we write the ciphertext bytes directly.
 pub const CANARY_FILENAME: &str = ".brain-canary";
-const GITATTRIBUTES_LINE: &str = "*.md filter=brain-crypt";
+
+/// Lines written to the wiki repo's `.gitattributes`.
+///
+/// `-text` is load-bearing, not cosmetic: git's check-in pipeline runs
+/// the `clean` filter FIRST and only then applies eol/`ident`
+/// normalization, and the check-out pipeline applies eol normalization
+/// BEFORE `smudge`. On a Windows clone (`core.autocrlf=true`) git would
+/// otherwise CRLF-mangle the opaque ciphertext whenever its binary
+/// auto-detection guessed "text" — corrupting the committed blob or
+/// breaking decryption on checkout. `-text` disables all eol/`ident`
+/// conversion on these paths so the filter's bytes pass through
+/// untouched. The canary is raw ciphertext we write directly (the
+/// filter never sees it), so it needs the same protection.
+const GITATTRIBUTES_LINES: &[&str] = &["*.md filter=brain-crypt -text", ".brain-canary -text"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum GitFilterError {
@@ -42,16 +55,21 @@ pub enum GitFilterError {
 /// Idempotent: re-running does not duplicate the `.gitattributes` line
 /// and just re-sets the config.
 pub fn configure_repo_filter(wiki_path: &Path, brain_exe: &Path) -> Result<(), GitFilterError> {
-    // .gitattributes — append the line only if not already present.
+    // .gitattributes — append each required line only if not already
+    // present, preserving any lines already in the file.
     let attrs_path = wiki_path.join(".gitattributes");
     let existing = std::fs::read_to_string(&attrs_path).unwrap_or_default();
-    if !existing.lines().any(|l| l.trim() == GITATTRIBUTES_LINE) {
-        let mut updated = existing;
-        if !updated.is_empty() && !updated.ends_with('\n') {
+    let mut updated = existing.clone();
+    for line in GITATTRIBUTES_LINES {
+        if !existing.lines().any(|l| l.trim() == *line) {
+            if !updated.is_empty() && !updated.ends_with('\n') {
+                updated.push('\n');
+            }
+            updated.push_str(line);
             updated.push('\n');
         }
-        updated.push_str(GITATTRIBUTES_LINE);
-        updated.push('\n');
+    }
+    if updated != existing {
         std::fs::write(&attrs_path, updated)?;
     }
 
@@ -145,7 +163,14 @@ pub fn run(mode_arg: Option<&str>) -> i32 {
         eprintln!("brain git-filter: not run from inside a BRAIN vault's wiki dir");
         return 3;
     };
-    let key: MasterKey = match keychain::load_master_key(&KeyringStore, &vault) {
+    let account = match keychain::vault_account(&vault) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("brain git-filter: cannot identify vault: {e}");
+            return 5;
+        }
+    };
+    let key: MasterKey = match keychain::load_master_key(&KeyringStore, &account) {
         Ok(Some(k)) => k,
         Ok(None) => {
             eprintln!(
@@ -227,10 +252,18 @@ mod tests {
         configure_repo_filter(wiki, exe).unwrap(); // idempotent
 
         let attrs = std::fs::read_to_string(wiki.join(".gitattributes")).unwrap();
-        assert_eq!(
-            attrs.lines().filter(|l| l.trim() == GITATTRIBUTES_LINE).count(),
-            1,
-            "the filter line must appear exactly once"
+        for line in GITATTRIBUTES_LINES {
+            assert_eq!(
+                attrs.lines().filter(|l| l.trim() == *line).count(),
+                1,
+                "attribute line {line:?} must appear exactly once"
+            );
+        }
+        // `-text` is the property that keeps ciphertext from being
+        // CRLF-mangled — assert it explicitly, not just by line match.
+        assert!(
+            attrs.lines().any(|l| l.contains("*.md") && l.contains("-text")),
+            "*.md must be marked -text so git never eol-converts ciphertext"
         );
         let repo = git2::Repository::open(wiki).unwrap();
         let cfg = repo.config().unwrap();
@@ -254,7 +287,9 @@ mod tests {
         configure_repo_filter(wiki, Path::new("/opt/brain/brain")).unwrap();
         let attrs = std::fs::read_to_string(wiki.join(".gitattributes")).unwrap();
         assert!(attrs.contains("*.png binary"), "pre-existing line kept");
-        assert!(attrs.contains(GITATTRIBUTES_LINE), "filter line added");
+        for line in GITATTRIBUTES_LINES {
+            assert!(attrs.contains(line), "filter line {line:?} added");
+        }
     }
 
     #[test]
