@@ -44,10 +44,16 @@ pub struct EncryptionResult {
 /// respawn the watcher. Returns the recovery key ONCE. Idempotent —
 /// re-running returns the existing key and changes nothing (rename and
 /// commit are no-ops on an already-encrypted vault).
+///
+/// `recovery_key` is optional: empty/absent generates a fresh key; a
+/// non-empty 64-hex value encrypts with that exact key instead, so this
+/// machine can join a vault that already exists on a remote (the second-PC
+/// / Variant-2 merge). The provided key replaces any cached key.
 #[tauri::command]
 pub async fn enable_vault_encryption(
     state: State<'_, Arc<crate::state::AppState>>,
     app: AppHandle,
+    recovery_key: Option<String>,
 ) -> BrainResult<EncryptionResult> {
     let vault = state
         .vault_path()
@@ -60,21 +66,39 @@ pub async fn enable_vault_encryption(
     }
     state.begin_op("Enabling encryption");
 
+    // An empty/whitespace field means "generate a fresh key"; a non-empty
+    // value means "join an existing vault with this exact key".
+    let provided_key = recovery_key
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty());
     let convert_vault = vault.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
         let store = crate::crypto::keychain::KeyringStore;
         let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("brain"));
-        let key = crate::wiki::encryption::enable_encryption(&convert_vault, &store, &exe)
-            .map_err(|e| format!("{e:#}"))?;
-        let keys = key.derive();
+        // A fresh convert re-roots the history (below) so the plaintext
+        // past can never be pushed; decide BEFORE flipping the canary.
+        let was_encrypted = crate::wiki::encryption::is_encrypted(&convert_vault);
+        let key = match &provided_key {
+            Some(hex) => {
+                crate::wiki::encryption::enable_encryption_with_key(&convert_vault, &store, &exe, hex)
+            }
+            None => crate::wiki::encryption::enable_encryption(&convert_vault, &store, &exe),
+        }
+        .map_err(|e| format!("{e:#}"))?;
         let wiki = crate::vault::layout::wiki_dir(&convert_vault);
-        crate::wiki::encryption::rename_pages_to_opaque(&wiki, &keys)
-            .map_err(|e| e.to_string())?;
-        crate::wiki::encryption::commit_wiki(
-            &wiki,
-            "encrypt: enable content encryption + opaque filenames",
-        )
-        .map_err(|e| e.to_string())?;
+        let message = "encrypt: enable content encryption + opaque filenames";
+        if was_encrypted {
+            // Already encrypted (idempotent re-run): a normal commit,
+            // which no-ops when nothing changed.
+            crate::wiki::encryption::commit_wiki(&wiki, message).map_err(|e| e.to_string())?;
+        } else {
+            // Fresh convert: commit the encrypted snapshot as a NEW history
+            // root. Everything before this moment is plaintext with human
+            // filenames — it stays local under pre-encryption-backup and
+            // can never reach a remote.
+            crate::wiki::encryption::commit_encrypted_snapshot_as_new_root(&wiki, message)
+                .map_err(|e| e.to_string())?;
+        }
         Ok(key.to_hex())
     })
     .await
@@ -99,6 +123,41 @@ pub async fn enable_vault_encryption(
     Ok(EncryptionResult { recovery_key })
 }
 
+/// Return the mounted vault's recovery key from the OS keychain (the
+/// "Show recovery key" button). Joining the vault from a second machine
+/// requires this key — without a way to re-display it, a user who missed
+/// the one-time dialog would be locked out of the join flow even though
+/// THIS machine still holds the key. Errors when the vault isn't
+/// encrypted or no key is cached on this machine.
+#[tauri::command]
+pub fn reveal_recovery_key(
+    state: State<Arc<crate::state::AppState>>,
+) -> BrainResult<EncryptionResult> {
+    let vault = state
+        .vault_path()
+        .ok_or_else(|| BrainError::Internal("no vault is currently mounted".into()))?;
+    if !crate::wiki::encryption::is_encrypted(&vault) {
+        return Err(BrainError::Internal(
+            "this vault is not encrypted — there is no recovery key to show".into(),
+        ));
+    }
+    let store = crate::crypto::keychain::KeyringStore;
+    let account = crate::crypto::keychain::vault_account(&vault)
+        .map_err(|e| BrainError::Internal(e.to_string()))?;
+    let key = crate::crypto::keychain::load_master_key(&store, &account)
+        .map_err(|e| BrainError::Internal(e.to_string()))?
+        .ok_or_else(|| {
+            BrainError::Internal(
+                "no recovery key is cached on this machine — it exists only where the vault \
+                 was encrypted (or joined)"
+                    .into(),
+            )
+        })?;
+    Ok(EncryptionResult {
+        recovery_key: key.to_hex(),
+    })
+}
+
 /// Disable content encryption on the mounted vault (inverse of convert):
 /// pause the watcher + auto-sync, rename pages back to plaintext names,
 /// drop the canary/filter, commit the plaintext tree, reindex, then
@@ -115,8 +174,11 @@ pub async fn disable_vault_encryption(
     if let Some(w) = state.take_watcher() {
         w.abort();
     }
-    // Stop auto-sync too — the vault layout is about to change wholesale.
+    // Stop auto-sync too — disabling encryption tears down the remote
+    // ("no Git without encryption"), so background syncing must stop and
+    // stay off across the next mount.
     state.set_auto_sync_task(None);
+    let _ = state.config.update(|s| s.auto_sync = false);
     state.begin_op("Disabling encryption");
 
     let decrypt_vault = vault.clone();
@@ -194,6 +256,19 @@ pub fn set_auto_sync(
     Ok(())
 }
 
+/// Disconnect the vault from its sync remote: remove the remote, drop the
+/// stored PAT, and stop auto-sync (persisted off). Encryption stays on —
+/// this is the "stop syncing / change host" escape hatch, distinct from
+/// disabling encryption entirely.
+#[tauri::command]
+pub fn disconnect_git_remote(state: State<Arc<crate::state::AppState>>) -> BrainResult<()> {
+    let wiki = current_wiki_dir(&state)?;
+    sync::disconnect(&wiki).map_err(BrainError::from)?;
+    state.set_auto_sync_task(None);
+    let _ = state.config.update(|s| s.auto_sync = false);
+    Ok(())
+}
+
 /// Attach (or update) the sync remote. Enforces the encryption coupling
 /// (a network URL requires an encrypted vault).
 #[tauri::command]
@@ -213,6 +288,37 @@ pub fn set_git_credential(
 ) -> BrainResult<()> {
     let wiki = current_wiki_dir(&state)?;
     sync::set_remote_credential(&wiki, &pat).map_err(BrainError::from)
+}
+
+/// Result of [`verify_git_remote`], for the UI toast.
+#[derive(Debug, Clone, Serialize)]
+pub struct RemoteKeyCheck {
+    /// `"verified"` (remote tip's canary matches our key) or `"empty"`
+    /// (remote has no branches yet — first sync publishes ours).
+    pub status: String,
+}
+
+/// Early key check, run by the UI right after the remote or its token is
+/// saved: fetch + validate the local key against the remote tip's canary
+/// (the same gate every merge enforces), so a wrong recovery key surfaces
+/// at setup time instead of at the first sync.
+#[tauri::command]
+pub async fn verify_git_remote(
+    state: State<'_, Arc<crate::state::AppState>>,
+) -> BrainResult<RemoteKeyCheck> {
+    let wiki = current_wiki_dir(&state)?;
+    state.begin_op("Checking the remote key");
+    let res = tokio::task::spawn_blocking(move || sync::verify_remote_key(&wiki)).await;
+    state.end_op("Checking the remote key");
+    let status = res
+        .map_err(|e| BrainError::Internal(format!("remote key check panicked: {e}")))?
+        .map_err(BrainError::from)?;
+    Ok(RemoteKeyCheck {
+        status: match status {
+            sync::RemoteKeyStatus::Verified => "verified".to_string(),
+            sync::RemoteKeyStatus::EmptyRemote => "empty".to_string(),
+        },
+    })
 }
 
 /// fetch → merge → push, then rebuild the index if the working tree

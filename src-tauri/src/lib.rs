@@ -65,6 +65,9 @@ pub fn run_convert(vault_arg: Option<&str>) -> i32 {
     }
     let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("brain"));
     let store = crypto::keychain::KeyringStore;
+    // A fresh convert re-roots the git history so the plaintext past can
+    // never be pushed; decide BEFORE the canary flips the state.
+    let was_encrypted = wiki::encryption::is_encrypted(vault);
     let key = match wiki::encryption::enable_encryption(vault, &store, &exe) {
         Ok(k) => k,
         Err(e) => {
@@ -88,11 +91,23 @@ pub fn run_convert(vault_arg: Option<&str>) -> i32 {
             return 5;
         }
     }
-    if let Err(e) =
-        wiki::encryption::commit_wiki(&wiki, "encrypt: enable content encryption + opaque filenames")
-    {
+    let message = "encrypt: enable content encryption + opaque filenames";
+    let commit_result = if was_encrypted {
+        // Idempotent re-run on an already-encrypted vault: normal commit,
+        // no-ops when nothing changed.
+        wiki::encryption::commit_wiki(&wiki, message)
+    } else {
+        // Fresh convert: the encrypted snapshot becomes a NEW history root;
+        // the plaintext history stays local under pre-encryption-backup.
+        wiki::encryption::commit_encrypted_snapshot_as_new_root(&wiki, message)
+    };
+    if let Err(e) = commit_result {
         eprintln!("convert: re-encrypting the vault content failed: {e:#}");
         return 6;
+    }
+    if !was_encrypted {
+        println!("Git history re-rooted: only the encrypted snapshot is pushable;");
+        println!("the plaintext history stays local on branch 'pre-encryption-backup'.");
     }
     println!("BRAIN vault content encryption enabled.");
     println!();
@@ -376,6 +391,9 @@ pub fn run() {
             wiki::commands::enable_vault_encryption,
             wiki::commands::disable_vault_encryption,
             wiki::commands::set_auto_sync,
+            wiki::commands::disconnect_git_remote,
+            wiki::commands::verify_git_remote,
+            wiki::commands::reveal_recovery_key,
             // Update (S04)
             update::commands::check_update,
             update::commands::apply_update,

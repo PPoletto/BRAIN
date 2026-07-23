@@ -1,10 +1,19 @@
 //! S11 phase 6 — background auto-sync scheduler.
 //!
 //! When enabled (per the `auto_sync` client setting) and a remote is
-//! configured, this periodically runs `sync::sync` (fetch → merge → push)
-//! and reindexes when the working tree changed. It is spawned on mount and
-//! aborted on unmount or when auto-sync is toggled off. Failures (offline,
-//! auth) are logged and retried on the next tick — never fatal.
+//! configured, this runs `sync::sync` (fetch → merge → push):
+//!
+//!  - **immediately after every local auto-commit** — the watcher nudges
+//!    [`AppState::nudge_sync`] once a change is committed, so edits reach
+//!    the remote within seconds;
+//!  - **and at least every [`INTERVAL`]** — the polling fallback that
+//!    PULLS changes other machines pushed while we were idle.
+//!
+//! It is spawned on mount and aborted on unmount or toggle-off. Transient
+//! failures (offline, auth hiccup) are logged and retried on the next
+//! tick. A PERMANENT failure — an encryption/key error — turns auto-sync
+//! off (persisted) and surfaces a `sync-error` event, instead of failing
+//! identically every two minutes forever.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -43,7 +52,10 @@ pub fn spawn<R: Runtime>(app: AppHandle<R>, state: Arc<AppState>, vault: PathBuf
 async fn run_loop<R: Runtime>(app: AppHandle<R>, state: Arc<AppState>, vault: PathBuf) {
     let wiki = wiki_dir(&vault);
     loop {
-        tokio::time::sleep(INTERVAL).await;
+        // Wait for a watcher nudge ("a local change was just committed")
+        // or the polling interval, whichever fires first. The timeout
+        // result is irrelevant — both wake-ups lead to the same sync.
+        let _ = tokio::time::timeout(INTERVAL, state.sync_nudge().notified()).await;
 
         // The task is aborted when auto-sync is toggled off, but re-check
         // the setting and that a remote is still configured before doing
@@ -79,6 +91,19 @@ async fn run_loop<R: Runtime>(app: AppHandle<R>, state: Arc<AppState>, vault: Pa
             Ok(Err(err)) => {
                 // Offline / auth / transient — retry on the next tick.
                 tracing::warn!(error = %err, "auto-sync attempt failed");
+                // An encryption error (e.g. the remote is keyed
+                // differently) is permanent, not transient: retrying every
+                // tick would fail identically forever. Turn auto-sync off
+                // (persisted, so it stays off across mounts), surface the
+                // reason, and end this task.
+                if matches!(err, crate::wiki::WikiError::Encryption(_)) {
+                    let _ = state.config.update(|s| s.auto_sync = false);
+                    let _ = app.emit(
+                        "sync-error",
+                        format!("{err} — auto-sync has been turned off"),
+                    );
+                    return;
+                }
             }
             Err(err) => {
                 tracing::warn!(error = %err, "auto-sync task join failed");

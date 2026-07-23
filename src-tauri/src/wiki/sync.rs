@@ -78,6 +78,33 @@ pub fn set_remote(wiki: &Path, url: &str) -> WikiResult<()> {
     Ok(())
 }
 
+/// Remove the managed sync remote from the repo (idempotent — a missing
+/// remote is success). The reverse of the S11 coupling: disabling
+/// encryption tears the remote down so a later plaintext push is
+/// impossible ("no Git without encryption").
+pub fn remove_remote(wiki: &Path) -> WikiResult<()> {
+    let repo = init_repo(wiki)?;
+    match repo.remote_delete(DEFAULT_REMOTE) {
+        Ok(()) => Ok(()),
+        // A missing remote means we're already disconnected.
+        Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(()),
+        Err(e) => Err(WikiError::from(e)),
+    }
+}
+
+/// Fully disconnect the vault from its remote: delete the remote and drop
+/// the stored PAT from the keychain. Idempotent — safe to call when
+/// nothing is configured.
+pub fn disconnect(wiki: &Path) -> WikiResult<()> {
+    remove_remote(wiki)?;
+    if let Ok(account) = account_for(wiki) {
+        // Best-effort: the remote is gone regardless of whether the
+        // keychain entry existed.
+        let _ = keychain::delete_git_pat(&account);
+    }
+    Ok(())
+}
+
 /// Store the git remote credential (PAT) for this vault in the keychain.
 /// Trims surrounding whitespace — a PAT pasted from a browser often picks
 /// up a trailing newline/space, which would otherwise make every auth
@@ -94,12 +121,6 @@ pub fn remote_url(wiki: &Path) -> Option<String> {
         .ok()?
         .url()
         .map(str::to_string)
-}
-
-/// Whether the configured remote is a network (hosted) remote — used to
-/// refuse disabling encryption while a plaintext push could leak content.
-pub fn has_network_remote(wiki: &Path) -> bool {
-    remote_url(wiki).map(|u| is_network_url(&u)).unwrap_or(false)
 }
 
 /// Whether a remote credential (PAT) is stored for this vault.
@@ -235,6 +256,104 @@ pub fn merge_from_remote(wiki: &Path, branch: &str) -> WikiResult<MergeOutcome> 
     merge_from_remote_with_store(wiki, branch, &KeyringStore)
 }
 
+/// Result of an explicit remote-key check (Settings UI, right after the
+/// remote or its token is saved).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteKeyStatus {
+    /// The remote tip's canary decrypts with our key — same vault key.
+    Verified,
+    /// The remote has no branches yet; the first sync will publish ours.
+    EmptyRemote,
+}
+
+/// Early key check for the Settings UI: fetch, then validate the local
+/// master key against the canary on the remote's tip — the SAME gate the
+/// merge enforces — so a wrong recovery key surfaces the moment the
+/// remote/token is saved instead of at the first sync.
+pub fn verify_remote_key(wiki: &Path) -> WikiResult<RemoteKeyStatus> {
+    verify_remote_key_with_store(wiki, &KeyringStore)
+}
+
+pub(crate) fn verify_remote_key_with_store(
+    wiki: &Path,
+    store: &impl MasterKeyStore,
+) -> WikiResult<RemoteKeyStatus> {
+    fetch(wiki)?;
+    let repo = init_repo(wiki)?;
+    // Prefer the branch a sync would merge; fall back to any remote ref —
+    // the canary is identical across branches of the same vault.
+    let branch = current_branch(&repo)?;
+    let their = match repo.find_reference(&format!("refs/remotes/{DEFAULT_REMOTE}/{branch}")) {
+        Ok(r) => Some(r),
+        Err(_) => repo
+            .references_glob(&format!("refs/remotes/{DEFAULT_REMOTE}/*"))?
+            .flatten()
+            .next(),
+    };
+    let Some(their_ref) = their else {
+        return Ok(RemoteKeyStatus::EmptyRemote);
+    };
+    let their_commit = their_ref.peel_to_commit()?;
+    verify_same_key_as_remote(&repo, &their_commit, wiki, store)?;
+    Ok(RemoteKeyStatus::Verified)
+}
+
+/// Refuse to merge a remote keyed differently than this vault.
+///
+/// The remote's tip commits a canary encrypted with ITS master key; check
+/// it against ours. Three cases:
+/// - remote canary present + our key checks out → proceed;
+/// - remote canary present + mismatch (or we have no key) → hard error,
+///   the user joined with the wrong recovery key;
+/// - remote has commits but NO canary → it is not an encrypted BRAIN
+///   vault; refuse when we are encrypted (merging plaintext into an
+///   encrypted vault would push plaintext later). A plaintext local vault
+///   with a plaintext (local-path) remote passes — no keys involved.
+fn verify_same_key_as_remote(
+    repo: &Repository,
+    their_commit: &git2::Commit,
+    wiki: &Path,
+    store: &impl MasterKeyStore,
+) -> WikiResult<()> {
+    let tree = their_commit.tree()?;
+    let remote_canary = tree
+        .get_path(Path::new(gitfilter::CANARY_FILENAME))
+        .ok()
+        .and_then(|e| repo.find_blob(e.id()).ok().map(|b| b.content().to_vec()));
+    let vault = wiki.parent().unwrap_or(wiki);
+    match remote_canary {
+        Some(stored) => {
+            let account = account_for(wiki)?;
+            let key = keychain::load_master_key(store, &account)
+                .map_err(|e| WikiError::Encryption(e.to_string()))?
+                .ok_or_else(|| {
+                    WikiError::Encryption(
+                        "the remote vault is encrypted but this vault has no master key — \
+                         enable encryption with that vault's recovery key first"
+                            .to_string(),
+                    )
+                })?;
+            if !crate::crypto::check_canary(&key.derive(), &stored) {
+                return Err(WikiError::Encryption(
+                    "the remote vault is encrypted with a different key than this vault — \
+                     refusing to merge. Disable encryption here, then enable it again using \
+                     the remote vault's recovery key, and sync again"
+                        .to_string(),
+                ));
+            }
+        }
+        None if encryption::is_encrypted(vault) => {
+            return Err(WikiError::Encryption(
+                "the remote has commits but no encryption canary — it does not look like an \
+                 encrypted BRAIN vault; refusing to merge it into an encrypted vault"
+                    .to_string(),
+            ));
+        }
+        None => {}
+    }
+    Ok(())
+}
+
 pub(crate) fn merge_from_remote_with_store(
     wiki: &Path,
     branch: &str,
@@ -248,6 +367,15 @@ pub(crate) fn merge_from_remote_with_store(
         Err(_) => return Ok(MergeOutcome::UpToDate),
     };
     let their_commit = their_ref.peel_to_commit()?;
+
+    // Key gate: never merge histories keyed differently. Two vaults with
+    // different keys produce different opaque filenames, so their trees
+    // union with ZERO path collisions — the merge would "succeed", push a
+    // mixed-key history, and leave half the pages undecryptable on every
+    // machine. Verify the local key against the remote's committed canary
+    // BEFORE any merge action.
+    verify_same_key_as_remote(&repo, &their_commit, wiki, store)?;
+
     let their_annotated = repo.reference_to_annotated_commit(&their_ref)?;
     let (analysis, _) = repo.merge_analysis(&[&their_annotated])?;
 
@@ -501,6 +629,165 @@ mod tests {
         init_repo(&wiki).unwrap();
         // A local filesystem path is not a network remote — allowed.
         assert!(set_remote(&wiki, "/srv/backups/brain.git").is_ok());
+    }
+
+    #[test]
+    fn remove_remote_detaches_and_is_idempotent() {
+        let store = MemStore::default();
+        let key = crate::crypto::MasterKey::from_bytes([3u8; 32]);
+        let v = make_encrypted_vault(&key, &[("entities/a", "x")], &store);
+        let wiki = wiki_dir(v.path());
+        set_remote(&wiki, "https://github.com/example/brain.git").unwrap();
+        assert!(remote_url(&wiki).is_some(), "remote attached");
+        remove_remote(&wiki).unwrap();
+        assert!(remote_url(&wiki).is_none(), "remote detached");
+        // A missing remote is success, not an error.
+        remove_remote(&wiki).unwrap();
+    }
+
+    #[test]
+    fn disabling_encryption_tears_down_the_remote() {
+        // "No Git without encryption": disabling encryption removes the
+        // remote so a later plaintext push is impossible — replacing the
+        // old behaviour of refusing while a remote was attached.
+        let store = MemStore::default();
+        let key = crate::crypto::MasterKey::from_bytes([7u8; 32]);
+        let v = make_encrypted_vault(&key, &[("entities/note", "hello")], &store);
+        let wiki = wiki_dir(v.path());
+        set_remote(&wiki, "https://github.com/example/brain.git").unwrap();
+        assert!(remote_url(&wiki).is_some());
+
+        crate::wiki::encryption::disable_encryption_with_store(v.path(), &store).unwrap();
+
+        assert!(remote_url(&wiki).is_none(), "remote must be gone after disabling encryption");
+        assert!(!encryption::is_encrypted(v.path()), "vault must be plaintext again");
+        assert!(wiki.join("entities/note.md").exists(), "plaintext filename restored");
+    }
+
+    #[test]
+    fn raw_files_travel_with_sync_and_restore_on_the_other_machine() {
+        // A attaches a document under 01_raw; after B syncs, the SAME
+        // bytes exist at the SAME 01_raw path on B — while the repo they
+        // travelled through holds only an opaque token + ciphertext.
+        let store = MemStore::default();
+        let key = crate::crypto::MasterKey::from_bytes([11u8; 32]);
+        let a = make_encrypted_vault(&key, &[("entities/x", "x")], &store);
+        let payload: &[u8] = b"%PDF-fake\x00\x01 vertrauliches Angebot";
+        let a_raw = crate::vault::layout::raw_dir(a.path());
+        std::fs::create_dir_all(a_raw.join("docs")).unwrap();
+        std::fs::write(a_raw.join("docs/angebot.pdf"), payload).unwrap();
+        crate::wiki::encryption::commit_wiki_with_store(&wiki_dir(a.path()), "raw", &store)
+            .unwrap()
+            .unwrap();
+
+        let b = make_encrypted_vault(&key, &[("entities/y", "y")], &store);
+        let b_wiki = wiki_dir(b.path());
+        set_remote(&b_wiki, &wiki_dir(a.path()).to_string_lossy()).unwrap();
+        fetch(&b_wiki).unwrap();
+        let branch = current_branch(&init_repo(&b_wiki).unwrap()).unwrap();
+        merge_from_remote_with_store(&b_wiki, &branch, &store).unwrap();
+
+        let restored =
+            std::fs::read(crate::vault::layout::raw_dir(b.path()).join("docs/angebot.pdf"))
+                .unwrap();
+        assert_eq!(restored, payload, "attachment bytes must survive the round trip");
+        // The mirror must never linger in the wiki working tree.
+        assert!(!b_wiki.join("raw").exists(), "no raw mirror copies in the worktree");
+    }
+
+    #[test]
+    fn customised_meta_files_travel_with_sync() {
+        // The user edits AGENTS.md on machine A; after B syncs, B's
+        // 00_meta/AGENTS.md carries the customisation.
+        let store = MemStore::default();
+        let key = crate::crypto::MasterKey::from_bytes([13u8; 32]);
+        let a = make_encrypted_vault(&key, &[("entities/x", "x")], &store);
+        let custom = b"# my customised wiki-agent rules";
+        std::fs::write(crate::vault::layout::meta_dir(a.path()).join("AGENTS.md"), custom)
+            .unwrap();
+        crate::wiki::encryption::commit_wiki_with_store(&wiki_dir(a.path()), "meta", &store)
+            .unwrap()
+            .unwrap();
+
+        let b = make_encrypted_vault(&key, &[("entities/y", "y")], &store);
+        let b_wiki = wiki_dir(b.path());
+        set_remote(&b_wiki, &wiki_dir(a.path()).to_string_lossy()).unwrap();
+        fetch(&b_wiki).unwrap();
+        let branch = current_branch(&init_repo(&b_wiki).unwrap()).unwrap();
+        merge_from_remote_with_store(&b_wiki, &branch, &store).unwrap();
+
+        let restored =
+            std::fs::read(crate::vault::layout::meta_dir(b.path()).join("AGENTS.md")).unwrap();
+        assert_eq!(restored, custom, "the customised AGENTS.md must arrive on B");
+    }
+
+    #[test]
+    fn verify_remote_key_reports_verified_for_a_same_key_remote() {
+        let store = MemStore::default();
+        let key = crate::crypto::MasterKey::from_bytes([5u8; 32]);
+        let a = make_encrypted_vault(&key, &[("entities/a", "aaa")], &store);
+        let b = make_encrypted_vault(&key, &[("entities/b", "bbb")], &store);
+        let b_wiki = wiki_dir(b.path());
+        set_remote(&b_wiki, &wiki_dir(a.path()).to_string_lossy()).unwrap();
+        let status = verify_remote_key_with_store(&b_wiki, &store).unwrap();
+        assert_eq!(status, RemoteKeyStatus::Verified);
+    }
+
+    #[test]
+    fn verify_remote_key_rejects_a_remote_keyed_differently() {
+        let store = MemStore::default();
+        let key_a = crate::crypto::MasterKey::from_bytes([1u8; 32]);
+        let key_b = crate::crypto::MasterKey::from_bytes([2u8; 32]);
+        let a = make_encrypted_vault(&key_a, &[("entities/a", "aaa")], &store);
+        let b = make_encrypted_vault(&key_b, &[("entities/b", "bbb")], &store);
+        let b_wiki = wiki_dir(b.path());
+        set_remote(&b_wiki, &wiki_dir(a.path()).to_string_lossy()).unwrap();
+        let err = verify_remote_key_with_store(&b_wiki, &store).unwrap_err();
+        assert!(err.to_string().contains("different key"), "clear message: {err}");
+    }
+
+    #[test]
+    fn verify_remote_key_reports_empty_for_a_remote_without_branches() {
+        let store = MemStore::default();
+        let key = crate::crypto::MasterKey::from_bytes([6u8; 32]);
+        let v = make_encrypted_vault(&key, &[("entities/a", "aaa")], &store);
+        let bare = TempDir::new().unwrap();
+        git2::Repository::init_bare(bare.path()).unwrap();
+        let wiki = wiki_dir(v.path());
+        set_remote(&wiki, &bare.path().to_string_lossy()).unwrap();
+        let status = verify_remote_key_with_store(&wiki, &store).unwrap();
+        assert_eq!(status, RemoteKeyStatus::EmptyRemote);
+    }
+
+    #[test]
+    fn refuses_to_merge_a_remote_encrypted_with_a_different_key() {
+        // The live-found gap: two vaults keyed differently have disjoint
+        // opaque filenames, so the union merge "succeeds" and pushes a
+        // mixed-key history nobody can fully read. The canary gate must
+        // reject this before any merge action.
+        let store = MemStore::default();
+        let key_a = crate::crypto::MasterKey::from_bytes([1u8; 32]);
+        let key_b = crate::crypto::MasterKey::from_bytes([2u8; 32]);
+        let a = make_encrypted_vault(&key_a, &[("entities/only-a", "aaa")], &store);
+        let b = make_encrypted_vault(&key_b, &[("entities/only-b", "bbb")], &store);
+        let a_wiki = wiki_dir(a.path());
+        let b_wiki = wiki_dir(b.path());
+
+        set_remote(&b_wiki, &a_wiki.to_string_lossy()).unwrap();
+        fetch(&b_wiki).unwrap();
+        let branch = current_branch(&init_repo(&b_wiki).unwrap()).unwrap();
+        let err = merge_from_remote_with_store(&b_wiki, &branch, &store).unwrap_err();
+
+        assert!(matches!(err, WikiError::Encryption(_)), "must be a key error: {err}");
+        assert!(err.to_string().contains("different key"), "clear message: {err}");
+        // Nothing merged: local HEAD still knows nothing of the remote page.
+        let repo = init_repo(&b_wiki).unwrap();
+        let head_tree = repo.head().unwrap().peel_to_tree().unwrap();
+        let token_a = key_a.derive().filename_token("entities/only-a");
+        assert!(
+            head_tree.get_path(Path::new(&format!("entities/{token_a}.md"))).is_err(),
+            "the foreign-keyed page must not enter the local history"
+        );
     }
 
     #[test]

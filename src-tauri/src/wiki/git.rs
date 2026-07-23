@@ -74,6 +74,49 @@ pub fn commit_index(
     Ok(Some(oid.to_string()))
 }
 
+/// Like [`commit_index`], but commits the staged tree as an ORPHAN — a
+/// fresh root commit with no parents — after preserving the current
+/// history under `backup_ref` (local-only; sync pushes just the current
+/// branch). The current branch is then repointed at the new root.
+///
+/// Used by the encryption convert: everything before the convert contains
+/// PLAINTEXT blobs and human filenames, and a normal commit would keep
+/// that history reachable — the first push would publish it. Re-rooting
+/// makes the encrypted snapshot the only thing a remote can ever see.
+pub fn commit_index_as_new_root(
+    repo: &Repository,
+    index: &mut git2::Index,
+    message: &str,
+    backup_ref: &str,
+) -> WikiResult<Option<String>> {
+    index.write()?;
+    let tree_id = index.write_tree()?;
+    let tree = repo.find_tree(tree_id)?;
+    let sig = Signature::now(COMMITTER_NAME, COMMITTER_EMAIL)?;
+
+    // Preserve the old history locally before disconnecting it.
+    if let Ok(old) = repo.head().and_then(|h| h.peel_to_commit()) {
+        repo.reference(
+            backup_ref,
+            old.id(),
+            true,
+            "convert: preserve pre-encryption history locally",
+        )?;
+    }
+
+    // The branch HEAD points at (resolves for an unborn branch too).
+    let branch_ref = repo
+        .find_reference("HEAD")
+        .ok()
+        .and_then(|r| r.symbolic_target().map(str::to_string))
+        .unwrap_or_else(|| "refs/heads/master".to_string());
+
+    let oid = repo.commit(None, &sig, &sig, message, &tree, &[])?;
+    repo.reference(&branch_ref, oid, true, "convert: fresh encrypted root")?;
+    repo.set_head(&branch_ref)?;
+    Ok(Some(oid.to_string()))
+}
+
 /// Returns the number of commits on HEAD.
 pub fn commit_count(wiki_path: &Path) -> WikiResult<usize> {
     let repo = init_repo(wiki_path)?;

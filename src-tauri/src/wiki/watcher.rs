@@ -61,6 +61,7 @@ async fn run_loop<R: Runtime>(
     let (tx, mut rx) = mpsc::channel::<()>(64);
 
     let watcher_tx = tx.clone();
+    let meta_root = crate::vault::layout::meta_dir(&vault_path);
     let mut debouncer = match new_debouncer(
         DEBOUNCE_IDLE,
         None,
@@ -73,11 +74,24 @@ async fn run_loop<R: Runtime>(
                 // every commit's index write would re-trigger the watcher,
                 // producing an endless commit loop. Only real page-file
                 // changes (outside `.git/`) should wake the committer.
-                let touches_wiki = events
-                    .iter()
-                    .flat_map(|ev| ev.paths.iter())
-                    .any(|p| !p.components().any(|c| c.as_os_str() == std::ffi::OsStr::new(".git")));
-                if touches_wiki {
+                //
+                // Under `00_meta/` only the SYNCED files (AGENTS.md,
+                // CLAUDE.md) count — log.md and index.md are written by
+                // our own commit cycle and would churn events forever.
+                let relevant = events.iter().flat_map(|ev| ev.paths.iter()).any(|p| {
+                    if p.components().any(|c| c.as_os_str() == std::ffi::OsStr::new(".git")) {
+                        return false;
+                    }
+                    if p.starts_with(&meta_root) {
+                        return p
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| crate::wiki::encryption::MIRRORED_META_FILES.contains(&n))
+                            .unwrap_or(false);
+                    }
+                    true
+                });
+                if relevant {
                     let _ = watcher_tx.try_send(());
                 }
             }
@@ -96,6 +110,24 @@ async fn run_loop<R: Runtime>(
     {
         tracing::error!(?err, "wiki watcher: cannot watch wiki dir");
         return;
+    }
+
+    // Watch 01_raw too: attachments are mirrored into the wiki repo at
+    // commit time (encrypted + opaque on an encrypted vault), so a file
+    // dropped there must trigger the same commit → sync path as a page
+    // edit. Non-fatal if unavailable — raw changes then ride along with
+    // the next page commit.
+    let raw = crate::vault::layout::raw_dir(&vault_path);
+    let _ = std::fs::create_dir_all(&raw);
+    if let Err(err) = debouncer.watcher().watch(&raw, RecursiveMode::Recursive) {
+        tracing::warn!(?err, "wiki watcher: cannot watch 01_raw — raw changes commit lazily");
+    }
+
+    // Watch 00_meta (flat) for edits/resets of the synced meta files
+    // (AGENTS.md, CLAUDE.md) — the callback filters everything else out.
+    let meta = crate::vault::layout::meta_dir(&vault_path);
+    if let Err(err) = debouncer.watcher().watch(&meta, RecursiveMode::NonRecursive) {
+        tracing::warn!(?err, "wiki watcher: cannot watch 00_meta — meta changes commit lazily");
     }
 
     while rx.recv().await.is_some() {
@@ -154,6 +186,9 @@ async fn process_idle_window<R: Runtime>(app: &AppHandle<R>, state: &Arc<AppStat
                     "message": commit.message,
                 }),
             );
+            // Local edits are committed — wake the auto-sync scheduler so
+            // they reach the remote within seconds, not at the next tick.
+            state.nudge_sync();
             // Surface lint warnings (non-blocking) so the user knows about
             // pages that should be cleaned up — non-canonical wiki links,
             // missing titles, etc. — even though the commit went through.

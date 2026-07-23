@@ -71,11 +71,43 @@ pub fn enable_encryption(
             fresh
         }
     };
+    finish_enable(vault, brain_exe, &key)?;
+    Ok(key)
+}
+
+/// Enable content encryption using a *specific existing* recovery key
+/// rather than generating one. This is how a second machine joins a vault
+/// that already lives on a remote: its diverged plaintext vault is
+/// encrypted with the SAME master key, so its blobs (and opaque paths)
+/// line up with the remote's and a same-key merge (Variant 2) can union
+/// the two histories. The provided key REPLACES any key currently cached
+/// in the keychain for this vault. Fails before touching the vault if the
+/// key isn't 64 hex characters.
+pub fn enable_encryption_with_key(
+    vault: &Path,
+    store: &impl MasterKeyStore,
+    brain_exe: &Path,
+    recovery_key_hex: &str,
+) -> anyhow::Result<MasterKey> {
+    use anyhow::Context;
+    let key = MasterKey::from_hex(recovery_key_hex.trim())
+        .ok_or_else(|| anyhow::anyhow!("recovery key must be 64 hex characters"))?;
+    let account = keychain::vault_account(vault).context("resolving the vault keychain id")?;
+    keychain::store_master_key(store, &account, &key)
+        .context("storing the provided recovery key in the keychain")?;
+    finish_enable(vault, brain_exe, &key)?;
+    Ok(key)
+}
+
+/// Shared tail of both enable paths: wire up the clean/smudge filter and
+/// write the canary so the key is provable and future commits encrypt.
+fn finish_enable(vault: &Path, brain_exe: &Path, key: &MasterKey) -> anyhow::Result<()> {
+    use anyhow::Context;
     let wiki = wiki_dir(vault);
     gitfilter::configure_repo_filter(&wiki, brain_exe)
         .context("configuring the brain-crypt git filter")?;
     gitfilter::write_canary(&wiki, &key.derive()).context("writing the encryption canary")?;
-    Ok(key)
+    Ok(())
 }
 
 /// The commit entry point for every wiki write path. Stages the working
@@ -114,7 +146,55 @@ pub(crate) fn commit_wiki_with_store(
     if let Some(keys) = &keys {
         encrypt_md_index_entries(wiki, &mut index, keys)?;
     }
+    // Attachments and the customisable meta files travel too: mirror
+    // them into the index (encrypted + opaque names when the vault is
+    // encrypted, verbatim otherwise).
+    let vault = wiki.parent().unwrap_or(wiki);
+    stage_raw_mirror(vault, &mut index, keys.as_ref())?;
+    stage_meta_mirror(vault, &mut index, keys.as_ref())?;
     crate::wiki::git::commit_index(&repo, &mut index, message)
+}
+
+/// Local-only ref that preserves the pre-conversion history when
+/// encryption is enabled. Never pushed — sync pushes only the current
+/// branch — so the plaintext commits from before the convert can never
+/// reach a remote.
+pub const PRE_ENCRYPTION_BACKUP_REF: &str = "refs/heads/pre-encryption-backup";
+
+/// The convert commit: stage the tree exactly like [`commit_wiki`]
+/// (opaque-rename + encrypt `*.md`), but commit it as a fresh history
+/// ROOT and park the old history under [`PRE_ENCRYPTION_BACKUP_REF`].
+/// Everything before the convert is plaintext with human filenames; a
+/// normal commit would keep it reachable and the first push would
+/// publish it. Requires the vault to already be encrypted (canary set).
+pub fn commit_encrypted_snapshot_as_new_root(
+    wiki: &Path,
+    message: &str,
+) -> WikiResult<Option<String>> {
+    commit_encrypted_snapshot_as_new_root_with_store(wiki, message, &KeyringStore)
+}
+
+pub(crate) fn commit_encrypted_snapshot_as_new_root_with_store(
+    wiki: &Path,
+    message: &str,
+    store: &impl MasterKeyStore,
+) -> WikiResult<Option<String>> {
+    let repo = crate::wiki::git::init_repo(wiki)?;
+    let keys = resolve_keys(wiki, store)?.ok_or_else(|| {
+        WikiError::Encryption(
+            "re-rooting the history requires an encrypted vault — enable encryption first"
+                .to_string(),
+        )
+    })?;
+    rename_pages_to_opaque(wiki, &keys)?;
+    let mut index = repo.index()?;
+    index.add_all(["."].iter(), git2::IndexAddOption::DEFAULT, None)?;
+    encrypt_md_index_entries(wiki, &mut index, &keys)?;
+    // The fresh encrypted root carries attachments + meta from day one.
+    let vault = wiki.parent().unwrap_or(wiki);
+    stage_raw_mirror(vault, &mut index, Some(&keys))?;
+    stage_meta_mirror(vault, &mut index, Some(&keys))?;
+    crate::wiki::git::commit_index_as_new_root(&repo, &mut index, message, PRE_ENCRYPTION_BACKUP_REF)
 }
 
 /// Turn a committed blob into the bytes that belong in the working tree.
@@ -227,6 +307,13 @@ fn encrypt_md_index_entries(
         .iter()
         .map(|entry| entry.path)
         .filter(|path| path.ends_with(b".md"))
+        // Mirror entries (raw/, meta/) have no working-tree file to read
+        // — they are staged from their sources by stage_raw_mirror /
+        // stage_meta_mirror right after this. Without this filter, the
+        // convert of a vault whose PLAINTEXT mirror contains `.md` files
+        // (e.g. 01_raw/notes/foo.md, meta/AGENTS.md) would try to read
+        // `02_wiki/raw/...` from disk and fail.
+        .filter(|path| !path.starts_with(b"raw/") && !path.starts_with(b"meta/"))
         .collect();
 
     for path in md_paths {
@@ -242,10 +329,12 @@ fn encrypt_md_index_entries(
 
 /// Re-materialise the working tree from HEAD as plaintext. After a git2
 /// operation that checks out committed blobs verbatim (e.g. a hard
-/// reset, or a fresh clone), an encrypted vault's working tree holds
-/// ciphertext; this decrypts every `*.md` back to plaintext in place.
-/// No-op for a plaintext vault. Also the basis for clone materialisation
-/// (phase 6b).
+/// reset, a merge, or a fresh clone), an encrypted vault's working tree
+/// holds ciphertext; this decrypts every `*.md` back to plaintext in
+/// place. It ALSO restores `<vault>/01_raw` from the raw mirror (both
+/// modes) and removes the mirror's worktree copies. The `*.md` decrypt is
+/// a no-op for a plaintext vault. Also the basis for clone
+/// materialisation (phase 6b).
 pub fn smudge_worktree_from_head(wiki: &Path) -> WikiResult<()> {
     smudge_worktree_from_head_with_store(wiki, &KeyringStore)
 }
@@ -254,6 +343,8 @@ pub(crate) fn smudge_worktree_from_head_with_store(
     wiki: &Path,
     store: &impl MasterKeyStore,
 ) -> WikiResult<()> {
+    materialise_raw_from_head_with_store(wiki, store)?;
+    materialise_meta_from_head_with_store(wiki, store)?;
     let Some(keys) = resolve_keys(wiki, store)? else {
         return Ok(());
     };
@@ -286,6 +377,333 @@ pub(crate) fn smudge_worktree_from_head_with_store(
         std::fs::write(&abs, &plaintext)?;
     }
     Ok(())
+}
+
+/// Repo-relative directory that mirrors `<vault>/01_raw` inside the wiki
+/// repo, so attachments travel with sync. The mirror lives ONLY in the
+/// index/history — it is never materialised into the wiki working tree
+/// (the real files live in `01_raw`).
+pub const RAW_MIRROR_DIR: &str = "raw";
+/// Encrypted manifest inside the mirror mapping filename token → original
+/// `01_raw`-relative path. Needed because a PDF can't carry its own path
+/// the way a page's frontmatter id does.
+pub const RAW_MANIFEST_PATH: &str = "raw/.manifest";
+/// Files larger than this are not synced (GitHub rejects blobs ≥ 100 MB);
+/// they stay local with a warning.
+const MAX_RAW_SYNC_BYTES: u64 = 95 * 1024 * 1024;
+
+/// Mirror `<vault>/01_raw` into the index under [`RAW_MIRROR_DIR`].
+/// Encrypted vault: each file is staged at `raw/<HMAC(relpath)>` with
+/// encrypted content plus the encrypted manifest — a copy of the repo
+/// reveals neither attachment names nor contents. Plaintext vault: clear
+/// relative paths, verbatim bytes, no manifest. Stale mirror entries
+/// (source file gone from `01_raw`) are removed; deterministic encryption
+/// keeps unchanged files from churning history.
+pub(crate) fn stage_raw_mirror(
+    vault: &Path,
+    index: &mut git2::Index,
+    keys: Option<&DerivedKeys>,
+) -> WikiResult<()> {
+    let raw_root = crate::vault::layout::raw_dir(vault);
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    if raw_root.is_dir() {
+        collect_raw_files(&raw_root, &raw_root, &mut files)?;
+    }
+    // Deterministic order → byte-stable manifest → no spurious diffs.
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut desired: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut manifest = serde_json::Map::new();
+    for (rel, abs) in &files {
+        if std::fs::metadata(abs).map(|m| m.len() > MAX_RAW_SYNC_BYTES).unwrap_or(false) {
+            tracing::warn!(path = %abs.display(), "raw file exceeds the sync size limit — kept local only");
+            continue;
+        }
+        let bytes = std::fs::read(abs)?;
+        let (mirror_rel, blob) = match keys {
+            Some(keys) => {
+                let token = keys.filename_token(rel);
+                manifest.insert(token.clone(), serde_json::Value::String(rel.clone()));
+                (format!("{RAW_MIRROR_DIR}/{token}"), filter_clean(keys, &bytes))
+            }
+            None => (format!("{RAW_MIRROR_DIR}/{rel}"), bytes),
+        };
+        // Stat-zero entry (same as encrypted pages): the mirror has no
+        // worktree file, so git must never consult stat data for it.
+        index.add_frombuffer(&encrypted_index_entry(mirror_rel.clone().into_bytes()), &blob)?;
+        desired.insert(mirror_rel);
+    }
+    if let Some(keys) = keys {
+        if !manifest.is_empty() {
+            let json = serde_json::Value::Object(manifest).to_string();
+            index.add_frombuffer(
+                &encrypted_index_entry(RAW_MANIFEST_PATH.as_bytes().to_vec()),
+                &filter_clean(keys, json.as_bytes()),
+            )?;
+            desired.insert(RAW_MANIFEST_PATH.to_string());
+        }
+    }
+    // Reconcile: drop mirror entries whose source file is gone (covers
+    // local deletions and the encrypted↔plaintext naming switch).
+    let prefix = format!("{RAW_MIRROR_DIR}/");
+    let stale: Vec<String> = index
+        .iter()
+        .filter_map(|e| String::from_utf8(e.path).ok())
+        .filter(|p| p.starts_with(&prefix) && !desired.contains(p))
+        .collect();
+    for p in stale {
+        index.remove_path(Path::new(&p))?;
+    }
+    Ok(())
+}
+
+fn collect_raw_files(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<(String, PathBuf)>,
+) -> WikiResult<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_raw_files(root, &path, out)?;
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        // Forward-slash relpath; skip (rare) non-UTF-8 names rather than
+        // lossy-mangling them beyond restoration.
+        let mut parts: Vec<&str> = Vec::new();
+        let mut utf8 = true;
+        for c in rel.components() {
+            match c.as_os_str().to_str() {
+                Some(s) => parts.push(s),
+                None => {
+                    utf8 = false;
+                    break;
+                }
+            }
+        }
+        if !utf8 {
+            tracing::warn!(path = %path.display(), "skipping raw file with a non-UTF-8 name");
+            continue;
+        }
+        out.push((parts.join("/"), path));
+    }
+    Ok(())
+}
+
+/// Inverse of [`stage_raw_mirror`]: restore `<vault>/01_raw` from the raw
+/// mirror committed at HEAD, and delete any `raw/` copies a forced
+/// checkout dumped into the wiki working tree (the mirror is
+/// history-only). Additions and updates propagate; deletions do NOT —
+/// `01_raw` is append-only by design (see the vault templates), so a file
+/// deleted remotely simply stays here.
+pub(crate) fn materialise_raw_from_head_with_store(
+    wiki: &Path,
+    store: &impl MasterKeyStore,
+) -> WikiResult<()> {
+    // Never keep a worktree copy of the mirror, ciphertext or otherwise.
+    let _ = std::fs::remove_dir_all(wiki.join(RAW_MIRROR_DIR));
+
+    let repo = crate::wiki::git::init_repo(wiki)?;
+    let tree = match repo.head() {
+        Ok(head) => head.peel_to_tree()?,
+        Err(_) => return Ok(()), // empty repo
+    };
+    let raw_tree = match tree.get_path(Path::new(RAW_MIRROR_DIR)) {
+        Ok(entry) => match entry.to_object(&repo)?.into_tree() {
+            Ok(t) => t,
+            Err(_) => return Ok(()),
+        },
+        Err(_) => return Ok(()), // no mirror committed yet
+    };
+    let keys = resolve_keys(wiki, store)?;
+    let vault = wiki.parent().unwrap_or(wiki);
+    let raw_root = crate::vault::layout::raw_dir(vault);
+
+    match keys {
+        Some(keys) => {
+            // Encrypted mirror: flat tokens + manifest. Without a manifest
+            // (or for tokens missing from it) there is nothing to restore.
+            let Some(manifest_entry) = raw_tree.get_name(".manifest") else {
+                return Ok(());
+            };
+            let manifest_blob = repo.find_blob(manifest_entry.id())?;
+            let manifest_json = filter_smudge(&keys, manifest_blob.content())
+                .map_err(|e| WikiError::Encryption(format!("raw manifest: {e}")))?;
+            let manifest: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_slice(&manifest_json).map_err(|e| {
+                    WikiError::Encryption(format!("raw manifest is not valid JSON: {e}"))
+                })?;
+            for entry in raw_tree.iter() {
+                let Some(name) = entry.name() else { continue };
+                if name == ".manifest" {
+                    continue;
+                }
+                let Some(rel) = manifest.get(name).and_then(|v| v.as_str()) else {
+                    tracing::warn!(token = name, "raw mirror entry missing from the manifest — skipped");
+                    continue;
+                };
+                let Some(dest) = safe_raw_dest(&raw_root, rel) else {
+                    tracing::warn!(rel, "raw manifest path escapes 01_raw — skipped");
+                    continue;
+                };
+                let blob = repo.find_blob(entry.id())?;
+                let bytes = filter_smudge(&keys, blob.content())
+                    .map_err(|e| WikiError::Encryption(format!("raw {rel}: {e}")))?;
+                write_if_changed(&dest, &bytes)?;
+            }
+        }
+        None => {
+            // Plaintext mirror: nested clear paths, verbatim bytes.
+            let mut targets: Vec<(String, git2::Oid)> = Vec::new();
+            raw_tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+                if entry.kind() == Some(git2::ObjectType::Blob) {
+                    if let Some(name) = entry.name() {
+                        targets.push((format!("{root}{name}"), entry.id()));
+                    }
+                }
+                git2::TreeWalkResult::Ok
+            })?;
+            for (rel, oid) in targets {
+                let Some(dest) = safe_raw_dest(&raw_root, &rel) else {
+                    tracing::warn!(rel, "raw mirror path escapes 01_raw — skipped");
+                    continue;
+                };
+                let blob = repo.find_blob(oid)?;
+                write_if_changed(&dest, blob.content())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Repo-relative directory mirroring the SYNCED subset of `00_meta`:
+/// the agent-instruction files the user may customise. Same rules as the
+/// raw mirror — history-only, never in the wiki working tree.
+pub const META_MIRROR_DIR: &str = "meta";
+/// The fixed set of `00_meta` files that sync. Machine-specific meta
+/// files (marker, .mcp.json bearer token, settings-internal, log/index)
+/// deliberately stay local.
+pub const MIRRORED_META_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
+
+/// Mirror the synced `00_meta` files into the index under
+/// [`META_MIRROR_DIR`]. Encrypted vault: `meta/<HMAC("00_meta/<name>")>`
+/// with encrypted content — the set is FIXED, so unlike raw files no
+/// manifest is needed (the restore side recomputes the expected tokens).
+/// Plaintext vault: `meta/<name>` verbatim. A missing local file drops
+/// its mirror entry (reconcile), so template resets sync too.
+pub(crate) fn stage_meta_mirror(
+    vault: &Path,
+    index: &mut git2::Index,
+    keys: Option<&DerivedKeys>,
+) -> WikiResult<()> {
+    let meta_root = crate::vault::layout::meta_dir(vault);
+    let mut desired: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for name in MIRRORED_META_FILES {
+        let abs = meta_root.join(name);
+        if !abs.is_file() {
+            continue;
+        }
+        let bytes = std::fs::read(&abs)?;
+        let (mirror_rel, blob) = match keys {
+            Some(keys) => (
+                format!("{META_MIRROR_DIR}/{}", meta_mirror_token(keys, name)),
+                filter_clean(keys, &bytes),
+            ),
+            None => (format!("{META_MIRROR_DIR}/{name}"), bytes),
+        };
+        index.add_frombuffer(&encrypted_index_entry(mirror_rel.clone().into_bytes()), &blob)?;
+        desired.insert(mirror_rel);
+    }
+    let prefix = format!("{META_MIRROR_DIR}/");
+    let stale: Vec<String> = index
+        .iter()
+        .filter_map(|e| String::from_utf8(e.path).ok())
+        .filter(|p| p.starts_with(&prefix) && !desired.contains(p))
+        .collect();
+    for p in stale {
+        index.remove_path(Path::new(&p))?;
+    }
+    Ok(())
+}
+
+/// Opaque token for a mirrored meta file. Domain-prefixed with the meta
+/// dir so it can never collide with a raw file named `AGENTS.md`.
+fn meta_mirror_token(keys: &DerivedKeys, name: &str) -> String {
+    keys.filename_token(&format!("00_meta/{name}"))
+}
+
+/// Inverse of [`stage_meta_mirror`]: restore the synced `00_meta` files
+/// from HEAD and drop any worktree copies of the mirror. Only writes when
+/// bytes differ. A file missing from HEAD is left alone locally.
+pub(crate) fn materialise_meta_from_head_with_store(
+    wiki: &Path,
+    store: &impl MasterKeyStore,
+) -> WikiResult<()> {
+    let _ = std::fs::remove_dir_all(wiki.join(META_MIRROR_DIR));
+
+    let repo = crate::wiki::git::init_repo(wiki)?;
+    let tree = match repo.head() {
+        Ok(head) => head.peel_to_tree()?,
+        Err(_) => return Ok(()),
+    };
+    let Ok(meta_entry) = tree.get_path(Path::new(META_MIRROR_DIR)) else {
+        return Ok(()); // no meta mirror committed yet
+    };
+    let Ok(meta_tree) = meta_entry.to_object(&repo)?.into_tree() else {
+        return Ok(());
+    };
+    let keys = resolve_keys(wiki, store)?;
+    let vault = wiki.parent().unwrap_or(wiki);
+    let meta_root = crate::vault::layout::meta_dir(vault);
+
+    for name in MIRRORED_META_FILES {
+        let (lookup, decrypt) = match &keys {
+            Some(keys) => (meta_mirror_token(keys, name), true),
+            None => ((*name).to_string(), false),
+        };
+        let Some(entry) = meta_tree.get_name(&lookup) else {
+            continue;
+        };
+        let blob = repo.find_blob(entry.id())?;
+        let bytes = if decrypt {
+            filter_smudge(keys.as_ref().expect("keys present when decrypting"), blob.content())
+                .map_err(|e| WikiError::Encryption(format!("meta {name}: {e}")))?
+        } else {
+            blob.content().to_vec()
+        };
+        write_if_changed(&meta_root.join(name), &bytes)?;
+    }
+    Ok(())
+}
+
+/// Resolve a mirror-relative path under `01_raw`, refusing traversal
+/// (`..`) and absolute components — the mirror comes from a remote and is
+/// not implicitly trusted, AEAD or not.
+fn safe_raw_dest(raw_root: &Path, rel: &str) -> Option<PathBuf> {
+    let rel_path = Path::new(rel);
+    let ok = rel_path.components().all(|c| matches!(c, std::path::Component::Normal(_)));
+    if !ok || rel.is_empty() {
+        return None;
+    }
+    Some(raw_root.join(rel_path))
+}
+
+/// Write only when the on-disk bytes differ — keeps repeated
+/// materialisations from re-triggering the file watcher.
+fn write_if_changed(abs: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Ok(existing) = std::fs::read(abs) {
+        if existing == bytes {
+            return Ok(());
+        }
+    }
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(abs, bytes)
 }
 
 /// Rename every page file to its opaque path `<type>/<token>.md`, based
@@ -355,9 +773,10 @@ fn collect_page_renames(
 /// pages back to their plaintext `<id>.md` names, drops the canary and the
 /// brain-crypt filter config, and commits the now-plaintext tree. The
 /// master key is left in the keychain (dormant) so re-enabling reuses it
-/// and old encrypted history stays readable. Refuses while a network
-/// remote is attached — a plaintext push would leak content. No-op if the
-/// vault isn't encrypted.
+/// and old encrypted history stays readable. Enforces "no Git without
+/// encryption": any configured remote (and its stored PAT) is torn down
+/// first, so no later plaintext push can leak content. No-op if the vault
+/// isn't encrypted.
 pub fn disable_encryption(vault: &Path) -> WikiResult<()> {
     disable_encryption_with_store(vault, &KeyringStore)
 }
@@ -370,12 +789,11 @@ pub(crate) fn disable_encryption_with_store(
         return Ok(());
     }
     let wiki = wiki_dir(vault);
-    if crate::wiki::sync::has_network_remote(&wiki) {
-        return Err(WikiError::Encryption(
-            "remove the network remote before disabling encryption — otherwise the next \
-             push would send plaintext"
-                .to_string(),
-        ));
+    // Enforce "no Git without encryption" in reverse: tearing down
+    // encryption also tears down the remote (and its stored PAT), so a
+    // later push cannot leak plaintext. Done before the plaintext commit.
+    if crate::wiki::sync::remote_url(&wiki).is_some() {
+        crate::wiki::sync::disconnect(&wiki)?;
     }
     // 1. Opaque → plaintext filenames (from the frontmatter id).
     rename_pages_to_plaintext(&wiki)?;
@@ -559,6 +977,225 @@ mod tests {
             .unwrap()
             .get_bool("filter.brain-crypt.required")
             .unwrap());
+    }
+
+    #[test]
+    fn raw_files_are_mirrored_encrypted_with_opaque_names_and_manifest() {
+        // Attachments in 01_raw hold customer documents — a copy of the
+        // repo must reveal neither their names nor their contents.
+        let tmp = vault_with_repo();
+        let store = MemStore::default();
+        let key =
+            enable_encryption(tmp.path(), &store, &PathBuf::from("/opt/brain/brain")).unwrap();
+        let raw = crate::vault::layout::raw_dir(tmp.path());
+        std::fs::create_dir_all(raw.join("email/work")).unwrap();
+        std::fs::write(raw.join("email/work/kunde-a.eml"), b"vertraulicher Inhalt").unwrap();
+
+        commit_wiki_with_store(&wiki_dir(tmp.path()), "wiki: raw", &store).unwrap().unwrap();
+
+        let repo = git2::Repository::open(wiki_dir(tmp.path())).unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        let keys = key.derive();
+        let token = keys.filename_token("email/work/kunde-a.eml");
+        let entry = tree.get_path(Path::new(&format!("raw/{token}"))).unwrap();
+        let blob = repo.find_blob(entry.id()).unwrap();
+        assert!(looks_encrypted(blob.content()), "raw blob must be ciphertext");
+        assert!(
+            tree.get_path(Path::new("raw/email/work/kunde-a.eml")).is_err(),
+            "the clear attachment path must not appear in the tree"
+        );
+        // The manifest exists, is encrypted, and maps token → clear path.
+        let m = tree.get_path(Path::new("raw/.manifest")).unwrap();
+        let m_blob = repo.find_blob(m.id()).unwrap();
+        assert!(looks_encrypted(m_blob.content()), "manifest must be ciphertext");
+        let json = filter_smudge(&keys, m_blob.content()).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(v[&token], "email/work/kunde-a.eml");
+    }
+
+    #[test]
+    fn raw_files_are_mirrored_verbatim_in_a_plaintext_vault() {
+        let tmp = vault_with_repo();
+        let store = MemStore::default();
+        let raw = crate::vault::layout::raw_dir(tmp.path());
+        std::fs::create_dir_all(raw.join("docs")).unwrap();
+        std::fs::write(raw.join("docs/notiz.txt"), b"klartext").unwrap();
+
+        commit_wiki_with_store(&wiki_dir(tmp.path()), "wiki: raw", &store).unwrap().unwrap();
+
+        let repo = git2::Repository::open(wiki_dir(tmp.path())).unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        let entry = tree.get_path(Path::new("raw/docs/notiz.txt")).unwrap();
+        let blob = repo.find_blob(entry.id()).unwrap();
+        assert_eq!(blob.content(), b"klartext", "plaintext vault mirrors verbatim");
+    }
+
+    #[test]
+    fn deleting_a_raw_file_removes_its_mirror_entry_on_the_next_commit() {
+        let tmp = vault_with_repo();
+        let store = MemStore::default();
+        let key =
+            enable_encryption(tmp.path(), &store, &PathBuf::from("/opt/brain/brain")).unwrap();
+        let raw = crate::vault::layout::raw_dir(tmp.path());
+        std::fs::create_dir_all(&raw).unwrap();
+        std::fs::write(raw.join("old.bin"), b"bytes").unwrap();
+        let wiki = wiki_dir(tmp.path());
+        commit_wiki_with_store(&wiki, "add", &store).unwrap().unwrap();
+
+        std::fs::remove_file(raw.join("old.bin")).unwrap();
+        commit_wiki_with_store(&wiki, "del", &store).unwrap().unwrap();
+
+        let repo = git2::Repository::open(&wiki).unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        let token = key.derive().filename_token("old.bin");
+        assert!(
+            tree.get_path(Path::new(&format!("raw/{token}"))).is_err(),
+            "a locally deleted raw file must leave the mirror"
+        );
+        assert!(
+            tree.get_path(Path::new("raw/.manifest")).is_err(),
+            "an empty mirror carries no manifest"
+        );
+    }
+
+    #[test]
+    fn meta_files_are_mirrored_encrypted_without_clear_names() {
+        let tmp = vault_with_repo();
+        let store = MemStore::default();
+        let key =
+            enable_encryption(tmp.path(), &store, &PathBuf::from("/opt/brain/brain")).unwrap();
+        let meta = crate::vault::layout::meta_dir(tmp.path());
+        std::fs::write(meta.join("AGENTS.md"), b"# custom agent rules").unwrap();
+
+        commit_wiki_with_store(&wiki_dir(tmp.path()), "wiki: meta", &store).unwrap().unwrap();
+
+        let repo = git2::Repository::open(wiki_dir(tmp.path())).unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        let keys = key.derive();
+        let token = keys.filename_token("00_meta/AGENTS.md");
+        let entry = tree.get_path(Path::new(&format!("meta/{token}"))).unwrap();
+        let blob = repo.find_blob(entry.id()).unwrap();
+        assert!(looks_encrypted(blob.content()), "meta blob must be ciphertext");
+        assert_eq!(filter_smudge(&keys, blob.content()).unwrap(), b"# custom agent rules");
+        assert!(
+            tree.get_path(Path::new("meta/AGENTS.md")).is_err(),
+            "the clear meta filename must not appear in an encrypted tree"
+        );
+    }
+
+    #[test]
+    fn converting_a_vault_with_plaintext_mirrors_succeeds_and_retokens_them() {
+        // Regression: the pre-convert PLAINTEXT history mirrors raw/meta
+        // files at clear `.md` paths (e.g. raw/notes/foo.md). The convert
+        // loads that index; encrypt_md_index_entries must skip mirror
+        // paths (no working-tree file to read) instead of failing, and
+        // the re-staged mirrors must come out token-named.
+        let tmp = vault_with_repo();
+        let store = MemStore::default();
+        let raw = crate::vault::layout::raw_dir(tmp.path());
+        std::fs::create_dir_all(raw.join("notes")).unwrap();
+        std::fs::write(raw.join("notes/plan.md"), b"raw markdown file").unwrap();
+        let meta = crate::vault::layout::meta_dir(tmp.path());
+        std::fs::write(meta.join("AGENTS.md"), b"rules").unwrap();
+        let wiki = wiki_dir(tmp.path());
+        // Plaintext era commit — mirrors land at clear .md paths.
+        commit_wiki_with_store(&wiki, "plaintext era", &store).unwrap().unwrap();
+
+        let key =
+            enable_encryption(tmp.path(), &store, &PathBuf::from("/opt/brain/brain")).unwrap();
+        commit_encrypted_snapshot_as_new_root_with_store(&wiki, "encrypt: convert", &store)
+            .unwrap()
+            .unwrap();
+
+        let repo = git2::Repository::open(&wiki).unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        assert!(tree.get_path(Path::new("raw/notes/plan.md")).is_err(), "clear raw path gone");
+        assert!(tree.get_path(Path::new("meta/AGENTS.md")).is_err(), "clear meta path gone");
+        let keys = key.derive();
+        let raw_token = keys.filename_token("notes/plan.md");
+        assert!(tree.get_path(Path::new(&format!("raw/{raw_token}"))).is_ok());
+        let meta_token = keys.filename_token("00_meta/AGENTS.md");
+        assert!(tree.get_path(Path::new(&format!("meta/{meta_token}"))).is_ok());
+    }
+
+    #[test]
+    fn converting_reroots_history_so_the_plaintext_past_is_not_pushable() {
+        // Before the convert the git history holds plaintext blobs at
+        // human-named paths. A normal convert commit would keep that
+        // history reachable — and the FIRST PUSH WOULD PUBLISH IT. The
+        // convert must instead re-root: HEAD becomes a single encrypted
+        // commit, and the old history survives only on a local backup ref.
+        let tmp = vault_with_repo();
+        let store = MemStore::default();
+        let wiki = wiki_dir(tmp.path());
+        let page = "---\nid: entities/geheim\ntype: entity\ntitle: Geheim\n---\n\nKlartext.\n";
+        std::fs::create_dir_all(wiki.join("entities")).unwrap();
+        std::fs::write(wiki.join("entities/geheim.md"), page).unwrap();
+        commit_wiki_with_store(&wiki, "wiki: plaintext era", &store).unwrap().unwrap();
+        assert!(crate::wiki::git::commit_count(&wiki).unwrap() >= 1);
+
+        let key =
+            enable_encryption(tmp.path(), &store, &PathBuf::from("/opt/brain/brain")).unwrap();
+        commit_encrypted_snapshot_as_new_root_with_store(&wiki, "encrypt: convert", &store)
+            .unwrap()
+            .unwrap();
+
+        // HEAD is a fresh root: exactly one commit, nothing plaintext
+        // reachable from it.
+        assert_eq!(crate::wiki::git::commit_count(&wiki).unwrap(), 1);
+        let repo = git2::Repository::open(&wiki).unwrap();
+        let head_tree = repo.head().unwrap().peel_to_tree().unwrap();
+        assert!(
+            head_tree.get_path(Path::new("entities/geheim.md")).is_err(),
+            "the human-named path must be gone from the pushable history"
+        );
+        let token = key.derive().filename_token("entities/geheim");
+        let entry = head_tree.get_path(Path::new(&format!("entities/{token}.md"))).unwrap();
+        let blob = repo.find_blob(entry.id()).unwrap();
+        assert!(looks_encrypted(blob.content()), "the committed blob must be ciphertext");
+
+        // The plaintext era still exists, but only on the local backup ref.
+        let backup = repo.find_reference(PRE_ENCRYPTION_BACKUP_REF).unwrap();
+        let backup_tree = backup.peel_to_tree().unwrap();
+        assert!(
+            backup_tree.get_path(Path::new("entities/geheim.md")).is_ok(),
+            "the backup ref preserves the pre-encryption history"
+        );
+    }
+
+    #[test]
+    fn enable_encryption_with_key_uses_the_provided_key() {
+        let tmp = vault_with_repo();
+        let store = MemStore::default();
+        let exe = PathBuf::from("/opt/brain/brain");
+        let provided = MasterKey::from_bytes([42u8; 32]);
+
+        let key = enable_encryption_with_key(tmp.path(), &store, &exe, &provided.to_hex()).unwrap();
+
+        // The vault is encrypted with exactly the key we handed in — this
+        // is what lets a second machine join an existing vault and merge.
+        assert_eq!(key.to_hex(), provided.to_hex());
+        let account = keychain::vault_account(tmp.path()).unwrap();
+        let loaded = keychain::load_master_key(&store, &account).unwrap().unwrap();
+        assert_eq!(loaded.to_hex(), provided.to_hex());
+        assert!(is_encrypted(tmp.path()));
+        assert!(gitfilter::canary_matches(&wiki_dir(tmp.path()), &provided.derive()));
+    }
+
+    #[test]
+    fn enable_encryption_with_key_rejects_a_malformed_key() {
+        let tmp = vault_with_repo();
+        let store = MemStore::default();
+        let exe = PathBuf::from("/opt/brain/brain");
+        // `MasterKey` has no `Debug` (secrets don't get logged), so match
+        // instead of `unwrap_err`.
+        let err = match enable_encryption_with_key(tmp.path(), &store, &exe, "not-a-valid-key") {
+            Ok(_) => panic!("a malformed recovery key must be rejected"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:#}").contains("64 hex"), "clear error: {err:#}");
+        // Nothing was written — the vault stays plaintext.
+        assert!(!is_encrypted(tmp.path()));
     }
 
     #[test]
