@@ -152,11 +152,22 @@ mod tests {
         tmp.path()
     }
 
+    /// AppState whose config file lives inside the test's own TempDir —
+    /// never the machine's real settings.json. `AppState::new()` loads
+    /// (and `config.update` PERSISTS to) the real dev config: tests here
+    /// used to write their TempDir vault paths into it, making the app
+    /// "forget" the user's vault on every launch after a test run.
+    fn isolated_state(tmp: &TempDir) -> AppState {
+        AppState::with_config(crate::config::ConfigStore::load_from(
+            tmp.path().join("test-settings.json"),
+        ))
+    }
+
     #[test]
     fn mount_source_refuses_paths_without_a_vault_marker() {
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
-        let state = AppState::new();
+        let state = isolated_state(&tmp);
         let err = mount_source(&state, tmp.path()).unwrap_err();
         assert!(matches!(err, MountError::Vault(_)));
         assert_eq!(state.mount(), MountState::Disconnected);
@@ -166,7 +177,7 @@ mod tests {
     fn mount_source_succeeds_when_marker_is_present_and_sets_state_idle() {
         let tmp = TempDir::new().unwrap();
         let path = prepare_vault(&tmp);
-        let state = AppState::new();
+        let state = isolated_state(&tmp);
         mount_source(&state, path).unwrap();
         assert_eq!(state.mount(), MountState::MountedIdle);
         assert_eq!(state.vault_path().as_deref(), Some(path));
@@ -176,7 +187,7 @@ mod tests {
     fn unmount_clears_state_and_removes_unclean_flag_on_clean_path() {
         let tmp = TempDir::new().unwrap();
         let path = prepare_vault(&tmp);
-        let state = AppState::new();
+        let state = isolated_state(&tmp);
         mount_source(&state, path).unwrap();
         UncleanFlag::set(path).unwrap();
         unmount(&state, false).unwrap();
@@ -188,7 +199,7 @@ mod tests {
     fn unmount_force_with_active_ops_sets_unclean_flag() {
         let tmp = TempDir::new().unwrap();
         let path = prepare_vault(&tmp);
-        let state = AppState::new();
+        let state = isolated_state(&tmp);
         mount_source(&state, path).unwrap();
         state.begin_op("test");
         unmount(&state, true).unwrap();
@@ -199,7 +210,7 @@ mod tests {
     fn unmount_without_force_refuses_when_ops_are_active() {
         let tmp = TempDir::new().unwrap();
         let path = prepare_vault(&tmp);
-        let state = AppState::new();
+        let state = isolated_state(&tmp);
         mount_source(&state, path).unwrap();
         state.begin_op("test");
         let err = unmount(&state, false).unwrap_err();
@@ -209,7 +220,8 @@ mod tests {
 
     #[test]
     fn unmount_when_not_mounted_returns_not_mounted_error() {
-        let state = AppState::new();
+        let tmp = TempDir::new().unwrap();
+        let state = isolated_state(&tmp);
         let err = unmount(&state, false).unwrap_err();
         assert!(matches!(err, MountError::NotMounted));
     }
@@ -218,7 +230,7 @@ mod tests {
     fn handle_vault_disappearance_returns_false_when_vault_still_present() {
         let tmp = TempDir::new().unwrap();
         let path = prepare_vault(&tmp);
-        let state = AppState::new();
+        let state = isolated_state(&tmp);
         mount_source(&state, path).unwrap();
         // Disk still there → no transition, nothing to do.
         assert!(!handle_vault_disappearance(&state));
@@ -233,7 +245,7 @@ mod tests {
         // detect the divergence and reset the in-memory state.
         let tmp = TempDir::new().unwrap();
         let path = prepare_vault(&tmp);
-        let state = AppState::new();
+        let state = isolated_state(&tmp);
         mount_source(&state, path).unwrap();
         // Delete the marker — same end-state as a yanked drive from
         // the perspective of `is_vault`.
@@ -249,7 +261,8 @@ mod tests {
 
     #[test]
     fn handle_vault_disappearance_returns_false_when_no_vault_was_mounted() {
-        let state = AppState::new();
+        let tmp = TempDir::new().unwrap();
+        let state = isolated_state(&tmp);
         assert!(!handle_vault_disappearance(&state));
     }
 
@@ -257,7 +270,7 @@ mod tests {
     fn try_auto_reconnect_remounts_when_disk_reappears_with_remembered_path() {
         let tmp = TempDir::new().unwrap();
         let path = prepare_vault(&tmp);
-        let state = AppState::new();
+        let state = isolated_state(&tmp);
         // Simulate prior session: vault was mounted, the persisted
         // config remembered the path, then the disk vanished.
         let _ = state.config.update(|s| {
@@ -280,7 +293,7 @@ mod tests {
     fn try_auto_reconnect_does_nothing_when_state_is_already_mounted() {
         let tmp = TempDir::new().unwrap();
         let path = prepare_vault(&tmp);
-        let state = AppState::new();
+        let state = isolated_state(&tmp);
         mount_source(&state, path).unwrap();
         // Already mounted → must not double-mount.
         assert!(try_auto_reconnect(&state).is_none());
@@ -290,7 +303,7 @@ mod tests {
     fn try_auto_reconnect_does_nothing_when_remembered_path_is_not_a_vault() {
         let tmp = TempDir::new().unwrap();
         // Remember a path that doesn't have a marker file.
-        let state = AppState::new();
+        let state = isolated_state(&tmp);
         let _ = state.config.update(|s| {
             s.last_active_vault_path = Some(tmp.path().to_path_buf());
         });
@@ -301,7 +314,8 @@ mod tests {
 
     #[test]
     fn try_auto_reconnect_does_nothing_when_no_remembered_path() {
-        let state = AppState::new();
+        let tmp = TempDir::new().unwrap();
+        let state = isolated_state(&tmp);
         state.set_mount(MountState::Disconnected);
         assert!(try_auto_reconnect(&state).is_none());
     }

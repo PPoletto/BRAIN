@@ -53,7 +53,15 @@ pub struct ConfigStore {
 
 impl ConfigStore {
     pub fn new() -> Self {
-        let path = config_path();
+        Self::load_from(config_path())
+    }
+
+    /// A store rooted at an explicit file path. Tests use this with a
+    /// TempDir file so they never read — or, via [`Self::update`], WRITE —
+    /// the developer's real settings.json. (Exactly that happened once:
+    /// test runs persisted their TempDir vault paths into the real dev
+    /// config, which then made the app "forget" the vault every launch.)
+    pub fn load_from(path: PathBuf) -> Self {
         let settings = path
             .parent()
             .and_then(|dir| {

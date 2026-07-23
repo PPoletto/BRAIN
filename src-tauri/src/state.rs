@@ -49,12 +49,24 @@ pub struct AppState {
     /// The running auto-sync scheduler (S11 phase 6), if enabled. Kept so
     /// it can be aborted on unmount or when auto-sync is toggled off.
     auto_sync_task: RwLock<Option<AutoSyncHandle>>,
+    /// Wakes the auto-sync scheduler early. The watcher nudges this after
+    /// every successful auto-commit so local edits reach the remote within
+    /// seconds instead of waiting out the polling interval (which remains
+    /// the fallback that PULLS remote changes).
+    sync_nudge: tokio::sync::Notify,
 }
 
 impl AppState {
     pub fn new() -> Self {
+        Self::with_config(ConfigStore::new())
+    }
+
+    /// [`AppState`] with an injected config store. Tests pass one rooted
+    /// in a TempDir (via [`ConfigStore::load_from`]) so their config
+    /// reads/writes never touch the machine's real settings.json.
+    pub fn with_config(config: ConfigStore) -> Self {
         Self {
-            config: ConfigStore::new(),
+            config,
             mount: RwLock::new(MountState::Disconnected),
             vault_path: RwLock::new(None),
             db: RwLock::new(None),
@@ -63,7 +75,19 @@ impl AppState {
             ops: RwLock::new(Vec::new()),
             watcher: RwLock::new(None),
             auto_sync_task: RwLock::new(None),
+            sync_nudge: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Wake the auto-sync scheduler now (called by the watcher after a
+    /// successful auto-commit). No-op when no scheduler is waiting.
+    pub fn nudge_sync(&self) {
+        self.sync_nudge.notify_one();
+    }
+
+    /// The notifier the auto-sync scheduler waits on between ticks.
+    pub fn sync_nudge(&self) -> &tokio::sync::Notify {
+        &self.sync_nudge
     }
 
     /// Store the running auto-sync scheduler, aborting any previous one.
