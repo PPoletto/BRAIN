@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
@@ -6,6 +6,7 @@ import {
   type ClientStatus,
   type McpCommandHint,
   type RegistrationReport,
+  type RemoteStatus,
 } from "../../lib/commands";
 import { Tabs } from "../../components/ui/Tabs";
 import { Button } from "../../components/ui/Button";
@@ -20,6 +21,7 @@ const TABS = [
   { id: "general", label: "General" },
   { id: "mcp", label: "MCP & Clients" },
   { id: "memory", label: "Memory mode" },
+  { id: "git", label: "Git sync" },
   { id: "danger", label: "Danger zone" },
 ];
 
@@ -221,6 +223,7 @@ export function Settings() {
             />
           )}
           {active === "memory" && <MemoryTab prompt={memoryPrompt} copy={copy} />}
+          {active === "git" && <GitSyncTab />}
           {active === "danger" && (
             <DangerTab
               onReset={resetBrain}
@@ -367,6 +370,189 @@ function RebuildIndexCard() {
         </Button>
       </CardHeader>
     </Card>
+  );
+}
+
+const INPUT_CLASS =
+  "h-9 flex-1 rounded-md border border-neutral-800 bg-neutral-900 px-3 text-sm placeholder:text-neutral-600 focus:border-emerald-700 focus:outline-none";
+
+function GitSyncTab() {
+  const { push } = useToast();
+  const [status, setStatus] = useState<RemoteStatus | null>(null);
+  const [url, setUrl] = useState("");
+  const [pat, setPat] = useState("");
+  const [conflicts, setConflicts] = useState<string[]>([]);
+
+  const refreshStatus = useCallback(async () => {
+    try {
+      const s = await commands.gitRemoteStatus();
+      setStatus(s);
+      setUrl((prev) => (prev.length === 0 ? (s.remote_url ?? "") : prev));
+    } catch {
+      // No vault mounted / not a git repo yet — leave the panel empty.
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshStatus();
+  }, [refreshStatus]);
+
+  const saveRemote = useAsyncAction(
+    async () => {
+      await commands.setGitRemote(url.trim());
+      await refreshStatus();
+    },
+    { pending: "Saving remote…", success: "Remote saved", errorPrefix: "Could not save remote" },
+  );
+
+  const saveCred = useAsyncAction(
+    async () => {
+      await commands.setGitCredential(pat);
+      setPat("");
+      await refreshStatus();
+    },
+    {
+      pending: "Storing token…",
+      success: "Access token stored in the OS keychain",
+      errorPrefix: "Could not store token",
+    },
+  );
+
+  const syncAction = useAsyncAction(
+    async () => {
+      const report = await commands.syncNow();
+      setConflicts(report.conflicted_pages);
+      const label =
+        report.outcome === "up-to-date"
+          ? "Already up to date"
+          : report.outcome === "fast-forward"
+            ? "Pulled latest changes"
+            : "Merged remote changes";
+      if (report.conflicted_pages.length > 0) {
+        push({
+          kind: "warning",
+          message: `${label} — ${report.conflicted_pages.length} page(s) need conflict resolution`,
+          detail: report.conflicted_pages.join(", "),
+        });
+      } else {
+        push({ kind: "success", message: label });
+      }
+    },
+    { pending: "Syncing…", errorPrefix: "Sync failed" },
+  );
+
+  return (
+    <div className="space-y-6">
+      {status && !status.encrypted && (
+        <ErrorBanner tone="warning">
+          This vault is not encrypted yet. Enable content encryption with{" "}
+          <code className="font-mono">brain convert</code> before attaching a
+          network remote — pushing an unencrypted vault to a hosting service is
+          refused.
+        </ErrorBanner>
+      )}
+
+      <Card>
+        <CardHeader>
+          <div>
+            <CardTitle>Remote repository</CardTitle>
+            <CardDescription>
+              The Git remote (e.g. a private GitHub repo) BRAIN pushes to and
+              pulls from. A network remote requires an encrypted vault.
+            </CardDescription>
+          </div>
+        </CardHeader>
+        <div className="mt-3 flex gap-2">
+          <input
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder="https://github.com/you/brain.git"
+            className={INPUT_CLASS}
+          />
+          <Button
+            variant="secondary"
+            size="sm"
+            loading={saveRemote.loading}
+            onClick={() => void saveRemote.trigger()}
+          >
+            Save remote
+          </Button>
+        </div>
+        {status?.remote_url && (
+          <p className="mt-2 text-xs text-neutral-500">
+            Current: <code className="font-mono">{status.remote_url}</code>
+          </p>
+        )}
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <div>
+            <CardTitle>Access token</CardTitle>
+            <CardDescription>
+              A personal access token for the remote, stored only in your OS
+              keychain — never in the repo.{" "}
+              {status?.has_credential
+                ? "A token is currently stored on this machine."
+                : "No token stored on this machine yet."}
+            </CardDescription>
+          </div>
+        </CardHeader>
+        <div className="mt-3 flex gap-2">
+          <input
+            type="password"
+            value={pat}
+            onChange={(e) => setPat(e.target.value)}
+            placeholder="Personal access token"
+            className={INPUT_CLASS}
+          />
+          <Button
+            variant="secondary"
+            size="sm"
+            loading={saveCred.loading}
+            disabled={pat.length === 0}
+            onClick={() => void saveCred.trigger()}
+          >
+            Store token
+          </Button>
+        </div>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <div>
+            <CardTitle>Sync now</CardTitle>
+            <CardDescription>
+              Fetch, merge, and push. Edits to different pages merge
+              automatically; a page changed on two machines gets conflict
+              markers you resolve in the editor, then sync again.
+            </CardDescription>
+          </div>
+          <Button
+            variant="primary"
+            size="sm"
+            loading={syncAction.loading}
+            onClick={() => void syncAction.trigger()}
+          >
+            {syncAction.loading ? "Syncing…" : "Sync now"}
+          </Button>
+        </CardHeader>
+        {conflicts.length > 0 && (
+          <div className="mt-3">
+            <ErrorBanner tone="warning">
+              These pages have conflict markers to resolve, then sync again:
+              <ul className="ml-4 mt-1 list-disc">
+                {conflicts.map((p) => (
+                  <li key={p}>
+                    <code className="font-mono">{p}</code>
+                  </li>
+                ))}
+              </ul>
+            </ErrorBanner>
+          </div>
+        )}
+      </Card>
+    </div>
   );
 }
 

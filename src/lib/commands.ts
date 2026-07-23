@@ -64,6 +64,18 @@ export type RegistrationReport = {
   // status meant we wrote a file ChatGPT never reads.
 };
 
+export type RemoteStatus = {
+  encrypted: boolean;
+  remote_url: string | null;
+  has_credential: boolean;
+};
+
+export type SyncReport = {
+  outcome: "up-to-date" | "fast-forward" | "merged";
+  conflicted_pages: string[];
+  reindexed: boolean;
+};
+
 export const commands = {
   listDisks: () => invoke<DiskInfo[]>("list_disks"),
   formatDisk: (diskId: string) => invoke<FormatDiskResult>("format_disk", { diskId }),
@@ -185,4 +197,10 @@ export const commands = {
     invoke<{ available: boolean; version: string | null; notes: string | null }>("check_update"),
   applyUpdate: () => invoke<void>("apply_update"),
   skipUpdate: (version: string) => invoke<void>("skip_update", { version }),
+
+  // Remote sync (S11 phase 6)
+  gitRemoteStatus: () => invoke<RemoteStatus>("git_remote_status"),
+  setGitRemote: (url: string) => invoke<void>("set_git_remote", { url }),
+  setGitCredential: (pat: string) => invoke<void>("set_git_credential", { pat }),
+  syncNow: () => invoke<SyncReport>("sync_now"),
 };

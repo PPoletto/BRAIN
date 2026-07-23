@@ -305,6 +305,11 @@ pub fn run() {
             wiki::commands::wiki_commit_detail,
             wiki::commands::wiki_restore_page,
             wiki::commands::wiki_hard_reset,
+            // Sync (S11 phase 6)
+            wiki::commands::git_remote_status,
+            wiki::commands::set_git_remote,
+            wiki::commands::set_git_credential,
+            wiki::commands::sync_now,
             // Update (S04)
             update::commands::check_update,
             update::commands::apply_update,

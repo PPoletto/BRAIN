@@ -82,6 +82,23 @@ pub fn set_remote_credential(wiki: &Path, pat: &str) -> WikiResult<()> {
     keychain::store_git_pat(&account, pat).map_err(|e| WikiError::Encryption(e.to_string()))
 }
 
+/// The configured sync remote URL, if any.
+pub fn remote_url(wiki: &Path) -> Option<String> {
+    let repo = init_repo(wiki).ok()?;
+    repo.find_remote(DEFAULT_REMOTE)
+        .ok()?
+        .url()
+        .map(str::to_string)
+}
+
+/// Whether a remote credential (PAT) is stored for this vault.
+pub fn has_credential(wiki: &Path) -> bool {
+    account_for(wiki)
+        .ok()
+        .and_then(|a| keychain::load_git_pat(&a).ok().flatten())
+        .is_some()
+}
+
 fn account_for(wiki: &Path) -> WikiResult<String> {
     let vault = wiki.parent().unwrap_or(wiki);
     keychain::vault_account(vault).map_err(|e| WikiError::Encryption(e.to_string()))
