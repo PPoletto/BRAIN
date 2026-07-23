@@ -79,9 +79,12 @@ pub fn set_remote(wiki: &Path, url: &str) -> WikiResult<()> {
 }
 
 /// Store the git remote credential (PAT) for this vault in the keychain.
+/// Trims surrounding whitespace — a PAT pasted from a browser often picks
+/// up a trailing newline/space, which would otherwise make every auth
+/// attempt fail.
 pub fn set_remote_credential(wiki: &Path, pat: &str) -> WikiResult<()> {
     let account = account_for(wiki)?;
-    keychain::store_git_pat(&account, pat).map_err(|e| WikiError::Encryption(e.to_string()))
+    keychain::store_git_pat(&account, pat.trim()).map_err(|e| WikiError::Encryption(e.to_string()))
 }
 
 /// The configured sync remote URL, if any.
