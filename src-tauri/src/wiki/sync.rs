@@ -106,46 +106,48 @@ fn account_for(wiki: &Path) -> WikiResult<String> {
     keychain::vault_account(vault).map_err(|e| WikiError::Encryption(e.to_string()))
 }
 
-/// Remote callbacks that supply the vault's PAT for user/pass auth (HTTPS)
-/// and fall back to the default credential for local transports.
-fn remote_callbacks<'a>(account: Option<String>) -> git2::RemoteCallbacks<'a> {
+/// Build remote callbacks that authenticate with `pat` (if present).
+///
+/// Sends the credential at most ONCE per connection. If the server
+/// rejects it, libgit2 calls back for credentials again; returning the
+/// same one spins into git2's opaque "too many authentication replays"
+/// error, so the retry fails with a clear message instead. A missing PAT
+/// on an authenticating remote also fails fast (rather than falling
+/// through to `Cred::default()`, which on HTTPS just triggers the same
+/// reject/replay loop).
+fn credentials_callbacks<'a>(pat: Option<String>) -> git2::RemoteCallbacks<'a> {
     let mut cb = git2::RemoteCallbacks::new();
+    let mut sent = false;
     cb.credentials(move |_url, username_from_url, allowed| {
         if allowed.contains(git2::CredentialType::USER_PASS_PLAINTEXT) {
-            if let Some(acct) = &account {
-                if let Ok(Some(pat)) = keychain::load_git_pat(acct) {
-                    let user = username_from_url.unwrap_or("x-access-token");
-                    return git2::Cred::userpass_plaintext(user, &pat);
-                }
+            let Some(pat) = pat.as_deref() else {
+                return Err(git2::Error::from_str(
+                    "this remote needs an access token — add one in Settings → Git sync",
+                ));
+            };
+            if sent {
+                return Err(git2::Error::from_str(
+                    "authentication failed — check the access token and that it has \
+                     push access to this repository",
+                ));
             }
+            sent = true;
+            // GitHub authenticates on the PAT (the password); the username
+            // is a conventional placeholder when the URL carries none.
+            return git2::Cred::userpass_plaintext(username_from_url.unwrap_or("x-access-token"), pat);
         }
         if allowed.contains(git2::CredentialType::DEFAULT) {
             return git2::Cred::default();
         }
-        Err(git2::Error::from_str(
-            "no credential available for this remote (set a PAT)",
-        ))
+        Err(git2::Error::from_str("no supported authentication method for this remote"))
     });
     cb
 }
 
-/// Remote callbacks that supply an explicitly-provided PAT (used during
-/// clone, before any credential is stored in the keychain).
-fn callbacks_with_pat<'a>(pat: Option<String>) -> git2::RemoteCallbacks<'a> {
-    let mut cb = git2::RemoteCallbacks::new();
-    cb.credentials(move |_url, username_from_url, allowed| {
-        if allowed.contains(git2::CredentialType::USER_PASS_PLAINTEXT) {
-            if let Some(pat) = &pat {
-                let user = username_from_url.unwrap_or("x-access-token");
-                return git2::Cred::userpass_plaintext(user, pat);
-            }
-        }
-        if allowed.contains(git2::CredentialType::DEFAULT) {
-            return git2::Cred::default();
-        }
-        Err(git2::Error::from_str("no credential available for this remote"))
-    });
-    cb
+/// Callbacks that pull the PAT from the keychain for `account` (fetch/push).
+fn remote_callbacks<'a>(account: Option<String>) -> git2::RemoteCallbacks<'a> {
+    let pat = account.and_then(|a| keychain::load_git_pat(&a).ok().flatten());
+    credentials_callbacks(pat)
 }
 
 /// Clone an encrypted BRAIN wiki repo into `<vault>/02_wiki` and prepare
@@ -174,7 +176,7 @@ pub fn clone_and_prepare(
 
     // Clone (working tree is ciphertext — no filter configured yet).
     let mut fo = git2::FetchOptions::new();
-    fo.remote_callbacks(callbacks_with_pat(pat.map(str::to_string)));
+    fo.remote_callbacks(credentials_callbacks(pat.map(str::to_string)));
     let mut builder = git2::build::RepoBuilder::new();
     builder.fetch_options(fo);
     builder.remote_create(|repo, _name, url| repo.remote(DEFAULT_REMOTE, url));

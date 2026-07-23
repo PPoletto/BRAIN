@@ -517,10 +517,8 @@ function GitSyncTab() {
             <CardTitle>Access token</CardTitle>
             <CardDescription>
               A personal access token for the remote, stored only in your OS
-              keychain — never in the repo.{" "}
-              {status?.has_credential
-                ? "A token is currently stored on this machine."
-                : "No token stored on this machine yet."}
+              keychain — never in the repo. It needs <strong>push access</strong>{" "}
+              to the repository.
             </CardDescription>
           </div>
         </CardHeader>
@@ -542,6 +540,13 @@ function GitSyncTab() {
             Store token
           </Button>
         </div>
+        <p className="mt-2 text-xs">
+          {status?.has_credential ? (
+            <span className="text-emerald-400">✓ A token is stored on this machine.</span>
+          ) : (
+            <span className="text-neutral-500">No token stored yet.</span>
+          )}
+        </p>
       </Card>
 
       <Card>
@@ -596,6 +601,21 @@ function GitSyncTab() {
         <pre className="mt-2 select-all overflow-x-auto rounded-md border border-neutral-800 bg-neutral-900 p-3 font-mono text-sm">
           {recoveryKey}
         </pre>
+        <div className="mt-2 flex items-center gap-2">
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => {
+              if (recoveryKey) {
+                void navigator.clipboard.writeText(recoveryKey);
+                push({ kind: "success", message: "Recovery key copied to clipboard" });
+              }
+            }}
+          >
+            Copy key
+          </Button>
+          <span className="text-xs text-neutral-500">then paste it into your password manager</span>
+        </div>
       </ConfirmDialog>
     </div>
   );
