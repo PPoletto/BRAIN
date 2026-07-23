@@ -38,6 +38,25 @@ export async function onWikiLintReport(
   );
 }
 
+/// Conflicts surfaced by the background auto-sync: repo-relative paths of
+/// pages that now carry conflict markers. A manual "Sync now" reports
+/// these in its own result — this event covers syncs the user didn't
+/// trigger.
+export async function onSyncConflicts(
+  handler: (pages: string[]) => void,
+): Promise<UnlistenFn> {
+  return listen<string[]>("sync-conflicts", (event) => handler(event.payload));
+}
+
+/// Permanent background-sync failures (e.g. the remote is encrypted with
+/// a different key). Transient failures (offline, auth hiccup) retry
+/// silently and never fire this.
+export async function onSyncError(
+  handler: (message: string) => void,
+): Promise<UnlistenFn> {
+  return listen<string>("sync-error", (event) => handler(event.payload));
+}
+
 /// Auto-refresh hook for any view that displays data derived from the
 /// vault. Subscribes to two backend events and re-invokes `refetch`:
 ///

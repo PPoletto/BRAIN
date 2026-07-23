@@ -209,8 +209,26 @@ export const commands = {
   setGitRemote: (url: string) => invoke<void>("set_git_remote", { url }),
   setGitCredential: (pat: string) => invoke<void>("set_git_credential", { pat }),
   syncNow: () => invoke<SyncReport>("sync_now"),
-  enableVaultEncryption: () =>
-    invoke<{ recovery_key: string }>("enable_vault_encryption"),
+  // Enable encryption. Omit recoveryKey to generate a fresh key; pass an
+  // existing 64-hex key to join a vault that already lives on a remote
+  // (second-PC / Variant-2 merge) — it must be the SAME key.
+  enableVaultEncryption: (recoveryKey?: string | null) =>
+    invoke<{ recovery_key: string }>("enable_vault_encryption", {
+      recoveryKey: recoveryKey ?? null,
+    }),
   disableVaultEncryption: () => invoke<void>("disable_vault_encryption"),
   setAutoSync: (enabled: boolean) => invoke<void>("set_auto_sync", { enabled }),
+  // Disconnect from the remote (remove remote + PAT, stop auto-sync);
+  // keeps encryption on. "No Git without encryption" also tears the
+  // remote down automatically when encryption is disabled.
+  disconnectGitRemote: () => invoke<void>("disconnect_git_remote"),
+  // Early key check (fetch + canary vs local key — the same gate every
+  // merge enforces). "verified" = same key; "empty" = remote has no
+  // branches yet, the first sync will publish this vault.
+  verifyGitRemote: () =>
+    invoke<{ status: "verified" | "empty" }>("verify_git_remote"),
+  // Re-display the recovery key from the OS keychain (needed to join
+  // this vault from a second machine).
+  revealRecoveryKey: () =>
+    invoke<{ recovery_key: string }>("reveal_recovery_key"),
 };

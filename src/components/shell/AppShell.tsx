@@ -6,7 +6,13 @@ import { StatusBar } from "./StatusBar";
 import { DefaultShortcuts } from "../ui/KeyboardShortcuts";
 import { BackendToastsBridge } from "../ui/Toast";
 import { useToast } from "../ui/toast-context";
-import { onMountState, onWikiChanged, onWikiLintReport } from "../../lib/events";
+import {
+  onMountState,
+  onSyncConflicts,
+  onSyncError,
+  onWikiChanged,
+  onWikiLintReport,
+} from "../../lib/events";
 import { commands } from "../../lib/commands";
 import { useAppState } from "../../lib/state";
 import { useWikiHistoryStore } from "../../lib/wikiHistoryStore";
@@ -60,6 +66,33 @@ export function AppShell() {
     });
     return () => {
       unlisten?.();
+    };
+  }, [push]);
+
+  // Background auto-sync outcomes. The scheduler runs whether or not the
+  // Git-sync tab is open, so its conflicts and permanent errors (e.g.
+  // "remote is keyed differently") surface here as global toasts instead
+  // of dying in the log.
+  useEffect(() => {
+    let unlistenConflicts: (() => void) | undefined;
+    let unlistenError: (() => void) | undefined;
+    onSyncConflicts((pages) => {
+      push({
+        kind: "warning",
+        message: `Auto-sync merged with ${pages.length} conflict${pages.length === 1 ? "" : "s"}`,
+        detail: `Resolve the markers, then sync again: ${pages.join(", ")}`,
+      });
+    }).then((u) => {
+      unlistenConflicts = u;
+    });
+    onSyncError((message) => {
+      push({ kind: "error", message: "Auto-sync failed", detail: message });
+    }).then((u) => {
+      unlistenError = u;
+    });
+    return () => {
+      unlistenConflicts?.();
+      unlistenError?.();
     };
   }, [push]);
 

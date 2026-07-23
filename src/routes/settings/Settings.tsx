@@ -385,6 +385,15 @@ function GitSyncTab() {
   const [conflicts, setConflicts] = useState<string[]>([]);
   const [recoveryKey, setRecoveryKey] = useState<string | null>(null);
   const [confirmDisable, setConfirmDisable] = useState(false);
+  // Optional: an existing recovery key to join a vault that already lives
+  // on a remote (second-PC / Variant-2 merge) instead of generating one.
+  const [joinKey, setJoinKey] = useState("");
+  const [showJoinKey, setShowJoinKey] = useState(false);
+  // Result of the last remote-key check. "failed" gates the sync controls
+  // — syncing would only hit the same backend gate and fail again.
+  const [keyCheck, setKeyCheck] = useState<"unknown" | "verified" | "empty" | "failed">(
+    "unknown",
+  );
 
   const refreshStatus = useCallback(async () => {
     try {
@@ -402,32 +411,13 @@ function GitSyncTab() {
 
   const enableAction = useAsyncAction(
     async () => {
-      const res = await commands.enableVaultEncryption();
+      const res = await commands.enableVaultEncryption(joinKey.trim() || null);
+      setJoinKey("");
+      setShowJoinKey(false);
       setRecoveryKey(res.recovery_key);
       await refreshStatus();
     },
     { pending: "Enabling encryption…", errorPrefix: "Could not enable encryption" },
-  );
-
-  const saveRemote = useAsyncAction(
-    async () => {
-      await commands.setGitRemote(url.trim());
-      await refreshStatus();
-    },
-    { pending: "Saving remote…", success: "Remote saved", errorPrefix: "Could not save remote" },
-  );
-
-  const saveCred = useAsyncAction(
-    async () => {
-      await commands.setGitCredential(pat);
-      setPat("");
-      await refreshStatus();
-    },
-    {
-      pending: "Storing token…",
-      success: "Access token stored in the OS keychain",
-      errorPrefix: "Could not store token",
-    },
   );
 
   const syncAction = useAsyncAction(
@@ -453,6 +443,82 @@ function GitSyncTab() {
     { pending: "Syncing…", errorPrefix: "Sync failed" },
   );
 
+  // Early key check: runs automatically once BOTH the remote and a token
+  // exist, so a wrong recovery key surfaces at setup time — with the same
+  // gate every merge enforces — instead of at the first sync. Catches its
+  // own errors so a failed check never masks the save that triggered it.
+  // The result also gates the sync controls (see `keyCheck`).
+  const verifyRemoteKey = useCallback(
+    async (opts?: { silent?: boolean }): Promise<"verified" | "empty" | "failed" | "skipped"> => {
+      try {
+        const s = await commands.gitRemoteStatus();
+        if (!s.remote_url || !s.has_credential) return "skipped";
+        const r = await commands.verifyGitRemote();
+        setKeyCheck(r.status);
+        if (!opts?.silent) {
+          push(
+            r.status === "verified"
+              ? {
+                  kind: "success",
+                  message: "Remote key verified — the remote uses this vault's key",
+                }
+              : {
+                  kind: "info",
+                  message: "Remote is empty — the first sync will publish this vault",
+                },
+          );
+        }
+        return r.status;
+      } catch (e) {
+        setKeyCheck("failed");
+        if (!opts?.silent) {
+          push({
+            kind: "error",
+            message: "Remote key check failed",
+            detail: String(e),
+          });
+        }
+        return "failed";
+      }
+    },
+    [push],
+  );
+
+  // Populate the key-check state when the tab opens with a fully
+  // configured remote (silent — no toasts for a browse-by visit).
+  useEffect(() => {
+    void verifyRemoteKey({ silent: true });
+    // Run once on mount; verifyRemoteKey is stable enough (deps: push).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const saveRemote = useAsyncAction(
+    async () => {
+      await commands.setGitRemote(url.trim());
+      await refreshStatus();
+      const st = await verifyRemoteKey();
+      // Connected to an existing same-key vault → pull its pages down
+      // right away instead of waiting for a manual Sync now.
+      if (st === "verified") void syncAction.trigger();
+    },
+    { pending: "Saving remote…", success: "Remote saved", errorPrefix: "Could not save remote" },
+  );
+
+  const saveCred = useAsyncAction(
+    async () => {
+      await commands.setGitCredential(pat);
+      setPat("");
+      await refreshStatus();
+      const st = await verifyRemoteKey();
+      if (st === "verified") void syncAction.trigger();
+    },
+    {
+      pending: "Storing token…",
+      success: "Access token stored in the OS keychain",
+      errorPrefix: "Could not store token",
+    },
+  );
+
   const autoSyncAction = useAsyncAction(
     async () => {
       const next = !(status?.auto_sync ?? false);
@@ -462,10 +528,37 @@ function GitSyncTab() {
     { errorPrefix: "Could not change auto-sync" },
   );
 
+  const disconnectAction = useAsyncAction(
+    async () => {
+      await commands.disconnectGitRemote();
+      setUrl("");
+      setConflicts([]);
+      setKeyCheck("unknown");
+      await refreshStatus();
+    },
+    {
+      pending: "Disconnecting…",
+      success: "Remote disconnected — encryption stays on",
+      errorPrefix: "Could not disconnect the remote",
+    },
+  );
+
+  const revealKeyAction = useAsyncAction(
+    async () => {
+      const res = await commands.revealRecoveryKey();
+      // Reuse the "save your recovery key" dialog (with its Copy button).
+      setRecoveryKey(res.recovery_key);
+    },
+    { errorPrefix: "Could not read the recovery key" },
+  );
+
   const disableAction = useAsyncAction(
     async () => {
       await commands.disableVaultEncryption();
       setConfirmDisable(false);
+      setUrl("");
+      setConflicts([]);
+      setKeyCheck("unknown");
       await refreshStatus();
     },
     {
@@ -474,6 +567,10 @@ function GitSyncTab() {
       errorPrefix: "Could not disable encryption",
     },
   );
+
+  // "No Git without encryption": every remote/token/sync control is
+  // inert until the vault is encrypted, instead of failing on click.
+  const gitReady = status?.encrypted ?? false;
 
   return (
     <div className="space-y-6">
@@ -499,6 +596,33 @@ function GitSyncTab() {
               {enableAction.loading ? "Encrypting…" : "Enable encryption"}
             </Button>
           </CardHeader>
+          <div className="mt-3 border-t border-neutral-800 pt-3">
+            {!showJoinKey ? (
+              <button
+                type="button"
+                className="text-xs text-neutral-400 underline underline-offset-2 hover:text-neutral-200"
+                onClick={() => setShowJoinKey(true)}
+              >
+                Joining a vault that already exists on another machine?
+              </button>
+            ) : (
+              <div className="space-y-2">
+                <p className="text-xs text-neutral-400">
+                  Paste that vault's <strong>recovery key</strong> (64 hex
+                  characters) to encrypt this copy with the{" "}
+                  <strong>same</strong> key. Only then can the two be synced and
+                  merged. Leave empty to generate a fresh key instead.
+                </p>
+                <input
+                  type="password"
+                  value={joinKey}
+                  onChange={(e) => setJoinKey(e.target.value)}
+                  placeholder="Existing recovery key (64 hex chars)"
+                  className={INPUT_CLASS}
+                />
+              </div>
+            )}
+          </div>
         </Card>
       )}
 
@@ -512,27 +636,48 @@ function GitSyncTab() {
             </CardDescription>
           </div>
         </CardHeader>
+        {!gitReady && (
+          <p className="mt-2 text-xs text-amber-400">
+            Enable encryption first — there is no Git without encryption.
+          </p>
+        )}
         <div className="mt-3 flex gap-2">
           <input
             value={url}
             onChange={(e) => setUrl(e.target.value)}
             placeholder="https://github.com/you/brain.git"
             className={INPUT_CLASS}
+            disabled={!gitReady}
           />
           <Button
             variant="secondary"
             size="sm"
             loading={saveRemote.loading}
+            disabled={!gitReady}
             onClick={() => void saveRemote.trigger()}
           >
             Save remote
           </Button>
         </div>
         {status?.remote_url && (
-          <p className="mt-2 text-xs text-neutral-500">
-            Current: <code className="font-mono">{status.remote_url}</code>
-          </p>
+          <div className="mt-3 flex items-center gap-2">
+            <span className="text-xs text-neutral-500">
+              Current: <code className="font-mono">{status.remote_url}</code>
+            </span>
+            <Button
+              variant="secondary"
+              size="sm"
+              loading={disconnectAction.loading}
+              onClick={() => void disconnectAction.trigger()}
+            >
+              Disconnect
+            </Button>
+          </div>
         )}
+        <p className="mt-2 text-xs text-neutral-500">
+          Disconnecting removes the remote and its stored token and stops
+          auto-sync. Your local vault and its encryption are untouched.
+        </p>
       </Card>
 
       <Card>
@@ -553,6 +698,7 @@ function GitSyncTab() {
           <Button
             variant="secondary"
             size="sm"
+            disabled={!gitReady}
             onClick={() =>
               void openShell(
                 "https://github.com/settings/tokens/new?scopes=repo&description=BRAIN+sync",
@@ -574,12 +720,13 @@ function GitSyncTab() {
             onChange={(e) => setPat(e.target.value)}
             placeholder="Paste your GitHub token (ghp_… / github_pat_…)"
             className={INPUT_CLASS}
+            disabled={!gitReady}
           />
           <Button
             variant="secondary"
             size="sm"
             loading={saveCred.loading}
-            disabled={pat.length === 0}
+            disabled={!gitReady || pat.length === 0}
             onClick={() => void saveCred.trigger()}
           >
             Store token
@@ -608,23 +755,32 @@ function GitSyncTab() {
             variant="primary"
             size="sm"
             loading={syncAction.loading}
+            disabled={!gitReady || keyCheck === "failed"}
             onClick={() => void syncAction.trigger()}
           >
             {syncAction.loading ? "Syncing…" : "Sync now"}
           </Button>
         </CardHeader>
+        {keyCheck === "failed" && (
+          <p className="mt-2 text-xs text-red-400">
+            The remote is encrypted with a different key than this vault —
+            syncing is blocked. Point the remote at the right repository, or
+            re-enable encryption here with that vault's recovery key.
+          </p>
+        )}
         <div className="mt-3 flex items-center gap-2">
           <Button
             variant="secondary"
             size="sm"
             loading={autoSyncAction.loading}
+            disabled={!gitReady || keyCheck === "failed"}
             onClick={() => void autoSyncAction.trigger()}
           >
             {status?.auto_sync ? "Disable auto-sync" : "Enable auto-sync"}
           </Button>
           <span className="text-xs text-neutral-500">
             {status?.auto_sync
-              ? "On — BRAIN fetches, merges and pushes in the background every couple of minutes."
+              ? "On — changes push seconds after you save; remote changes are pulled every couple of minutes."
               : "Off — the vault syncs only when you click Sync now."}
           </span>
         </div>
@@ -648,12 +804,37 @@ function GitSyncTab() {
         <Card>
           <CardHeader>
             <div>
+              <CardTitle>Recovery key</CardTitle>
+              <CardDescription>
+                Re-display this vault's recovery key from the OS keychain —
+                you need it to join the vault from another machine, and it
+                belongs in your password manager. Never paste it anywhere
+                else.
+              </CardDescription>
+            </div>
+            <Button
+              variant="secondary"
+              size="sm"
+              loading={revealKeyAction.loading}
+              onClick={() => void revealKeyAction.trigger()}
+            >
+              Show recovery key
+            </Button>
+          </CardHeader>
+        </Card>
+      )}
+
+      {status?.encrypted && (
+        <Card>
+          <CardHeader>
+            <div>
               <CardTitle>Disable encryption</CardTitle>
               <CardDescription>
                 Turn this vault back into a plaintext vault: pages get their
                 readable names back and future commits are unencrypted. Your
-                data isn't lost. Remove any network remote first — a plaintext
-                push would leak content.
+                data isn't lost. There's <strong>no Git without encryption</strong>,
+                so any remote and its token are disconnected automatically —
+                nothing plaintext can be pushed.
               </CardDescription>
             </div>
             <Button
@@ -682,6 +863,12 @@ function GitSyncTab() {
           vault as <strong>plaintext</strong>. New commits are no longer
           encrypted.
         </p>
+        {status?.remote_url && (
+          <p className="text-amber-400">
+            The remote <code className="font-mono">{status.remote_url}</code> and
+            its stored token will be disconnected — no Git without encryption.
+          </p>
+        )}
         <p className="text-neutral-400">
           Existing encrypted history stays as-is (and the master key stays in
           your keychain, so you can re-enable later). Make sure the drive is
