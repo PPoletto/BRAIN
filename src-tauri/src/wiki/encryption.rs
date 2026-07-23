@@ -100,11 +100,19 @@ pub(crate) fn commit_wiki_with_store(
     store: &impl MasterKeyStore,
 ) -> WikiResult<Option<String>> {
     let repo = crate::wiki::git::init_repo(wiki)?;
+    let keys = resolve_keys(wiki, store)?;
+    // In an encrypted vault, ensure every page sits at its opaque path
+    // BEFORE staging, so a page created outside the app's write path (an
+    // external editor, a dropped file) can't leak its human name through
+    // the committed filename. Idempotent: pages already at their opaque
+    // path (e.g. written via the MCP resolver) are skipped.
+    if let Some(keys) = &keys {
+        rename_pages_to_opaque(wiki, keys)?;
+    }
     let mut index = repo.index()?;
-    index
-        .add_all(["."].iter(), git2::IndexAddOption::DEFAULT, None)?;
-    if let Some(keys) = resolve_keys(wiki, store)? {
-        encrypt_md_index_entries(wiki, &mut index, &keys)?;
+    index.add_all(["."].iter(), git2::IndexAddOption::DEFAULT, None)?;
+    if let Some(keys) = &keys {
+        encrypt_md_index_entries(wiki, &mut index, keys)?;
     }
     crate::wiki::git::commit_index(&repo, &mut index, message)
 }
@@ -496,7 +504,8 @@ mod tests {
         let sha = commit_wiki_with_store(&wiki, "encrypt", &store).unwrap();
         assert!(sha.is_some(), "encryption must produce a commit");
 
-        let blob = head_blob(&wiki, "entities/x.md");
+        // The page is now at its opaque path (commit_wiki renames it).
+        let blob = head_blob(&wiki, &format!("entities/{}.md", keys.filename_token("entities/x")));
         assert!(looks_encrypted(&blob), "committed page must be ciphertext");
         assert_ne!(blob.as_slice(), page, "committed page must not be plaintext");
         assert_eq!(&filter_smudge(&keys, &blob).unwrap(), page, "decrypt restores original");
@@ -504,6 +513,36 @@ mod tests {
         // .gitattributes stays plaintext (not a *.md file).
         let ga = head_blob(&wiki, ".gitattributes");
         assert!(!looks_encrypted(&ga), ".gitattributes stays plaintext");
+    }
+
+    #[test]
+    fn commit_wiki_gives_a_directly_created_page_an_opaque_name() {
+        // A page dropped straight into the working tree with a human name
+        // (bypassing the MCP resolver) must still be committed at its
+        // opaque path — the name must never reach the committed tree.
+        let tmp = vault_with_repo();
+        let wiki = wiki_dir(tmp.path());
+        let store = MemStore::default();
+        let key = enable_encryption(tmp.path(), &store, &PathBuf::from("/opt/brain/brain")).unwrap();
+        let keys = key.derive();
+        std::fs::write(
+            wiki.join("entities").join("michael-simon.md"),
+            "---\nid: entities/michael-simon\ntype: entity\ntitle: M\n---\nbody\n",
+        )
+        .unwrap();
+
+        commit_wiki_with_store(&wiki, "add page", &store).unwrap();
+
+        let repo = git2::Repository::open(&wiki).unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        assert!(
+            tree.get_path(Path::new("entities/michael-simon.md")).is_err(),
+            "the human-named path must not appear in the committed tree"
+        );
+        let opaque = format!("entities/{}.md", keys.filename_token("entities/michael-simon"));
+        let entry = tree.get_path(Path::new(&opaque)).expect("opaque path committed");
+        let blob = repo.find_blob(entry.id()).unwrap();
+        assert!(looks_encrypted(blob.content()), "committed at the opaque path as ciphertext");
     }
 
     #[test]
