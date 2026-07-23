@@ -193,7 +193,7 @@ fn run_lint_and_commit(wiki: &Path) -> super::WikiResult<LintCommit> {
     if summary.is_empty() {
         return Ok(LintCommit::NoChanges);
     }
-    let message = build_commit_message(&summary);
+    let message = commit_message(&summary, super::encryption::is_encrypted(&vault));
     // commit_wiki (not git::commit_all) so an encrypted vault stores
     // ciphertext — this is what keeps encryption sticky across edits.
     match super::encryption::commit_wiki(wiki, &message)? {
@@ -242,9 +242,48 @@ fn build_commit_message(paths: &[String]) -> String {
     )
 }
 
+/// The commit message for an auto-commit. On an encrypted vault it is
+/// path-FREE (a bare change count): commit messages get pushed, and a
+/// just-created page is still at its plaintext name at this point (the
+/// opaque-rename happens inside `commit_wiki`), so listing paths would
+/// leak the name through the message. Plaintext vaults keep the detailed
+/// path list.
+fn commit_message(paths: &[String], encrypted: bool) -> String {
+    if encrypted {
+        let n = paths.len();
+        format!("wiki: {n} change{}", if n == 1 { "" } else { "s" })
+    } else {
+        build_commit_message(paths)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commit_message_is_path_free_on_an_encrypted_vault() {
+        // The leak guard: page paths (which can be plaintext for a
+        // just-created file) must never reach a pushed commit message.
+        let paths = vec![
+            "entities/michael-simon.md".to_string(),
+            "concepts/nl-spec.md".to_string(),
+        ];
+        let msg = commit_message(&paths, true);
+        assert_eq!(msg, "wiki: 2 changes");
+        assert!(!msg.contains("michael"), "no page name may appear: {msg}");
+        assert!(!msg.contains(".md"), "no paths at all: {msg}");
+        assert_eq!(commit_message(&["entities/a.md".to_string()], true), "wiki: 1 change");
+    }
+
+    #[test]
+    fn commit_message_keeps_the_detailed_list_on_a_plaintext_vault() {
+        let paths = vec!["entities/alice.md".to_string()];
+        assert!(
+            commit_message(&paths, false).contains("entities/alice.md"),
+            "plaintext vault keeps the informative path list"
+        );
+    }
 
     #[test]
     fn build_commit_message_lists_first_three_paths_and_total_count() {
