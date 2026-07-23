@@ -65,8 +65,21 @@ async fn run_loop<R: Runtime>(
         DEBOUNCE_IDLE,
         None,
         move |result: DebounceEventResult| {
-            if matches!(result, Ok(events) if !events.is_empty()) {
-                let _ = watcher_tx.try_send(());
+            if let Ok(events) = result {
+                // Ignore events under `.git/`. Our own commits rewrite
+                // `.git/index` (and refs/objects), and on an encrypted
+                // vault the index holds ciphertext while the working tree
+                // is plaintext — so git status is perpetually "dirty" and
+                // every commit's index write would re-trigger the watcher,
+                // producing an endless commit loop. Only real page-file
+                // changes (outside `.git/`) should wake the committer.
+                let touches_wiki = events
+                    .iter()
+                    .flat_map(|ev| ev.paths.iter())
+                    .any(|p| !p.components().any(|c| c.as_os_str() == std::ffi::OsStr::new(".git")));
+                if touches_wiki {
+                    let _ = watcher_tx.try_send(());
+                }
             }
         },
     ) {
