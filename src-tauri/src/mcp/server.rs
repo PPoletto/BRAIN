@@ -566,6 +566,19 @@ fn tool_descriptors() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "brain_patch_page",
+            "description": "Edit ONE section of an existing page instead of rewriting the whole thing. `heading` is a markdown heading line (e.g. '## Kontakt'); its section — from that heading to the next heading of the same or higher level — is replaced with `content` (the section body, without repeating the heading). If the heading isn't present, the section is appended. Frontmatter is preserved untouched and wiki-links are normalised, so the result equals a full rewrite of that section. Prefer this over brain_write_page for targeted updates: the diff (and, on an encrypted/synced vault, the merge surface) stays tiny. The page must already exist; use brain_write_page to create it. Commit is delegated to the watcher.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "page id, e.g. 'entities/alice'" },
+                    "heading": { "type": "string", "description": "the section heading line to replace, e.g. '## Kontakt'" },
+                    "content": { "type": "string", "description": "the new section body (markdown, without the heading line)" }
+                },
+                "required": ["id", "heading", "content"]
+            }
+        }),
+        json!({
             "name": "brain_get_page_history",
             "description": "Return the Git commits that touched a single page, newest first. Each entry has `{sha, ts, message, files_changed}`. Use this together with `brain_restore_page` to roll back a page that was accidentally overwritten or to inspect how a fact changed over time. Walks the repo's revwalk and filters per-commit by diff — work is proportional to commits scanned, not commits matched; the default `limit` (20) is usually enough.",
             "inputSchema": {
@@ -922,6 +935,36 @@ fn call_tool(
                 "warnings": page_warnings,
             }))
             .unwrap_or_default())
+        }
+        "brain_patch_page" => {
+            let id = args
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing 'id'".to_string())?;
+            if id.contains("..") {
+                return Err("id may not contain '..'".to_string());
+            }
+            let heading = args
+                .get("heading")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing 'heading'".to_string())?;
+            let section = args
+                .get("content")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing 'content'".to_string())?;
+            // The page must already exist — patch edits one section of it.
+            let target = crate::wiki::encryption::page_path(vault, id).map_err(|e| e.to_string())?;
+            let original = std::fs::read_to_string(&target)
+                .map_err(|_| format!("page not found: {id} (use brain_write_page to create it)"))?;
+            let parsed = page::parse(&original)
+                .map_err(|e| format!("existing page is malformed, refusing to patch: {e}"))?;
+            let patched_body = patch_section(&parsed.body, heading, section);
+            // Same link-normalisation + frontmatter-preserving re-stitch as
+            // brain_write_page, so a patched page is byte-for-byte what a
+            // full rewrite of the same content would produce.
+            let normalized_body = page::normalize_internal_links(&patched_body);
+            let new_content = rebuild_page_file(&original, &normalized_body);
+            write_normalized_page(vault, id, &new_content)
         }
         "brain_get_page_history" => {
             let id = args
@@ -1390,6 +1433,113 @@ impl std::fmt::Display for ViewerErrAdapter {
     }
 }
 
+/// Replace the section under `heading` in a page `body` with `new_content`.
+/// A "section" runs from the line equal to `heading` (after trimming) up to
+/// the next heading of the SAME OR HIGHER level (same-or-fewer `#`), or end
+/// of body. `heading` must be a markdown heading line, e.g. `## Kontakt`.
+/// If the heading isn't present, the section is appended at the end. Pure +
+/// testable; the caller re-normalises links and re-stitches frontmatter.
+///
+/// This is the core of `brain_patch_page`: editing one section produces a
+/// small, local diff instead of a whole-page rewrite — fewer bytes to
+/// re-encrypt and far fewer sync merge conflicts.
+fn patch_section(body: &str, heading: &str, new_content: &str) -> String {
+    let heading = heading.trim();
+    let target_level = heading.chars().take_while(|c| *c == '#').count();
+    // A body line is a heading iff it is one-or-more `#` followed by a space.
+    let heading_level = |line: &str| -> Option<usize> {
+        let t = line.trim_start();
+        let hashes = t.chars().take_while(|c| *c == '#').count();
+        if hashes > 0 && t[hashes..].starts_with(' ') {
+            Some(hashes)
+        } else {
+            None
+        }
+    };
+    let lines: Vec<&str> = body.lines().collect();
+    let new_section = format!("{heading}\n\n{}", new_content.trim_end_matches('\n'));
+
+    match lines.iter().position(|l| l.trim() == heading) {
+        Some(start) => {
+            // End at the next heading of level <= target_level, else EOF.
+            let end = lines
+                .iter()
+                .enumerate()
+                .skip(start + 1)
+                .find_map(|(j, l)| heading_level(l).filter(|lvl| *lvl <= target_level).map(|_| j))
+                .unwrap_or(lines.len());
+            let mut out = String::new();
+            for l in &lines[..start] {
+                out.push_str(l);
+                out.push('\n');
+            }
+            out.push_str(&new_section);
+            out.push('\n');
+            if end < lines.len() {
+                out.push('\n');
+                for l in &lines[end..] {
+                    out.push_str(l);
+                    out.push('\n');
+                }
+            }
+            out
+        }
+        None => {
+            let mut out = body.trim_end_matches('\n').to_string();
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(&new_section);
+            out.push('\n');
+            out
+        }
+    }
+}
+
+/// Write `normalized_content` to the page's (opaque-aware) path, then run
+/// the page-scoped lint and build the standard write response. Mirrors the
+/// write+lint tail of `brain_write_page`; shared with `brain_patch_page`.
+/// Commit is left to the watcher.
+fn write_normalized_page(
+    vault: &std::path::Path,
+    id: &str,
+    normalized_content: &str,
+) -> Result<String, String> {
+    let target = crate::wiki::encryption::page_path(vault, id).map_err(|e| e.to_string())?;
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let previous_size_bytes = std::fs::metadata(&target).map(|m| m.len() as i64).unwrap_or(0);
+    std::fs::write(&target, normalized_content).map_err(|e| e.to_string())?;
+    let new_size_bytes = normalized_content.len() as i64;
+
+    let full_report = lint::lint(vault).map_err(|e| e.to_string())?;
+    let page_errors: Vec<&lint::LintError> = full_report
+        .errors
+        .iter()
+        .filter(|e| paths_equal(&e.path, &target))
+        .collect();
+    let page_warnings: Vec<&lint::LintWarning> = full_report
+        .warnings
+        .iter()
+        .filter(|w| paths_equal(&w.path, &target))
+        .collect();
+    if !page_errors.is_empty() {
+        let detail = serde_json::to_string(&page_errors).unwrap_or_else(|_| "[]".to_string());
+        return Err(format!(
+            "page written but lint failed: {} error(s) on this page\n{detail}",
+            page_errors.len()
+        ));
+    }
+    Ok(serde_json::to_string(&json!({
+        "wrote": id,
+        "previous_size_bytes": previous_size_bytes,
+        "new_size_bytes": new_size_bytes,
+        "warnings": page_warnings,
+    }))
+    .unwrap_or_default())
+}
+
 /// Splices a normalized body back into a page file, keeping the original
 /// frontmatter exactly as the LLM produced it. The shape we need to
 /// preserve is `---\n<yaml>\n---\n<body>`; we find the second
@@ -1437,6 +1587,35 @@ mod rebuild_page_tests {
         let normalized = "[[entities/alice]]";
         let result = rebuild_page_file(original, normalized);
         assert_eq!(result, "[[entities/alice]]");
+    }
+
+    #[test]
+    fn patch_section_replaces_only_the_named_section() {
+        let body = "# Title\n\nIntro.\n\n## Kontakt\n\nalt\n\n## Andere\n\nbleibt\n";
+        let out = patch_section(body, "## Kontakt", "neu");
+        assert!(out.contains("## Kontakt\n\nneu"), "section replaced: {out}");
+        assert!(!out.contains("alt"), "old section body gone: {out}");
+        assert!(out.contains("Intro."), "content before the section preserved");
+        assert!(out.contains("## Andere\n\nbleibt"), "later section untouched: {out}");
+    }
+
+    #[test]
+    fn patch_section_appends_when_heading_absent() {
+        let body = "# Title\n\nIntro.\n";
+        let out = patch_section(body, "## Neu", "inhalt");
+        assert!(out.contains("Intro."), "existing content kept");
+        assert!(out.trim_end().ends_with("## Neu\n\ninhalt"), "new section appended: {out}");
+    }
+
+    #[test]
+    fn patch_section_stops_at_same_level_heading_but_includes_deeper_ones() {
+        // A `## X` section should swallow a `### sub` but stop at the next `##`.
+        let body = "## X\n\nold\n\n### sub\n\nsubtext\n\n## Y\n\nyeahs\n";
+        let out = patch_section(body, "## X", "replaced");
+        assert!(out.contains("## X\n\nreplaced"), "X replaced");
+        assert!(!out.contains("### sub"), "deeper subsection was part of X and is gone: {out}");
+        assert!(!out.contains("subtext"), "sub content gone");
+        assert!(out.contains("## Y\n\nyeahs"), "sibling section Y preserved: {out}");
     }
 }
 
@@ -1490,6 +1669,7 @@ mod tests {
             "brain_get_context",
             "brain_list_pages",
             "brain_write_page",
+            "brain_patch_page",
             "brain_write_batch",
             "brain_write_raw_file",
             "brain_get_page_history",
@@ -2672,6 +2852,60 @@ mod tests {
         assert!(prev > new, "previous ({prev}) must exceed new ({new}) for this shrink test");
         assert!(prev > 1000, "previous size sanity (got {prev})");
         assert!(new < 200, "new size sanity (got {new})");
+    }
+
+    #[test]
+    fn patch_page_replaces_one_section_and_preserves_the_rest() {
+        use tempfile::TempDir;
+        use crate::vault::layout::{ensure_skeleton, wiki_dir};
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        seed_marker(tmp.path());
+        let entities = wiki_dir(tmp.path()).join("entities");
+        std::fs::create_dir_all(&entities).unwrap();
+        let original = "---\nid: entities/alice\ntype: entity\ntitle: Alice\ncreated: 2026-04-30\nupdated: 2026-04-30\n---\n\n# Alice\n\nIntro.\n\n## Kontakt\n\nalte Nummer\n\n## Notizen\n\nbleibt\n";
+        std::fs::write(entities.join("alice.md"), original).unwrap();
+
+        let ok = call_tool(
+            &json!({
+                "name": "brain_patch_page",
+                "arguments": {
+                    "id": "entities/alice",
+                    "heading": "## Kontakt",
+                    "content": "neue Nummer +49 201 0"
+                }
+            }),
+            tmp.path(),
+            &mut None,
+        )
+        .expect("patch succeeds");
+        assert!(ok.contains("entities/alice"), "response names the page: {ok}");
+
+        let after = std::fs::read_to_string(entities.join("alice.md")).unwrap();
+        assert!(after.starts_with("---\nid: entities/alice"), "frontmatter preserved: {after}");
+        assert!(after.contains("## Kontakt\n\nneue Nummer +49 201 0"), "section replaced: {after}");
+        assert!(!after.contains("alte Nummer"), "old section gone: {after}");
+        assert!(after.contains("Intro."), "intro preserved: {after}");
+        assert!(after.contains("## Notizen\n\nbleibt"), "sibling section preserved: {after}");
+    }
+
+    #[test]
+    fn patch_page_errors_when_the_page_does_not_exist() {
+        use tempfile::TempDir;
+        use crate::vault::layout::ensure_skeleton;
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        seed_marker(tmp.path());
+        let err = call_tool(
+            &json!({
+                "name": "brain_patch_page",
+                "arguments": { "id": "entities/ghost", "heading": "## X", "content": "y" }
+            }),
+            tmp.path(),
+            &mut None,
+        )
+        .unwrap_err();
+        assert!(err.contains("page not found"), "patch on a missing page must fail clearly: {err}");
     }
 
     #[test]
