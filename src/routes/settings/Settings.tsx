@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { open as openShell } from "@tauri-apps/plugin-shell";
 import {
   commands,
   type ClientStatus,
@@ -525,12 +526,30 @@ function GitSyncTab() {
             </CardDescription>
           </div>
         </CardHeader>
+        <div className="mt-3 flex items-center gap-2">
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() =>
+              void openShell(
+                "https://github.com/settings/tokens/new?scopes=repo&description=BRAIN+sync",
+              )
+            }
+          >
+            Create token on GitHub →
+          </Button>
+          <span className="text-xs text-neutral-500">
+            opens GitHub with the <code className="font-mono">repo</code> scope
+            pre-selected — generate it, then paste the{" "}
+            <code className="font-mono">ghp_…</code> value below
+          </span>
+        </div>
         <div className="mt-3 flex gap-2">
           <input
             type="password"
             value={pat}
             onChange={(e) => setPat(e.target.value)}
-            placeholder="Personal access token"
+            placeholder="Paste your GitHub token (ghp_… / github_pat_…)"
             className={INPUT_CLASS}
           />
           <Button
