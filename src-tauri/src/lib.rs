@@ -374,6 +374,7 @@ pub fn run() {
             wiki::commands::set_git_credential,
             wiki::commands::sync_now,
             wiki::commands::enable_vault_encryption,
+            wiki::commands::set_auto_sync,
             // Update (S04)
             update::commands::check_update,
             update::commands::apply_update,

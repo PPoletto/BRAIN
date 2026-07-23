@@ -28,6 +28,8 @@ pub struct RemoteStatus {
     pub remote_url: Option<String>,
     /// Whether a credential (PAT) is stored for the remote on this machine.
     pub has_credential: bool,
+    /// Whether background auto-sync is enabled.
+    pub auto_sync: bool,
 }
 
 /// Returned by [`enable_vault_encryption`] — the recovery key shown once
@@ -119,7 +121,34 @@ pub fn git_remote_status(state: State<Arc<crate::state::AppState>>) -> BrainResu
         encrypted: crate::wiki::encryption::is_encrypted(&vault),
         remote_url: sync::remote_url(&wiki),
         has_credential: sync::has_credential(&wiki),
+        auto_sync: state.config.snapshot().auto_sync,
     })
+}
+
+/// Enable/disable background auto-sync and persist the choice. Spawns or
+/// aborts the scheduler immediately for the mounted vault.
+#[tauri::command]
+pub fn set_auto_sync(
+    state: State<Arc<crate::state::AppState>>,
+    app: AppHandle,
+    enabled: bool,
+) -> BrainResult<()> {
+    state
+        .config
+        .update(|s| s.auto_sync = enabled)
+        .map_err(|e| BrainError::Internal(format!("saving the auto-sync setting: {e}")))?;
+    if enabled {
+        if let Some(vault) = state.vault_path() {
+            state.set_auto_sync_task(Some(crate::wiki::auto_sync::spawn(
+                app,
+                state.inner().clone(),
+                vault,
+            )));
+        }
+    } else {
+        state.set_auto_sync_task(None);
+    }
+    Ok(())
 }
 
 /// Attach (or update) the sync remote. Enforces the encryption coupling

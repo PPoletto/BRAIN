@@ -7,6 +7,7 @@ use crate::config::ConfigStore;
 use crate::db::DbHandle;
 use crate::mcp::registration::RegistrationReport;
 use crate::onboarding::disks::DiskInfo;
+use crate::wiki::auto_sync::AutoSyncHandle;
 use crate::wiki::watcher::WikiWatcher;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +46,9 @@ pub struct AppState {
     /// working tree in bulk (e.g. the encrypt/convert step) can pause it
     /// — abort, do the work, respawn — instead of racing its auto-commit.
     watcher: RwLock<Option<WikiWatcher>>,
+    /// The running auto-sync scheduler (S11 phase 6), if enabled. Kept so
+    /// it can be aborted on unmount or when auto-sync is toggled off.
+    auto_sync_task: RwLock<Option<AutoSyncHandle>>,
 }
 
 impl AppState {
@@ -58,7 +62,22 @@ impl AppState {
             disk_cache: RwLock::new(None),
             ops: RwLock::new(Vec::new()),
             watcher: RwLock::new(None),
+            auto_sync_task: RwLock::new(None),
         }
+    }
+
+    /// Store the running auto-sync scheduler, aborting any previous one.
+    pub fn set_auto_sync_task(&self, task: Option<AutoSyncHandle>) {
+        let mut guard = self.auto_sync_task.write().expect("auto_sync_task write lock");
+        if let Some(old) = guard.take() {
+            old.abort();
+        }
+        *guard = task;
+    }
+
+    /// Whether an auto-sync scheduler is currently running.
+    pub fn auto_sync_running(&self) -> bool {
+        self.auto_sync_task.read().expect("auto_sync_task read lock").is_some()
     }
 
     /// Store the running watcher, aborting any previous one first.

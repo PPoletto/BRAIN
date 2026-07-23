@@ -412,6 +412,13 @@ fn complete_auto_mount(
         app_state.clone(),
         vault_path.clone(),
     )));
+    if app_state.config.snapshot().auto_sync {
+        app_state.set_auto_sync_task(Some(crate::wiki::auto_sync::spawn(
+            app.clone(),
+            app_state.clone(),
+            vault_path.clone(),
+        )));
+    }
 
     let path_str = vault_path.to_string_lossy().to_string();
     let _ = app.emit(
@@ -521,6 +528,13 @@ pub fn finish_onboarding(
         inner_state.clone(),
         vault_path.clone(),
     )));
+    if inner_state.config.snapshot().auto_sync {
+        inner_state.set_auto_sync_task(Some(crate::wiki::auto_sync::spawn(
+            app.clone(),
+            inner_state.clone(),
+            vault_path.clone(),
+        )));
+    }
 
     let _ = app.emit(
         "mount-state",

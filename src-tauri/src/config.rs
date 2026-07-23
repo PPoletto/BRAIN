@@ -26,6 +26,10 @@ pub struct ClientSettings {
     /// vault is auto-mounted, so users don't redo onboarding every launch.
     #[serde(default)]
     pub last_active_vault_path: Option<PathBuf>,
+    /// When true, and a sync remote is configured, BRAIN periodically
+    /// fetch→merge→pushes in the background (S11 phase 6). Off by default.
+    #[serde(default)]
+    pub auto_sync: bool,
 }
 
 impl Default for ClientSettings {
@@ -37,6 +41,7 @@ impl Default for ClientSettings {
             mount_path_override: None,
             default_provider: "local".to_string(),
             last_active_vault_path: None,
+            auto_sync: false,
         }
     }
 }
@@ -142,6 +147,7 @@ mod tests {
             mount_path_override: Some(PathBuf::from("/mnt/brain")),
             default_provider: "anthropic".into(),
             last_active_vault_path: Some(PathBuf::from("D:/")),
+            auto_sync: true,
         };
         let raw = serde_json::to_string(&s).unwrap();
         let parsed: ClientSettings = serde_json::from_str(&raw).unwrap();

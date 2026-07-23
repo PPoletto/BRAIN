@@ -452,6 +452,15 @@ function GitSyncTab() {
     { pending: "Syncing…", errorPrefix: "Sync failed" },
   );
 
+  const autoSyncAction = useAsyncAction(
+    async () => {
+      const next = !(status?.auto_sync ?? false);
+      await commands.setAutoSync(next);
+      await refreshStatus();
+    },
+    { errorPrefix: "Could not change auto-sync" },
+  );
+
   return (
     <div className="space-y-6">
       {status && !status.encrypted && (
@@ -590,6 +599,21 @@ function GitSyncTab() {
             {syncAction.loading ? "Syncing…" : "Sync now"}
           </Button>
         </CardHeader>
+        <div className="mt-3 flex items-center gap-2">
+          <Button
+            variant="secondary"
+            size="sm"
+            loading={autoSyncAction.loading}
+            onClick={() => void autoSyncAction.trigger()}
+          >
+            {status?.auto_sync ? "Disable auto-sync" : "Enable auto-sync"}
+          </Button>
+          <span className="text-xs text-neutral-500">
+            {status?.auto_sync
+              ? "On — BRAIN fetches, merges and pushes in the background every couple of minutes."
+              : "Off — the vault syncs only when you click Sync now."}
+          </span>
+        </div>
         {conflicts.length > 0 && (
           <div className="mt-3">
             <ErrorBanner tone="warning">

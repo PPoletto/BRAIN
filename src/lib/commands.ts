@@ -69,6 +69,7 @@ export type RemoteStatus = {
   encrypted: boolean;
   remote_url: string | null;
   has_credential: boolean;
+  auto_sync: boolean;
 };
 
 export type SyncReport = {
@@ -210,4 +211,5 @@ export const commands = {
   syncNow: () => invoke<SyncReport>("sync_now"),
   enableVaultEncryption: () =>
     invoke<{ recovery_key: string }>("enable_vault_encryption"),
+  setAutoSync: (enabled: boolean) => invoke<void>("set_auto_sync", { enabled }),
 };
