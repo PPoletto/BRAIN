@@ -1,7 +1,7 @@
 {
   "name": "brain-client",
   "private": true,
-  "version": "0.2.20",
+  "version": "0.3.0",
   "license": "MIT",
   "homepage": "https://github.com/PPoletto/BRAIN",
   "repository": {

@@ -6,6 +6,82 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-07-23
+
+### Added — S11 vault sync (encrypted Git remote)
+
+- **Sync the vault through a private Git remote (e.g. GitHub) with
+  client-side encryption.** Committed blobs are XChaCha20-Poly1305
+  ciphertext, filenames are keyed-HMAC tokens; the hosting service
+  never sees page names or content. Settings → Git sync: enable
+  encryption (one-time recovery key), save remote + GitHub PAT (both
+  live only in the OS keychain), Sync now / opt-in auto-sync.
+- **Everything non-regenerable travels:** wiki pages + full history,
+  `01_raw` attachments (encrypted mirror `raw/<HMAC>` + encrypted
+  token→path manifest), and the customisable `00_meta/AGENTS.md` /
+  `CLAUDE.md` (encrypted mirror `meta/<HMAC>`). Deliberately local:
+  vault marker, `.mcp.json` bearer token, the SQLite index (rebuilt),
+  models (re-downloaded), caches/logs, graph layout.
+- **Second-machine join:** enable encryption with an existing recovery
+  key, connect the same remote, and the unrelated histories merge
+  (union of pages; genuine same-page conflicts get plaintext conflict
+  markers to resolve). "Show recovery key" re-displays the key from
+  the OS keychain for the hand-over. A clone-from-remote path exists
+  in onboarding for brand-new machines.
+- **Auto-sync** pushes local changes seconds after the auto-commit
+  (watcher nudge) and pulls remote changes on a 2-minute interval.
+  Background conflicts and permanent errors surface as toasts.
+
+### Security model (read before first push)
+
+- **The convert re-roots git history.** Enabling encryption commits
+  the encrypted snapshot as a fresh root; the plaintext past stays
+  local on the `pre-encryption-backup` branch and can never be pushed.
+- **No Git without encryption, both directions.** A network remote
+  cannot be attached to a plaintext vault, and disabling encryption
+  automatically disconnects the remote and deletes the stored PAT.
+- **Wrong keys are refused, early.** Every merge validates the local
+  master key against the remote's committed canary; the UI runs the
+  same check when the remote/token is saved and blocks sync controls
+  on mismatch. Two differently-keyed vaults can no longer be unioned
+  into a mixed, half-unreadable repo.
+- **Known metadata that an encrypted remote still reveals** (accepted,
+  git-crypt-class model): commit timestamps (activity timing),
+  per-page ciphertext sizes ≈ plaintext sizes, page/attachment counts,
+  and the four type directories (`entities/…` — categories, by
+  design). Commit messages are path-free on encrypted vaults.
+- **What BRAIN's encryption does NOT cover:** the working tree on the
+  local disk stays plaintext (that is the editing model). Protection
+  of the physical medium (lost stick/laptop) is the user's volume
+  encryption (BitLocker/VeraCrypt). Key custody: the recovery key
+  exists only in the user's password manager and the OS keychain —
+  losing both makes every pushed copy permanently unreadable.
+- Attachment paths from the remote manifest are sanitised against
+  directory traversal; files > 95 MB stay local (GitHub blob limit).
+
+### Fixed
+
+- The dev/test client "forgot" the vault location after every test
+  run: mount lifecycle tests persisted TempDir paths into the real
+  `settings.json`. Tests now run against isolated config files.
+- Converting a vault whose plaintext-era history mirrored `.md`
+  attachments could fail mid-convert; mirror paths are now skipped by
+  the page-encryption pass and restaged from their sources.
+- The auto-commit watcher no longer leaks the changed page's name into
+  commit messages of encrypted vaults ("wiki: N change(s)" instead).
+
+### Migration notes
+
+- Existing plaintext vaults: Settings → Git sync → *Enable content
+  encryption* → save the recovery key → create a **private, empty**
+  GitHub repo → save remote + token → the first sync publishes a
+  single encrypted root commit (no plaintext history).
+- Second PC with a diverged copy of the same vault: *Enable
+  encryption* → "Joining a vault that already exists?" → paste the
+  SAME recovery key → save the same remote + a token → the automatic
+  first sync merges both histories; resolve any conflict markers and
+  sync again.
+
 ## [0.2.20] — 2026-06-20
 
 ### Fixed
