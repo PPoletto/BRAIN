@@ -265,7 +265,12 @@ pub(crate) fn merge_from_remote_with_store(
         return Ok(MergeOutcome::FastForward(their_commit.id().to_string()));
     }
 
-    // Divergent — real merge.
+    // Divergent — real merge. This also covers "unrelated histories"
+    // (two Brains created independently, then pointed at the same repo —
+    // S11 Variant 2): merge_commits uses an empty base, so shared-id pages
+    // surface as add/add conflicts (resolved below via decrypt→merge→
+    // re-encrypt) and unique pages union. A repo encrypted with a DIFFERENT
+    // key fails safely — its blobs won't decrypt during conflict handling.
     let our_commit = repo.head()?.peel_to_commit()?;
     let mut index = repo.merge_commits(&our_commit, &their_commit, None)?;
     let mut conflicted_pages = Vec::new();
@@ -512,5 +517,99 @@ mod tests {
         assert!(markers, "overlapping edits must be flagged as a conflict");
         let s = String::from_utf8(merged).unwrap();
         assert!(s.contains("<<<<<<<") && s.contains(">>>>>>>"), "conflict markers present: {s}");
+    }
+
+    // In-memory key store so the merge's decrypt/encrypt runs against a
+    // controlled key rather than the OS keychain.
+    #[derive(Default)]
+    struct MemStore(std::sync::Mutex<std::collections::HashMap<String, String>>);
+    impl MasterKeyStore for MemStore {
+        fn set_hex(&self, a: &str, h: &str) -> Result<(), crate::crypto::keychain::KeychainError> {
+            self.0.lock().unwrap().insert(a.into(), h.into());
+            Ok(())
+        }
+        fn get_hex(&self, a: &str) -> Result<Option<String>, crate::crypto::keychain::KeychainError> {
+            Ok(self.0.lock().unwrap().get(a).cloned())
+        }
+        fn delete(&self, a: &str) -> Result<(), crate::crypto::keychain::KeychainError> {
+            self.0.lock().unwrap().remove(a);
+            Ok(())
+        }
+    }
+
+    /// Build a standalone encrypted vault keyed with `key`, its pages
+    /// committed (as ciphertext at opaque paths). Each call has its own
+    /// git history — so two of them are "unrelated histories".
+    fn make_encrypted_vault(
+        key: &crate::crypto::MasterKey,
+        pages: &[(&str, &str)],
+        store: &MemStore,
+    ) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        write_marker(tmp.path(), &VaultMarker::new("0.0.0")).unwrap();
+        let wiki = wiki_dir(tmp.path());
+        init_repo(&wiki).unwrap();
+        let account = keychain::vault_account(tmp.path()).unwrap();
+        keychain::store_master_key(store, &account, key).unwrap();
+        crate::crypto::gitfilter::write_canary(&wiki, &key.derive()).unwrap();
+        for (id, body) in pages {
+            let abs = wiki.join(format!("{id}.md"));
+            std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+            std::fs::write(&abs, format!("---\nid: {id}\ntype: entity\ntitle: t\n---\n\n{body}\n"))
+                .unwrap();
+        }
+        crate::wiki::encryption::commit_wiki_with_store(&wiki, "init", store).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn merges_unrelated_histories_with_the_same_key() {
+        // Variant 2: two Brains created independently (no common ancestor)
+        // but keyed identically. Unique pages must union; a page that
+        // exists on both with different content must surface as a conflict.
+        let store = MemStore::default();
+        let key = crate::crypto::MasterKey::from_bytes([9u8; 32]);
+        let a = make_encrypted_vault(
+            &key,
+            &[("entities/only-a", "aaa"), ("entities/shared", "shared from A")],
+            &store,
+        );
+        let b = make_encrypted_vault(
+            &key,
+            &[("entities/only-b", "bbb"), ("entities/shared", "shared from B")],
+            &store,
+        );
+        let a_wiki = wiki_dir(a.path());
+        let b_wiki = wiki_dir(b.path());
+
+        set_remote(&b_wiki, &a_wiki.to_string_lossy()).unwrap();
+        fetch(&b_wiki).unwrap();
+        let branch = current_branch(&init_repo(&b_wiki).unwrap()).unwrap();
+        let outcome = merge_from_remote_with_store(&b_wiki, &branch, &store).unwrap();
+
+        let (sha, conflicts) = match outcome {
+            MergeOutcome::Merged { sha, conflicted_pages } => (sha, conflicted_pages),
+            other => panic!("expected a merge of unrelated histories, got {other:?}"),
+        };
+        assert!(!sha.is_empty());
+
+        let keys = key.derive();
+        let shared = format!("entities/{}.md", keys.filename_token("entities/shared"));
+        assert!(conflicts.contains(&shared), "the shared id must conflict: {conflicts:?}");
+
+        // Union: every side's pages are in the merged tree.
+        let repo = git2::Repository::open(&b_wiki).unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        for id in ["entities/only-a", "entities/only-b", "entities/shared"] {
+            let p = format!("entities/{}.md", keys.filename_token(id));
+            assert!(tree.get_path(Path::new(&p)).is_ok(), "merged tree missing {id}");
+        }
+        // The conflicted page's working tree carries BOTH versions (markers).
+        let merged_shared = std::fs::read_to_string(b_wiki.join(&shared)).unwrap();
+        assert!(
+            merged_shared.contains("shared from A") && merged_shared.contains("shared from B"),
+            "both versions must be present for the user to resolve: {merged_shared}"
+        );
     }
 }
