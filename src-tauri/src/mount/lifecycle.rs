@@ -190,7 +190,7 @@ mod tests {
         let path = prepare_vault(&tmp);
         let state = AppState::new();
         mount_source(&state, path).unwrap();
-        state.begin_op();
+        state.begin_op("test");
         unmount(&state, true).unwrap();
         assert!(UncleanFlag::is_set(path));
     }
@@ -201,7 +201,7 @@ mod tests {
         let path = prepare_vault(&tmp);
         let state = AppState::new();
         mount_source(&state, path).unwrap();
-        state.begin_op();
+        state.begin_op("test");
         let err = unmount(&state, false).unwrap_err();
         assert!(matches!(err, MountError::Io(_)));
         assert_eq!(state.mount(), MountState::MountedIdle);

@@ -90,7 +90,7 @@ pub async fn rebuild_index(
     let db = state
         .db()
         .ok_or_else(|| BrainError::Internal("no SQLite index is open".into()))?;
-    state.begin_op();
+    state.begin_op("Rebuilding the search index");
     let result = tokio::task::spawn_blocking(move || {
         // Force-bypass the format version skip-fast-path by clearing the
         // stored marker before the rebuild. The rebuild itself writes
@@ -106,7 +106,7 @@ pub async fn rebuild_index(
     })
     .await
     .map_err(|e| BrainError::Internal(format!("rebuild task panicked: {e}")))?;
-    state.end_op();
+    state.end_op("Rebuilding the search index");
     result.map_err(|e| BrainError::Internal(format!("rebuild failed: {e}")))?;
     // Page count for the toast confirmation.
     let count = state

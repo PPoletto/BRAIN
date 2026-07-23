@@ -56,7 +56,7 @@ pub async fn enable_vault_encryption(
     if let Some(w) = state.take_watcher() {
         w.abort();
     }
-    state.begin_op();
+    state.begin_op("Enabling encryption");
 
     let convert_vault = vault.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
@@ -91,7 +91,7 @@ pub async fn enable_vault_encryption(
         state.inner().clone(),
         vault,
     )));
-    state.end_op();
+    state.end_op("Enabling encryption");
 
     let recovery_key = result?.map_err(BrainError::Internal)?;
     Ok(EncryptionResult { recovery_key })
@@ -155,10 +155,10 @@ pub async fn sync_now(
         .ok_or_else(|| BrainError::Internal("no vault is currently mounted".into()))?;
     let wiki = wiki_dir(&vault);
 
-    state.begin_op();
+    state.begin_op("Syncing with the remote");
     let sync_wiki = wiki.clone();
     let outcome = tokio::task::spawn_blocking(move || sync::sync(&sync_wiki)).await;
-    state.end_op();
+    state.end_op("Syncing with the remote");
     let outcome = outcome
         .map_err(|e| BrainError::Internal(format!("sync task panicked: {e}")))?
         .map_err(BrainError::from)?;
@@ -177,12 +177,12 @@ pub async fn sync_now(
     if changed {
         if let Some(db) = state.db() {
             let reindex_vault = vault.clone();
-            state.begin_op();
+            state.begin_op("Rebuilding the index");
             let r = tokio::task::spawn_blocking(move || {
                 crate::db::pages_index::rebuild(&db, &reindex_vault)
             })
             .await;
-            state.end_op();
+            state.end_op("Rebuilding the index");
             r.map_err(|e| BrainError::Internal(format!("reindex task panicked: {e}")))?
                 .map_err(|e| BrainError::Internal(format!("reindex after sync failed: {e}")))?;
         }

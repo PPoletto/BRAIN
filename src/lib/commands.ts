@@ -27,6 +27,7 @@ export type TrayStatus = {
   tooltip: string;
   vault_path: string | null;
   active_operations: number;
+  active_operation_labels: string[];
   message: string | null;
 };
 

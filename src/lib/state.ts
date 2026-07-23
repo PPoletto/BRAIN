@@ -12,6 +12,7 @@ export const useAppState = create<AppState>((set) => ({
     tooltip: "BRAIN disconnected",
     vault_path: null,
     active_operations: 0,
+    active_operation_labels: [],
     message: null,
   },
   setTray: (status) => set({ tray: status }),

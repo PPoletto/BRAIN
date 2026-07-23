@@ -447,10 +447,11 @@ fn spawn_bootstrap_background_work(
     vault: PathBuf,
 ) {
     std::thread::spawn(move || {
-        state.begin_op();
+        const OP: &str = "Preparing the vault (index + MCP)";
+        state.begin_op(OP);
         struct OpGuard<'a> { state: &'a crate::state::AppState }
         impl Drop for OpGuard<'_> {
-            fn drop(&mut self) { self.state.end_op(); }
+            fn drop(&mut self) { self.state.end_op(OP); }
         }
         let _guard = OpGuard { state: &state };
 

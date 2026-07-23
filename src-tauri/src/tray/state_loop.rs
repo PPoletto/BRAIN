@@ -101,6 +101,7 @@ pub fn spawn<R: Runtime>(app: AppHandle<R>, state: Arc<AppState>) {
                         "tooltip": tray_state.tooltip(),
                         "vault_path": state.vault_path().map(|p| p.display().to_string()),
                         "active_operations": active,
+                        "active_operation_labels": state.active_op_labels(),
                     }),
                 );
                 last_tag = tag;
@@ -153,9 +154,10 @@ fn finish_auto_reconnect<R: Runtime>(
     let path_for_rebuild = path.clone();
     let state_for_rebuild = state.clone();
     std::thread::spawn(move || {
-        state_for_rebuild.begin_op();
+        const OP: &str = "Rebuilding the index";
+        state_for_rebuild.begin_op(OP);
         struct Guard<'a> { s: &'a AppState }
-        impl Drop for Guard<'_> { fn drop(&mut self) { self.s.end_op(); } }
+        impl Drop for Guard<'_> { fn drop(&mut self) { self.s.end_op(OP); } }
         let _g = Guard { s: &state_for_rebuild };
         if let Some(db) = state_for_rebuild.db() {
             if let Err(err) = crate::db::pages_index::rebuild(&db, &path_for_rebuild) {

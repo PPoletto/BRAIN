@@ -17,6 +17,9 @@ pub struct TrayStatus {
     pub tooltip: String,
     pub vault_path: Option<String>,
     pub active_operations: u32,
+    /// Human labels of the in-flight operations (for the "what's running?"
+    /// tooltip). One entry per active op; length == `active_operations`.
+    pub active_operation_labels: Vec<String>,
     pub message: Option<String>,
 }
 
@@ -41,6 +44,7 @@ pub fn tray_status(state: State<Arc<crate::state::AppState>>) -> BrainResult<Tra
         tooltip,
         vault_path: state.vault_path().map(|p| p.display().to_string()),
         active_operations: state.active_ops(),
+        active_operation_labels: state.active_op_labels(),
         message,
     })
 }

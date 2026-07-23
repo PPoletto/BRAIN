@@ -73,8 +73,23 @@ export function StatusBar() {
       </span>
       <span className="ml-auto flex items-center gap-3">
         {tray.active_operations > 0 && (
-          <span className="text-amber-400">
+          <span
+            className="cursor-help text-amber-400"
+            title={
+              tray.active_operation_labels.length > 0
+                ? `Running:\n• ${tray.active_operation_labels.join("\n• ")}`
+                : "A background operation is running"
+            }
+          >
             {tray.active_operations} op{tray.active_operations === 1 ? "" : "s"} active
+            {tray.active_operation_labels.length > 0 && (
+              <span className="ml-1 text-amber-500/80">
+                — {tray.active_operation_labels[0]}
+                {tray.active_operation_labels.length > 1
+                  ? ` (+${tray.active_operation_labels.length - 1})`
+                  : ""}
+              </span>
+            )}
           </span>
         )}
         <button

@@ -73,7 +73,7 @@ mod tests {
     fn busy_state_when_any_active_op_running_independent_of_timing() {
         let app = AppState::new();
         app.set_mount(MountState::MountedIdle);
-        app.begin_op();
+        app.begin_op("test");
         let state = derive(&app, Some(Instant::now()), Instant::now());
         assert_eq!(state, TrayState::MountedBusy);
     }

@@ -109,7 +109,7 @@ async fn run_loop<R: Runtime>(
 }
 
 async fn process_idle_window<R: Runtime>(app: &AppHandle<R>, state: &Arc<AppState>, wiki: &Path) {
-    state.begin_op();
+    state.begin_op("Saving wiki changes");
     let result = run_lint_and_commit(wiki);
     // Refresh the SQLite index regardless of commit outcome — even a lint
     // failure leaves the working tree usable for search until the user fixes
@@ -122,7 +122,7 @@ async fn process_idle_window<R: Runtime>(app: &AppHandle<R>, state: &Arc<AppStat
             tracing::warn!(?err, "could not refresh 00_meta/index.md");
         }
     }
-    state.end_op();
+    state.end_op("Saving wiki changes");
 
     match result {
         Ok(LintCommit::Committed { commit, warnings }) => {

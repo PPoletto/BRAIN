@@ -1,7 +1,6 @@
 //! Application-wide state held in a shared `Arc<AppState>`.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::RwLock;
 
 use crate::config::ConfigStore;
@@ -38,7 +37,10 @@ pub struct AppState {
     db: RwLock<Option<DbHandle>>,
     last_registration: RwLock<Option<RegistrationReport>>,
     disk_cache: RwLock<Option<Vec<DiskInfo>>>,
-    active_ops: AtomicU32,
+    /// Labels of the operations currently in flight (one entry per active
+    /// op). The length is the "N ops active" count; the labels let the
+    /// tray/UI show *what* is running on hover.
+    ops: RwLock<Vec<String>>,
     /// The running wiki file-watcher, kept so operations that rewrite the
     /// working tree in bulk (e.g. the encrypt/convert step) can pause it
     /// — abort, do the work, respawn — instead of racing its auto-commit.
@@ -54,7 +56,7 @@ impl AppState {
             db: RwLock::new(None),
             last_registration: RwLock::new(None),
             disk_cache: RwLock::new(None),
-            active_ops: AtomicU32::new(0),
+            ops: RwLock::new(Vec::new()),
             watcher: RwLock::new(None),
         }
     }
@@ -130,18 +132,31 @@ impl AppState {
         *self.vault_path.write().expect("vault path write lock") = path;
     }
 
-    pub fn begin_op(&self) -> u32 {
-        self.active_ops.fetch_add(1, Ordering::SeqCst) + 1
+    /// Start an operation with a human label (e.g. "Syncing with the
+    /// remote"). Pair with [`end_op`] using the SAME label.
+    pub fn begin_op(&self, label: &str) {
+        self.ops.write().expect("ops write lock").push(label.to_string());
     }
 
-    pub fn end_op(&self) -> u32 {
-        let prev = self.active_ops.fetch_sub(1, Ordering::SeqCst);
-        debug_assert!(prev > 0, "end_op without matching begin_op");
-        prev.saturating_sub(1)
+    /// End an operation started with [`begin_op`]. Removes one entry with
+    /// the matching label.
+    pub fn end_op(&self, label: &str) {
+        let mut ops = self.ops.write().expect("ops write lock");
+        if let Some(pos) = ops.iter().position(|l| l == label) {
+            ops.remove(pos);
+        } else {
+            debug_assert!(false, "end_op without matching begin_op: {label}");
+        }
     }
 
     pub fn active_ops(&self) -> u32 {
-        self.active_ops.load(Ordering::SeqCst)
+        self.ops.read().expect("ops read lock").len() as u32
+    }
+
+    /// Labels of the operations currently in flight, for the tray/UI
+    /// tooltip ("what's running?").
+    pub fn active_op_labels(&self) -> Vec<String> {
+        self.ops.read().expect("ops read lock").clone()
     }
 }
 
@@ -164,12 +179,16 @@ mod tests {
     }
 
     #[test]
-    fn begin_and_end_op_track_active_count() {
+    fn begin_and_end_op_track_active_count_and_labels() {
         let s = AppState::new();
-        assert_eq!(s.begin_op(), 1);
-        assert_eq!(s.begin_op(), 2);
-        assert_eq!(s.end_op(), 1);
-        assert_eq!(s.end_op(), 0);
+        s.begin_op("Syncing");
+        s.begin_op("Rebuilding index");
+        assert_eq!(s.active_ops(), 2);
+        assert_eq!(s.active_op_labels(), vec!["Syncing", "Rebuilding index"]);
+        s.end_op("Syncing");
+        assert_eq!(s.active_ops(), 1);
+        assert_eq!(s.active_op_labels(), vec!["Rebuilding index"]);
+        s.end_op("Rebuilding index");
         assert_eq!(s.active_ops(), 0);
     }
 
