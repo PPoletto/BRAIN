@@ -384,6 +384,7 @@ function GitSyncTab() {
   const [pat, setPat] = useState("");
   const [conflicts, setConflicts] = useState<string[]>([]);
   const [recoveryKey, setRecoveryKey] = useState<string | null>(null);
+  const [confirmDisable, setConfirmDisable] = useState(false);
 
   const refreshStatus = useCallback(async () => {
     try {
@@ -459,6 +460,19 @@ function GitSyncTab() {
       await refreshStatus();
     },
     { errorPrefix: "Could not change auto-sync" },
+  );
+
+  const disableAction = useAsyncAction(
+    async () => {
+      await commands.disableVaultEncryption();
+      setConfirmDisable(false);
+      await refreshStatus();
+    },
+    {
+      pending: "Disabling encryption…",
+      success: "Encryption disabled — the vault is plaintext again",
+      errorPrefix: "Could not disable encryption",
+    },
   );
 
   return (
@@ -629,6 +643,51 @@ function GitSyncTab() {
           </div>
         )}
       </Card>
+
+      {status?.encrypted && (
+        <Card>
+          <CardHeader>
+            <div>
+              <CardTitle>Disable encryption</CardTitle>
+              <CardDescription>
+                Turn this vault back into a plaintext vault: pages get their
+                readable names back and future commits are unencrypted. Your
+                data isn't lost. Remove any network remote first — a plaintext
+                push would leak content.
+              </CardDescription>
+            </div>
+            <Button
+              variant="destructive"
+              size="sm"
+              loading={disableAction.loading}
+              onClick={() => setConfirmDisable(true)}
+            >
+              Disable encryption
+            </Button>
+          </CardHeader>
+        </Card>
+      )}
+
+      <ConfirmDialog
+        open={confirmDisable}
+        title="Disable encryption"
+        confirmLabel="Disable encryption"
+        tone="destructive"
+        loading={disableAction.loading}
+        onConfirm={() => void disableAction.trigger()}
+        onCancel={() => setConfirmDisable(false)}
+      >
+        <p>
+          BRAIN will rename pages back to their readable names and commit the
+          vault as <strong>plaintext</strong>. New commits are no longer
+          encrypted.
+        </p>
+        <p className="text-neutral-400">
+          Existing encrypted history stays as-is (and the master key stays in
+          your keychain, so you can re-enable later). Make sure the drive is
+          otherwise protected (volume encryption) if that matters to you.
+        </p>
+      </ConfirmDialog>
 
       <ConfirmDialog
         open={recoveryKey !== null}

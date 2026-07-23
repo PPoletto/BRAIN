@@ -211,5 +211,6 @@ export const commands = {
   syncNow: () => invoke<SyncReport>("sync_now"),
   enableVaultEncryption: () =>
     invoke<{ recovery_key: string }>("enable_vault_encryption"),
+  disableVaultEncryption: () => invoke<void>("disable_vault_encryption"),
   setAutoSync: (enabled: boolean) => invoke<void>("set_auto_sync", { enabled }),
 };

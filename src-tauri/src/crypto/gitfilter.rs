@@ -90,6 +90,31 @@ pub fn configure_repo_filter(wiki_path: &Path, brain_exe: &Path) -> Result<(), G
     Ok(())
 }
 
+/// Undo [`configure_repo_filter`]: drop the brain-crypt lines from
+/// `.gitattributes` (removing the file if nothing else remains) and delete
+/// the `filter.brain-crypt.*` config. Used when disabling encryption.
+pub fn remove_repo_filter(wiki_path: &Path) -> Result<(), GitFilterError> {
+    let attrs_path = wiki_path.join(".gitattributes");
+    if let Ok(existing) = std::fs::read_to_string(&attrs_path) {
+        let kept: Vec<&str> = existing
+            .lines()
+            .filter(|l| !GITATTRIBUTES_LINES.contains(&l.trim()))
+            .collect();
+        if kept.iter().all(|l| l.trim().is_empty()) {
+            let _ = std::fs::remove_file(&attrs_path);
+        } else {
+            std::fs::write(&attrs_path, format!("{}\n", kept.join("\n")))?;
+        }
+    }
+    let repo = git2::Repository::open(wiki_path)?;
+    let mut cfg = repo.config()?;
+    // Ignore "not found" — removal is idempotent.
+    let _ = cfg.remove(&format!("filter.{FILTER_NAME}.clean"));
+    let _ = cfg.remove(&format!("filter.{FILTER_NAME}.smudge"));
+    let _ = cfg.remove(&format!("filter.{FILTER_NAME}.required"));
+    Ok(())
+}
+
 /// Write the encrypted canary into the wiki repo.
 pub fn write_canary(wiki_path: &Path, keys: &DerivedKeys) -> Result<(), GitFilterError> {
     std::fs::write(wiki_path.join(CANARY_FILENAME), super::make_canary(keys))?;

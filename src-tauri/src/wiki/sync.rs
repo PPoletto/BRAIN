@@ -96,6 +96,12 @@ pub fn remote_url(wiki: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Whether the configured remote is a network (hosted) remote — used to
+/// refuse disabling encryption while a plaintext push could leak content.
+pub fn has_network_remote(wiki: &Path) -> bool {
+    remote_url(wiki).map(|u| is_network_url(&u)).unwrap_or(false)
+}
+
 /// Whether a remote credential (PAT) is stored for this vault.
 pub fn has_credential(wiki: &Path) -> bool {
     account_for(wiki)

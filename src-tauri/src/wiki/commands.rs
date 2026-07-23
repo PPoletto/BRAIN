@@ -99,6 +99,49 @@ pub async fn enable_vault_encryption(
     Ok(EncryptionResult { recovery_key })
 }
 
+/// Disable content encryption on the mounted vault (inverse of convert):
+/// pause the watcher + auto-sync, rename pages back to plaintext names,
+/// drop the canary/filter, commit the plaintext tree, reindex, then
+/// respawn the watcher. Refuses while a network remote is attached.
+#[tauri::command]
+pub async fn disable_vault_encryption(
+    state: State<'_, Arc<crate::state::AppState>>,
+    app: AppHandle,
+) -> BrainResult<()> {
+    let vault = state
+        .vault_path()
+        .ok_or_else(|| BrainError::Internal("no vault is currently mounted".into()))?;
+
+    if let Some(w) = state.take_watcher() {
+        w.abort();
+    }
+    // Stop auto-sync too — the vault layout is about to change wholesale.
+    state.set_auto_sync_task(None);
+    state.begin_op("Disabling encryption");
+
+    let decrypt_vault = vault.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::wiki::encryption::disable_encryption(&decrypt_vault)
+    })
+    .await
+    .map_err(|e| BrainError::Internal(format!("decrypt task panicked: {e}")));
+
+    if let Some(db) = state.db() {
+        let reindex_vault = vault.clone();
+        let _ =
+            tokio::task::spawn_blocking(move || crate::db::pages_index::rebuild(&db, &reindex_vault))
+                .await;
+    }
+    state.set_watcher(Some(crate::wiki::watcher::spawn(
+        app,
+        state.inner().clone(),
+        vault,
+    )));
+    state.end_op("Disabling encryption");
+
+    result?.map_err(BrainError::from)
+}
+
 /// Result of a sync, for the UI toast.
 #[derive(Debug, Clone, Serialize)]
 pub struct SyncReport {

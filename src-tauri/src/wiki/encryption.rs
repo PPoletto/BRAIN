@@ -351,6 +351,95 @@ fn collect_page_renames(
     Ok(())
 }
 
+/// Disable content encryption on `vault` — the inverse of convert. Renames
+/// pages back to their plaintext `<id>.md` names, drops the canary and the
+/// brain-crypt filter config, and commits the now-plaintext tree. The
+/// master key is left in the keychain (dormant) so re-enabling reuses it
+/// and old encrypted history stays readable. Refuses while a network
+/// remote is attached — a plaintext push would leak content. No-op if the
+/// vault isn't encrypted.
+pub fn disable_encryption(vault: &Path) -> WikiResult<()> {
+    disable_encryption_with_store(vault, &KeyringStore)
+}
+
+pub(crate) fn disable_encryption_with_store(
+    vault: &Path,
+    store: &impl MasterKeyStore,
+) -> WikiResult<()> {
+    if !is_encrypted(vault) {
+        return Ok(());
+    }
+    let wiki = wiki_dir(vault);
+    if crate::wiki::sync::has_network_remote(&wiki) {
+        return Err(WikiError::Encryption(
+            "remove the network remote before disabling encryption — otherwise the next \
+             push would send plaintext"
+                .to_string(),
+        ));
+    }
+    // 1. Opaque → plaintext filenames (from the frontmatter id).
+    rename_pages_to_plaintext(&wiki)?;
+    // 2. Drop the canary + filter config, so is_encrypted() becomes false
+    //    and the commit below stages plaintext blobs.
+    let _ = std::fs::remove_file(wiki.join(gitfilter::CANARY_FILENAME));
+    gitfilter::remove_repo_filter(&wiki).map_err(|e| WikiError::Encryption(e.to_string()))?;
+    // 3. Commit the plaintext tree (is_encrypted now false → plaintext
+    //    add_all + commit; stages the renames, the canary deletion and the
+    //    .gitattributes change).
+    commit_wiki_with_store(&wiki, "decrypt: disable content encryption", store)?;
+    Ok(())
+}
+
+/// Rename every page from its opaque path back to the plaintext `<id>.md`,
+/// based on the frontmatter id. Inverse of [`rename_pages_to_opaque`];
+/// content-loss-safe (a filesystem rename) and idempotent. Returns the
+/// number of files renamed.
+pub fn rename_pages_to_plaintext(wiki: &Path) -> WikiResult<usize> {
+    let mut moves: Vec<(PathBuf, PathBuf)> = Vec::new();
+    collect_plaintext_renames(wiki, wiki, &mut moves)?;
+    let mut renamed = 0;
+    for (old_abs, new_abs) in moves {
+        if old_abs == new_abs {
+            continue;
+        }
+        if let Some(parent) = new_abs.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::rename(&old_abs, &new_abs)?;
+        renamed += 1;
+    }
+    Ok(renamed)
+}
+
+fn collect_plaintext_renames(
+    wiki: &Path,
+    dir: &Path,
+    out: &mut Vec<(PathBuf, PathBuf)>,
+) -> WikiResult<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            collect_plaintext_renames(wiki, &path, out)?;
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(parsed) = crate::wiki::page::parse(&raw) else {
+            continue;
+        };
+        out.push((path, wiki.join(page_relpath_for_id(&parsed.frontmatter.id))));
+    }
+    Ok(())
+}
+
 /// Index entry for a hand-encrypted blob. Only `mode` and `path` matter
 /// to `add_frombuffer` — it hashes the buffer and fills in the object id
 /// and size. Stat fields stay zero: git2 owns all staging of encrypted
@@ -640,6 +729,36 @@ mod tests {
         assert!(raw.contains("id: entities/michael-simon"), "id stays in frontmatter");
         // Idempotent.
         assert_eq!(rename_pages_to_opaque(&wiki, &keys).unwrap(), 0, "second run is a no-op");
+    }
+
+    #[test]
+    fn disable_encryption_restores_plaintext_names_and_blobs() {
+        let tmp = vault_with_repo();
+        let wiki = wiki_dir(tmp.path());
+        std::fs::write(
+            wiki.join("entities").join("alice.md"),
+            "---\nid: entities/alice\ntype: entity\ntitle: A\n---\nbody\n",
+        )
+        .unwrap();
+        crate::wiki::git::commit_all(&wiki, "baseline").unwrap();
+        let store = MemStore::default();
+        enable_encryption(tmp.path(), &store, &PathBuf::from("/opt/brain/brain")).unwrap();
+        commit_wiki_with_store(&wiki, "encrypt", &store).unwrap();
+        assert!(is_encrypted(tmp.path()));
+
+        disable_encryption_with_store(tmp.path(), &store).unwrap();
+
+        assert!(!is_encrypted(tmp.path()), "canary gone → vault reports plaintext");
+        assert!(
+            wiki.join("entities").join("alice.md").exists(),
+            "plaintext filename restored in the working tree"
+        );
+        let repo = git2::Repository::open(&wiki).unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        let entry = tree.get_path(Path::new("entities/alice.md")).unwrap();
+        let blob = repo.find_blob(entry.id()).unwrap();
+        assert!(!looks_encrypted(blob.content()), "committed blob is plaintext again");
+        assert!(std::str::from_utf8(blob.content()).unwrap().contains("id: entities/alice"));
     }
 
     #[test]
