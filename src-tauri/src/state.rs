@@ -8,6 +8,7 @@ use crate::config::ConfigStore;
 use crate::db::DbHandle;
 use crate::mcp::registration::RegistrationReport;
 use crate::onboarding::disks::DiskInfo;
+use crate::wiki::watcher::WikiWatcher;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MountState {
@@ -38,6 +39,10 @@ pub struct AppState {
     last_registration: RwLock<Option<RegistrationReport>>,
     disk_cache: RwLock<Option<Vec<DiskInfo>>>,
     active_ops: AtomicU32,
+    /// The running wiki file-watcher, kept so operations that rewrite the
+    /// working tree in bulk (e.g. the encrypt/convert step) can pause it
+    /// — abort, do the work, respawn — instead of racing its auto-commit.
+    watcher: RwLock<Option<WikiWatcher>>,
 }
 
 impl AppState {
@@ -50,7 +55,23 @@ impl AppState {
             last_registration: RwLock::new(None),
             disk_cache: RwLock::new(None),
             active_ops: AtomicU32::new(0),
+            watcher: RwLock::new(None),
         }
+    }
+
+    /// Store the running watcher, aborting any previous one first.
+    pub fn set_watcher(&self, watcher: Option<WikiWatcher>) {
+        let mut guard = self.watcher.write().expect("watcher write lock");
+        if let Some(old) = guard.take() {
+            old.abort();
+        }
+        *guard = watcher;
+    }
+
+    /// Take the running watcher out (aborting is the caller's job — used
+    /// to pause auto-commit around a bulk working-tree rewrite).
+    pub fn take_watcher(&self) -> Option<WikiWatcher> {
+        self.watcher.write().expect("watcher write lock").take()
     }
 
     pub fn disk_cache(&self) -> Option<Vec<DiskInfo>> {

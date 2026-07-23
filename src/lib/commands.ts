@@ -207,4 +207,6 @@ export const commands = {
   setGitRemote: (url: string) => invoke<void>("set_git_remote", { url }),
   setGitCredential: (pat: string) => invoke<void>("set_git_credential", { pat }),
   syncNow: () => invoke<SyncReport>("sync_now"),
+  enableVaultEncryption: () =>
+    invoke<{ recovery_key: string }>("enable_vault_encryption"),
 };

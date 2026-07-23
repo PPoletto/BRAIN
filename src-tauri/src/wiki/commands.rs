@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use serde::Serialize;
-use tauri::State;
+use tauri::{AppHandle, State};
 
 use crate::error::{BrainError, BrainResult};
 use crate::vault::layout::wiki_dir;
@@ -28,6 +28,73 @@ pub struct RemoteStatus {
     pub remote_url: Option<String>,
     /// Whether a credential (PAT) is stored for the remote on this machine.
     pub has_credential: bool,
+}
+
+/// Returned by [`enable_vault_encryption`] — the recovery key shown once
+/// so the user can save it in their password manager.
+#[derive(Debug, Clone, Serialize)]
+pub struct EncryptionResult {
+    pub recovery_key: String,
+}
+
+/// Enable content encryption on the mounted vault (the GUI "convert"):
+/// pause the watcher, encrypt + opaque-rename + commit, reindex, then
+/// respawn the watcher. Returns the recovery key ONCE. Idempotent —
+/// re-running returns the existing key and changes nothing (rename and
+/// commit are no-ops on an already-encrypted vault).
+#[tauri::command]
+pub async fn enable_vault_encryption(
+    state: State<'_, Arc<crate::state::AppState>>,
+    app: AppHandle,
+) -> BrainResult<EncryptionResult> {
+    let vault = state
+        .vault_path()
+        .ok_or_else(|| BrainError::Internal("no vault is currently mounted".into()))?;
+
+    // Pause auto-commit while the whole working tree is rewritten (rename
+    // + re-encrypt), so the watcher can't commit a half-converted tree.
+    if let Some(w) = state.take_watcher() {
+        w.abort();
+    }
+    state.begin_op();
+
+    let convert_vault = vault.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let store = crate::crypto::keychain::KeyringStore;
+        let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("brain"));
+        let key = crate::wiki::encryption::enable_encryption(&convert_vault, &store, &exe)
+            .map_err(|e| format!("{e:#}"))?;
+        let keys = key.derive();
+        let wiki = crate::vault::layout::wiki_dir(&convert_vault);
+        crate::wiki::encryption::rename_pages_to_opaque(&wiki, &keys)
+            .map_err(|e| e.to_string())?;
+        crate::wiki::encryption::commit_wiki(
+            &wiki,
+            "encrypt: enable content encryption + opaque filenames",
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(key.to_hex())
+    })
+    .await
+    .map_err(|e| BrainError::Internal(format!("encryption task panicked: {e}")));
+
+    // Paths changed (opaque rename) — rebuild the index. Respawn the
+    // watcher regardless of the convert outcome so auto-commit resumes.
+    if let Some(db) = state.db() {
+        let reindex_vault = vault.clone();
+        let _ =
+            tokio::task::spawn_blocking(move || crate::db::pages_index::rebuild(&db, &reindex_vault))
+                .await;
+    }
+    state.set_watcher(Some(crate::wiki::watcher::spawn(
+        app,
+        state.inner().clone(),
+        vault,
+    )));
+    state.end_op();
+
+    let recovery_key = result?.map_err(BrainError::Internal)?;
+    Ok(EncryptionResult { recovery_key })
 }
 
 /// Result of a sync, for the UI toast.

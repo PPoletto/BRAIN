@@ -407,7 +407,11 @@ fn complete_auto_mount(
         app_state.set_db(Some(db));
     }
 
-    let _ = crate::wiki::watcher::spawn(app.clone(), app_state.clone(), vault_path.clone());
+    app_state.set_watcher(Some(crate::wiki::watcher::spawn(
+        app.clone(),
+        app_state.clone(),
+        vault_path.clone(),
+    )));
 
     let path_str = vault_path.to_string_lossy().to_string();
     let _ = app.emit(
@@ -511,7 +515,11 @@ pub fn finish_onboarding(
     // Start the wiki watcher so edits via external editors or MCP get
     // automatically committed.
     let inner_state: Arc<crate::state::AppState> = state.inner().clone();
-    let _ = crate::wiki::watcher::spawn(app.clone(), inner_state, vault_path.clone());
+    inner_state.set_watcher(Some(crate::wiki::watcher::spawn(
+        app.clone(),
+        inner_state.clone(),
+        vault_path.clone(),
+    )));
 
     let _ = app.emit(
         "mount-state",

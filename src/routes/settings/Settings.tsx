@@ -382,6 +382,7 @@ function GitSyncTab() {
   const [url, setUrl] = useState("");
   const [pat, setPat] = useState("");
   const [conflicts, setConflicts] = useState<string[]>([]);
+  const [recoveryKey, setRecoveryKey] = useState<string | null>(null);
 
   const refreshStatus = useCallback(async () => {
     try {
@@ -396,6 +397,15 @@ function GitSyncTab() {
   useEffect(() => {
     void refreshStatus();
   }, [refreshStatus]);
+
+  const enableAction = useAsyncAction(
+    async () => {
+      const res = await commands.enableVaultEncryption();
+      setRecoveryKey(res.recovery_key);
+      await refreshStatus();
+    },
+    { pending: "Enabling encryption…", errorPrefix: "Could not enable encryption" },
+  );
 
   const saveRemote = useAsyncAction(
     async () => {
@@ -444,12 +454,28 @@ function GitSyncTab() {
   return (
     <div className="space-y-6">
       {status && !status.encrypted && (
-        <ErrorBanner tone="warning">
-          This vault is not encrypted yet. Enable content encryption with{" "}
-          <code className="font-mono">brain convert</code> before attaching a
-          network remote — pushing an unencrypted vault to a hosting service is
-          refused.
-        </ErrorBanner>
+        <Card tone="warning">
+          <CardHeader>
+            <div>
+              <CardTitle>Enable content encryption</CardTitle>
+              <CardDescription>
+                Encrypts page content and replaces filenames with opaque
+                tokens, so a copy of the repo reveals neither content nor
+                names. Required before a network remote can be attached. You'll
+                get a recovery key — save it in your password manager;{" "}
+                <strong>losing it makes any pushed copy unreadable.</strong>
+              </CardDescription>
+            </div>
+            <Button
+              variant="primary"
+              size="sm"
+              loading={enableAction.loading}
+              onClick={() => void enableAction.trigger()}
+            >
+              {enableAction.loading ? "Encrypting…" : "Enable encryption"}
+            </Button>
+          </CardHeader>
+        </Card>
       )}
 
       <Card>
@@ -552,6 +578,25 @@ function GitSyncTab() {
           </div>
         )}
       </Card>
+
+      <ConfirmDialog
+        open={recoveryKey !== null}
+        title="Save your recovery key"
+        confirmLabel="I've saved it"
+        tone="destructive"
+        onConfirm={() => setRecoveryKey(null)}
+        onCancel={() => setRecoveryKey(null)}
+      >
+        <p>
+          Store this in your password manager <strong>now</strong> — it is
+          shown only once. Without it, any pushed or backed-up copy of this
+          vault is <strong>permanently unreadable</strong>, and you cannot open
+          the vault on another machine.
+        </p>
+        <pre className="mt-2 select-all overflow-x-auto rounded-md border border-neutral-800 bg-neutral-900 p-3 font-mono text-sm">
+          {recoveryKey}
+        </pre>
+      </ConfirmDialog>
     </div>
   );
 }
