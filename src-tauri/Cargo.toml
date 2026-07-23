@@ -67,11 +67,11 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 # `Location` header. Sync flavour only — we don't want a second tokio.
 hf-hub = { version = "0.4", default-features = false, features = ["ureq", "native-tls"] }
 
-# Wiki / Git
-# `https` enables the remote transport for S11 sync. On Windows this uses
-# WinHTTP + schannel (no OpenSSL at runtime); macOS uses SecureTransport;
-# Linux uses OpenSSL (add openssl handling if/when a Linux build needs it).
-git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2", "https"] }
+# Wiki / Git — git2 is declared per-target below (after this section):
+# the `https` feature pulls openssl-sys on every unix target, and the
+# macOS x86_64 RELEASE build cross-compiles on an arm64 runner where the
+# host Homebrew OpenSSL is the wrong architecture — macOS therefore
+# vendors OpenSSL (built from source for the exact target).
 notify = "6.1"
 notify-debouncer-full = "0.3"
 
@@ -127,6 +127,21 @@ rand = "0.8"
 
 # External editor
 open = "5.3"
+
+# git2 per target (S11 sync remote transport, `https` feature):
+#  - Windows: WinHTTP + schannel — no OpenSSL involved at all.
+#  - macOS: `vendored-openssl` builds OpenSSL from source FOR THE TARGET,
+#    which is what makes the x86_64-apple-darwin cross-compile on the
+#    arm64 CI runner work (the host's arm64 Homebrew OpenSSL can't link).
+#  - other unix (Linux): system OpenSSL, as before (CI installs libssl-dev).
+[target.'cfg(windows)'.dependencies]
+git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2", "https"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2", "https", "vendored-openssl"] }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2", "https"] }
 
 [dev-dependencies]
 tempfile = "3.13"
