@@ -24,6 +24,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use git2::{build::CheckoutBuilder, Oid, Repository, Signature};
 
 use crate::crypto::keychain::{self, KeyringStore, MasterKeyStore};
+use crate::crypto::{gitfilter, MasterKey};
+use crate::vault::layout::wiki_dir;
 
 use super::encryption;
 use super::git::{init_repo, COMMITTER_EMAIL, COMMITTER_NAME};
@@ -125,6 +127,84 @@ fn remote_callbacks<'a>(account: Option<String>) -> git2::RemoteCallbacks<'a> {
         ))
     });
     cb
+}
+
+/// Remote callbacks that supply an explicitly-provided PAT (used during
+/// clone, before any credential is stored in the keychain).
+fn callbacks_with_pat<'a>(pat: Option<String>) -> git2::RemoteCallbacks<'a> {
+    let mut cb = git2::RemoteCallbacks::new();
+    cb.credentials(move |_url, username_from_url, allowed| {
+        if allowed.contains(git2::CredentialType::USER_PASS_PLAINTEXT) {
+            if let Some(pat) = &pat {
+                let user = username_from_url.unwrap_or("x-access-token");
+                return git2::Cred::userpass_plaintext(user, pat);
+            }
+        }
+        if allowed.contains(git2::CredentialType::DEFAULT) {
+            return git2::Cred::default();
+        }
+        Err(git2::Error::from_str("no credential available for this remote"))
+    });
+    cb
+}
+
+/// Clone an encrypted BRAIN wiki repo into `<vault>/02_wiki` and prepare
+/// it for use on this machine. Steps: clone → verify the recovery key
+/// against the committed canary → store the key (and the PAT) in the
+/// keychain → configure the local clean/smudge filter → materialise the
+/// plaintext working tree. The vault MUST already have a marker (the
+/// caller creates a fresh one so `vault_account` resolves) but no wiki
+/// dir yet.
+///
+/// Returns a clear error — and stores nothing — when the recovery key is
+/// wrong, so a bad key never mounts garbage. The caller does the rest of
+/// onboarding (skeleton, templates + fresh bearer token, MCP, index).
+pub fn clone_and_prepare(
+    url: &str,
+    pat: Option<&str>,
+    vault: &Path,
+    recovery_key_hex: &str,
+    brain_exe: &Path,
+) -> WikiResult<()> {
+    let wiki = wiki_dir(vault);
+
+    // Validate the key format up front so a typo fails before the network.
+    let key = MasterKey::from_hex(recovery_key_hex.trim())
+        .ok_or_else(|| WikiError::Encryption("recovery key must be 64 hex characters".into()))?;
+
+    // Clone (working tree is ciphertext — no filter configured yet).
+    let mut fo = git2::FetchOptions::new();
+    fo.remote_callbacks(callbacks_with_pat(pat.map(str::to_string)));
+    let mut builder = git2::build::RepoBuilder::new();
+    builder.fetch_options(fo);
+    builder.remote_create(|repo, _name, url| repo.remote(DEFAULT_REMOTE, url));
+    builder
+        .clone(url, &wiki)
+        .map_err(|e| WikiError::Encryption(format!("clone failed: {e}")))?;
+
+    // Verify the key against the canary BEFORE storing anything.
+    let keys = key.derive();
+    if !gitfilter::canary_matches(&wiki, &keys) {
+        return Err(WikiError::Encryption(
+            "recovery key does not match this vault — wrong key".into(),
+        ));
+    }
+
+    // Persist the key (and PAT, so later syncs work) under this machine's
+    // fresh vault_id account.
+    let account = keychain::vault_account(vault).map_err(|e| WikiError::Encryption(e.to_string()))?;
+    keychain::store_master_key(&KeyringStore, &account, &key)
+        .map_err(|e| WikiError::Encryption(e.to_string()))?;
+    if let Some(pat) = pat {
+        keychain::store_git_pat(&account, pat).map_err(|e| WikiError::Encryption(e.to_string()))?;
+    }
+
+    // Configure the local filter (interop for plain git) and decrypt the
+    // working tree in place.
+    gitfilter::configure_repo_filter(&wiki, brain_exe)
+        .map_err(|e| WikiError::Encryption(e.to_string()))?;
+    encryption::smudge_worktree_from_head(&wiki)?;
+    Ok(())
 }
 
 /// Fetch the remote's refs into the remote-tracking namespace.

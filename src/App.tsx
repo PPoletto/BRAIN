@@ -4,6 +4,7 @@ import { AppShell } from "./components/shell/AppShell";
 import { OnboardingLayout } from "./routes/onboarding/OnboardingLayout";
 import { Welcome } from "./routes/onboarding/Welcome";
 import { Medium } from "./routes/onboarding/Medium";
+import { CloneVault } from "./routes/onboarding/CloneVault";
 import { Format } from "./routes/onboarding/Format";
 import { TemplatePopulation } from "./routes/onboarding/TemplatePopulation";
 import { Completion } from "./routes/onboarding/Completion";
@@ -23,6 +24,7 @@ export const router = createBrowserRouter([
     children: [
       { index: true, element: <Welcome /> },
       { path: "medium", element: <Medium /> },
+      { path: "clone", element: <CloneVault /> },
       { path: "format", element: <Format /> },
       { path: "template", element: <TemplatePopulation /> },
       { path: "completion", element: <Completion /> },

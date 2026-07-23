@@ -198,6 +198,10 @@ export const commands = {
   applyUpdate: () => invoke<void>("apply_update"),
   skipUpdate: (version: string) => invoke<void>("skip_update", { version }),
 
+  // Clone an existing encrypted vault onto this machine (S11 phase 6b)
+  cloneVault: (url: string, pat: string | null, path: string, recoveryKey: string) =>
+    invoke<void>("clone_vault", { url, pat, path, recoveryKey }),
+
   // Remote sync (S11 phase 6)
   gitRemoteStatus: () => invoke<RemoteStatus>("git_remote_status"),
   setGitRemote: (url: string) => invoke<void>("set_git_remote", { url }),

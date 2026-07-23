@@ -136,6 +136,51 @@ pub fn populate_template(path: String) -> BrainResult<()> {
     crate::onboarding::template::populate(&p).map_err(BrainError::from)
 }
 
+/// S11 phase 6b — clone an encrypted BRAIN vault from a Git remote onto
+/// this machine. Creates a fresh marker (new per-machine `vault_id`),
+/// clones `02_wiki` and decrypts it in place after validating the recovery
+/// key against the committed canary, then fills the non-repo skeleton and
+/// writes fresh templates (`.mcp.json` with a per-machine token, never the
+/// origin's — `00_meta` is not in the repo). The frontend then routes to
+/// the completion screen, whose `finish_onboarding` mounts + indexes +
+/// registers MCP. A wrong key mounts nothing and the partial clone is
+/// removed so a retry works.
+#[tauri::command]
+pub async fn clone_vault(
+    url: String,
+    pat: Option<String>,
+    path: String,
+    recovery_key: String,
+) -> BrainResult<()> {
+    let vault = PathBuf::from(&path);
+    if crate::vault::layout::wiki_dir(&vault).exists() {
+        return Err(BrainError::Internal(format!(
+            "'{}' already contains a 02_wiki — choose an empty folder",
+            vault.display()
+        )));
+    }
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        std::fs::create_dir_all(&vault).map_err(|e| e.to_string())?;
+        let marker = VaultMarker::new(env!("CARGO_PKG_VERSION"));
+        crate::vault::marker::write_marker(&vault, &marker).map_err(|e| e.to_string())?;
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("brain"));
+        if let Err(e) =
+            crate::wiki::sync::clone_and_prepare(&url, pat.as_deref(), &vault, recovery_key.trim(), &exe)
+        {
+            // Nothing was stored in the keychain (the canary check runs
+            // before that); remove the partial clone so a retry works.
+            let _ = std::fs::remove_dir_all(crate::vault::layout::wiki_dir(&vault));
+            return Err(e.to_string());
+        }
+        crate::vault::layout::ensure_skeleton(&vault).map_err(|e| e.to_string())?;
+        crate::onboarding::template::populate(&vault).map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| BrainError::Internal(format!("clone task panicked: {e}")))?
+    .map_err(BrainError::Internal)
+}
+
 /// Downloads the bge-m3 model files (~2.3 GB) from HuggingFace into
 /// `04_models/bge-m3/`. Idempotent — files that already exist on disk are
 /// skipped, so re-running the wizard is cheap.

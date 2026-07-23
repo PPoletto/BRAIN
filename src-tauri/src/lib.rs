@@ -131,6 +131,68 @@ pub fn run_remote_add(vault_arg: Option<&str>, url: Option<&str>) -> i32 {
     }
 }
 
+/// Entry point for `brain clone <url> <target-vault-dir>` — clone an
+/// encrypted vault onto this machine (S11 phase 6b, CLI core). Creates a
+/// fresh marker, clones `02_wiki`, validates the recovery key against the
+/// canary, stores the key, configures the filter, and materialises the
+/// plaintext working tree, then fills the non-repo skeleton dirs. Reads
+/// STDIN: line 1 = recovery key (required), line 2 = PAT (optional, for
+/// an authenticated remote). The app's onboarding wizard wraps the same
+/// core with template/bearer-token/index/mount steps. Returns an exit
+/// code.
+pub fn run_clone(url: Option<&str>, target: Option<&str>) -> i32 {
+    configure_libgit2();
+    let (Some(url), Some(target)) = (url, target) else {
+        eprintln!("usage: brain clone <url> <target-vault-dir>   (recovery key on stdin line 1, optional PAT on line 2)");
+        return 2;
+    };
+    let vault = std::path::Path::new(target);
+    if vault::layout::wiki_dir(vault).exists() {
+        eprintln!("clone: '{}/02_wiki' already exists — refusing to overwrite", vault.display());
+        return 3;
+    }
+    let mut stdin_buf = String::new();
+    use std::io::Read as _;
+    if std::io::stdin().read_to_string(&mut stdin_buf).is_err() {
+        eprintln!("clone: could not read the recovery key from stdin");
+        return 4;
+    }
+    let mut lines = stdin_buf.lines();
+    let recovery_key = lines.next().unwrap_or("").trim().to_string();
+    let pat = lines.next().map(str::trim).filter(|s| !s.is_empty());
+    if recovery_key.is_empty() {
+        eprintln!("clone: no recovery key on stdin");
+        return 4;
+    }
+    // Fresh per-machine marker so vault_account resolves (vault_id is a
+    // local keychain handle, not cryptographic — the master key is what
+    // must match across machines).
+    if let Err(e) = std::fs::create_dir_all(vault) {
+        eprintln!("clone: could not create target dir: {e}");
+        return 5;
+    }
+    let marker = vault::marker::VaultMarker::new(env!("CARGO_PKG_VERSION"));
+    if let Err(e) = vault::marker::write_marker(vault, &marker) {
+        eprintln!("clone: could not write vault marker: {e}");
+        return 5;
+    }
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("brain"));
+    if let Err(e) = wiki::sync::clone_and_prepare(url, pat, vault, &recovery_key, &exe) {
+        eprintln!("clone failed: {e}");
+        // Remove the partial clone so a retry (e.g. with the right key)
+        // isn't blocked by the existing 02_wiki.
+        let _ = std::fs::remove_dir_all(vault::layout::wiki_dir(vault));
+        return 6;
+    }
+    if let Err(e) = vault::layout::ensure_skeleton(vault) {
+        eprintln!("clone: could not create vault skeleton: {e}");
+        return 7;
+    }
+    println!("cloned and decrypted into {}", vault.display());
+    println!("(run the app to build the index; onboarding wizard adds templates + MCP)");
+    0
+}
+
 /// Entry point for `brain remote-cred <vault-path>` — store the remote
 /// credential (PAT) in the OS keychain. The PAT is read from STDIN (not a
 /// CLI arg) so it never lands in shell history. Returns a process exit
@@ -270,6 +332,7 @@ pub fn run() {
             onboarding::commands::format_disk,
             onboarding::commands::init_vault,
             onboarding::commands::populate_template,
+            onboarding::commands::clone_vault,
             onboarding::commands::download_embedding_model,
             onboarding::commands::read_marker,
             onboarding::commands::detect_existing_vault,
