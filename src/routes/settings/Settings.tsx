@@ -516,9 +516,12 @@ function GitSyncTab() {
           <div>
             <CardTitle>Access token</CardTitle>
             <CardDescription>
-              A personal access token for the remote, stored only in your OS
-              keychain — never in the repo. It needs <strong>push access</strong>{" "}
-              to the repository.
+              Your <strong>GitHub</strong> personal access token (looks like{" "}
+              <code className="font-mono">ghp_…</code> or{" "}
+              <code className="font-mono">github_pat_…</code>), created at
+              github.com/settings/tokens with <strong>push access</strong> to
+              this repo. This is <strong>not</strong> your BRAIN recovery key.
+              Stored only in your OS keychain — never in the repo.
             </CardDescription>
           </div>
         </CardHeader>
@@ -597,6 +600,10 @@ function GitSyncTab() {
           shown only once. Without it, any pushed or backed-up copy of this
           vault is <strong>permanently unreadable</strong>, and you cannot open
           the vault on another machine.
+        </p>
+        <p className="mt-2 text-neutral-400">
+          This is your vault's <strong>encryption key</strong> — not a GitHub
+          token. It never leaves this machine and never goes to the remote.
         </p>
         <pre className="mt-2 select-all overflow-x-auto rounded-md border border-neutral-800 bg-neutral-900 p-3 font-mono text-sm">
           {recoveryKey}
