@@ -6,6 +6,17 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-07-23
+
+### Fixed
+
+- **Only one BRAIN instance runs at a time.** Launching BRAIN from the
+  Programs menu while it was already running in the tray started a
+  second copy — two file watchers double-committing, two auto-sync
+  schedulers, the index database opened twice, and a duplicate tray
+  icon. A second launch now simply brings the existing window to the
+  front.
+
 ## [0.3.0] — 2026-07-23
 
 ### Added — S11 vault sync (encrypted Git remote)
