@@ -26,6 +26,13 @@ tauri-plugin-updater = "2.0"
 # Windows registry (Run key), macOS LaunchAgents, and `~/.config/autostart/`
 # on Linux. Wired into the Settings → General toggle.
 tauri-plugin-autostart = "2.0"
+# One GUI instance per machine: launching BRAIN from the Programs menu
+# while it already runs (tray) must focus the existing window, not spawn
+# a second process (which would double-mount the vault: two watchers,
+# two auto-sync schedulers, the SQLite index opened twice). CLI
+# subcommands (`brain mcp`, filters) never reach the Builder, so they
+# are unaffected.
+tauri-plugin-single-instance = "2"
 
 # Async + concurrency
 tokio = { version = "1.40", features = ["full"] }

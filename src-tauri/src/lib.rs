@@ -299,7 +299,27 @@ pub fn run() {
 
     let app_state = Arc::new(AppState::new());
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // MUST be the first plugin: a second GUI launch (Programs menu while
+    // the tray instance runs) exits immediately and this callback fires
+    // in the FIRST instance instead — bring its window to the front.
+    // Without this, two processes double-mount the vault: two watchers,
+    // two auto-sync schedulers, the SQLite index opened twice.
+    //
+    // Release builds only: the instance identity is the app identifier,
+    // which dev and release share — registering it in debug builds would
+    // make `pnpm tauri dev` exit and focus the INSTALLED app instead of
+    // starting the dev instance (mirrors the brain-dev config isolation).
+    #[cfg(not(debug_assertions))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        use tauri::Manager;
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+        }
+    }));
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_shell::init())
