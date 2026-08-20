@@ -67,8 +67,47 @@ struct RpcError {
     data: Option<Value>,
 }
 
+/// Belt-and-suspenders against orphaned `brain mcp` processes.
+///
+/// A stdio server normally exits when the client dies: the OS closes the
+/// stdin pipe, the read loop sees EOF, `run_stdio` returns. But on
+/// Windows the pipe's WRITE end can be inherited by other children of
+/// the client process — then the pipe never fully closes, EOF never
+/// arrives, and every finished LLM session leaves a `brain.exe mcp`
+/// running forever (observed in the wild: dozens after a day of use).
+///
+/// This watchdog snapshots the parent PID (+ name, as a PID-reuse guard)
+/// at startup and polls it; when the parent is gone the server exits.
+/// Exit code 0 — an orphan shutting down is normal, not an error.
+fn spawn_parent_watchdog() {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+    let me = Pid::from_u32(std::process::id());
+    let mut sys = System::new();
+    sys.refresh_processes(ProcessesToUpdate::All, true);
+    let Some(parent_pid) = sys.process(me).and_then(|p| p.parent()) else {
+        return; // no detectable parent — nothing to watch
+    };
+    let parent_name = sys.process(parent_pid).map(|p| p.name().to_os_string());
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(20));
+            let mut sys = System::new();
+            sys.refresh_processes(ProcessesToUpdate::Some(&[parent_pid]), true);
+            let alive = sys.process(parent_pid).is_some_and(|p| {
+                // Same PID but a different image name = the PID was
+                // recycled by an unrelated process; our parent is gone.
+                parent_name.as_deref().is_none_or(|n| p.name() == n)
+            });
+            if !alive {
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
 /// Entrypoint for `brain mcp`. Reads env, then runs the dispatch loop.
 pub fn run_stdio() -> std::io::Result<()> {
+    spawn_parent_watchdog();
     // The configured vault path from the registration env var. We
     // deliberately do NOT `is_vault`-filter it once at startup:
     //   - the disk may be absent at launch (Claude started before the
