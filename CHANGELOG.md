@@ -6,6 +6,20 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-07-23
+
+### Fixed
+
+- **Finished LLM sessions no longer leave `brain mcp` processes
+  running.** Every Claude (or other MCP client) session starts its own
+  BRAIN server process, which is supposed to exit when the session
+  closes. On Windows that exit signal can get lost, and dead sessions
+  accumulated dozens of background `brain.exe` processes over a day.
+  Each server now watches its parent process directly and shuts down
+  within seconds of the session ending. One-time cleanup of existing
+  orphans: close your LLM clients and end the leftover `brain.exe`
+  processes in Task Manager (or reboot).
+
 ## [0.3.1] — 2026-07-23
 
 ### Fixed
