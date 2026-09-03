@@ -1,6 +1,6 @@
 [package]
 name = "brain"
-version = "0.3.2"
+version = "0.3.3"
 description = "BRAIN — personal knowledge system"
 authors = ["Pascal Poletto"]
 edition = "2024"

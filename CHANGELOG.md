@@ -6,6 +6,38 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.3] — 2026-09-03
+
+### Fixed
+
+- **Intermittent MCP disconnects are no longer silent.** A field log
+  showed `brain mcp` servers ending with "Server transport closed
+  unexpectedly" and no explanation, plus one genuine out-of-memory
+  abort (`memory allocation of 1530392 bytes failed`) hitting two
+  server processes at the same instant. Every exit path now says why
+  on stderr — which Claude Desktop / Claude Code capture into their
+  MCP log: stdin EOF, stdin read error, parent-process watchdog
+  (with the parent's PID and name), and any I/O error at shutdown. The
+  server also logs its version and PID at startup and a heartbeat with
+  uptime and resident memory every 10 minutes, so a crash log shows
+  whether memory was growing beforehand.
+- **Parent watchdog is more conservative.** It now requires two
+  consecutive "parent gone" observations (~40 s) before exiting, so a
+  single failed process-table read can never take a live session down.
+- **Allocation failures print a backtrace.** Registration now sets
+  `RUST_BACKTRACE=1` for the MCP subprocess (Claude Desktop, Claude
+  Code, Codex, Continue), so the next out-of-memory abort shows where
+  it happened. Re-run "Register MCP" in Settings (or re-mount the
+  vault) to pick this up.
+
+### Notes
+
+- If you see two `sqlite-vec auto-extension registered` lines per
+  session start in a client log, that client is launching BRAIN twice
+  (e.g. two `mcpServers` entries such as `BRAIN` and a legacy `brain`).
+  Each extra process can hold its own copy of the embedding model in
+  RAM; remove the duplicate entry.
+
 ## [0.3.2] — 2026-07-23
 
 ### Fixed
