@@ -57,6 +57,14 @@ pub fn brain_server_entry(vault_path: &Path) -> McpServerEntry {
         "BRAIN_VAULT_PATH".to_string(),
         serde_json::Value::String(normalise_path(&vault_path.to_string_lossy())),
     );
+    // An allocation failure aborts the subprocess with only "memory
+    // allocation of N bytes failed"; with RUST_BACKTRACE set the abort
+    // also prints WHERE — captured by the client's MCP log, our only
+    // forensic channel into a process we cannot attach to.
+    env.insert(
+        "RUST_BACKTRACE".to_string(),
+        serde_json::Value::String("1".to_string()),
+    );
     McpServerEntry {
         command: exe,
         args: vec!["mcp".into()],
@@ -370,6 +378,8 @@ fn invoke_claude_mcp_add(claude: &str, vault_path: &Path) -> std::io::Result<()>
     // Long-form (`--env=…`) attached values strip the `=` correctly. Plus
     // the `--` terminator stops the variadic from chewing positionals.
     let env_eq = format!("--env=BRAIN_VAULT_PATH={vault}");
+    // Same forensic env as the JSON-config clients (see brain_server_entry).
+    let backtrace_eq = "--env=RUST_BACKTRACE=1";
     let output = crate::proc::no_window(claude)
         .args([
             "mcp",
@@ -377,6 +387,7 @@ fn invoke_claude_mcp_add(claude: &str, vault_path: &Path) -> std::io::Result<()>
             "--scope",
             "user",
             &env_eq,
+            backtrace_eq,
             "--",
             BRAIN_SERVER_KEY,
             &exe,

@@ -36,8 +36,12 @@ fn main() {
         std::process::exit(brain_lib::run_sync(args.get(2).map(String::as_str)));
     }
     if args.iter().any(|a| a == "mcp") {
-        // Ensure stdout is line-buffered for stdio JSON-RPC.
-        let _ = brain_lib::run_mcp_stdio();
+        // Ensure stdout is line-buffered for stdio JSON-RPC. An error
+        // here (stdin/stdout failure) must be visible in the client's
+        // MCP log rather than a silent early exit.
+        if let Err(err) = brain_lib::run_mcp_stdio() {
+            eprintln!("brain mcp: exiting with error: {err}");
+        }
         return;
     }
     brain_lib::run();

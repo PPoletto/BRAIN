@@ -85,10 +85,17 @@ fn spawn_parent_watchdog() {
     let mut sys = System::new();
     sys.refresh_processes(ProcessesToUpdate::All, true);
     let Some(parent_pid) = sys.process(me).and_then(|p| p.parent()) else {
-        return; // no detectable parent — nothing to watch
+        tracing::info!("mcp watchdog: no detectable parent process — not watching");
+        return;
     };
     let parent_name = sys.process(parent_pid).map(|p| p.name().to_os_string());
+    tracing::info!(
+        parent_pid = parent_pid.as_u32(),
+        parent = ?parent_name,
+        "mcp watchdog: watching the client process"
+    );
     std::thread::spawn(move || {
+        let mut misses = 0u8;
         loop {
             std::thread::sleep(std::time::Duration::from_secs(20));
             let mut sys = System::new();
@@ -98,16 +105,58 @@ fn spawn_parent_watchdog() {
                 // recycled by an unrelated process; our parent is gone.
                 parent_name.as_deref().is_none_or(|n| p.name() == n)
             });
-            if !alive {
+            if alive {
+                misses = 0;
+                continue;
+            }
+            // Two consecutive misses (~40 s) before acting: one failed
+            // process-table refresh must never take a live session down.
+            misses += 1;
+            if misses >= 2 {
+                tracing::info!(
+                    parent_pid = parent_pid.as_u32(),
+                    "mcp watchdog: client process is gone — exiting"
+                );
                 std::process::exit(0);
             }
         }
     });
 }
 
+/// Periodic health line on stderr — which the client captures into its
+/// MCP log. When a server dies without a message, or aborts on an
+/// allocation failure, the last heartbeat shows whether memory had been
+/// growing beforehand. Once every 10 minutes: cheap, and enough to see a
+/// trend over a multi-day session.
+fn spawn_health_heartbeat() {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+    let me = Pid::from_u32(std::process::id());
+    let started = std::time::Instant::now();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(600));
+            let mut sys = System::new();
+            sys.refresh_processes(ProcessesToUpdate::Some(&[me]), true);
+            let rss_mb = sys.process(me).map(|p| p.memory() / (1024 * 1024)).unwrap_or(0);
+            tracing::info!(
+                uptime_min = started.elapsed().as_secs() / 60,
+                rss_mb,
+                "mcp heartbeat"
+            );
+        }
+    });
+}
+
 /// Entrypoint for `brain mcp`. Reads env, then runs the dispatch loop.
 pub fn run_stdio() -> std::io::Result<()> {
+    // Version + pid first: a crash log then says WHICH build died.
+    tracing::info!(
+        version = SERVER_VERSION,
+        pid = std::process::id(),
+        "mcp server starting"
+    );
     spawn_parent_watchdog();
+    spawn_health_heartbeat();
     // The configured vault path from the registration env var. We
     // deliberately do NOT `is_vault`-filter it once at startup:
     //   - the disk may be absent at launch (Claude started before the
@@ -138,7 +187,15 @@ pub fn run_stdio() -> std::io::Result<()> {
     let mut out = stdout.lock();
 
     for line in stdin.lock().lines() {
-        let line = line?;
+        // Every exit path says why on stderr. Silent exits were exactly
+        // what made intermittent disconnects undiagnosable in the wild.
+        let line = match line {
+            Ok(line) => line,
+            Err(err) => {
+                tracing::warn!(error = %err, "mcp: stdin read failed — exiting");
+                return Err(err);
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -208,6 +265,7 @@ pub fn run_stdio() -> std::io::Result<()> {
         writeln!(out, "{}", response_line)?;
         out.flush()?;
     }
+    tracing::info!("mcp: stdin closed by the client (EOF) — exiting");
     Ok(())
 }
 
