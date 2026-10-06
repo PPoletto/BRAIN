@@ -584,10 +584,13 @@ pub(crate) fn materialise_raw_from_head_with_store(
 /// the agent-instruction files the user may customise. Same rules as the
 /// raw mirror — history-only, never in the wiki working tree.
 pub const META_MIRROR_DIR: &str = "meta";
-/// The fixed set of `00_meta` files that sync. Machine-specific meta
-/// files (marker, .mcp.json bearer token, settings-internal, log/index)
-/// deliberately stay local.
-pub const MIRRORED_META_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
+/// The fixed set of `00_meta` files that sync: the agent instructions and
+/// the retrieval eval set (`viewer::eval`, B1 — both PCs share one test
+/// set). Plain file names only (the mirror and the watcher's `00_meta`
+/// filter match on names). Machine-specific meta files (marker, .mcp.json
+/// bearer token, settings-internal, log/index, audit reports, the eval
+/// history, the dream queue/log) deliberately stay local.
+pub const MIRRORED_META_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md", "eval-queries.yaml"];
 
 /// Mirror the synced `00_meta` files into the index under
 /// [`META_MIRROR_DIR`]. Encrypted vault: `meta/<HMAC("00_meta/<name>")>`
@@ -1081,6 +1084,26 @@ mod tests {
             tree.get_path(Path::new("meta/AGENTS.md")).is_err(),
             "the clear meta filename must not appear in an encrypted tree"
         );
+    }
+
+    #[test]
+    fn the_eval_set_is_mirrored_encrypted_like_the_agent_instructions() {
+        let tmp = vault_with_repo();
+        let store = MemStore::default();
+        let key =
+            enable_encryption(tmp.path(), &store, &PathBuf::from("/opt/brain/brain")).unwrap();
+        let meta = crate::vault::layout::meta_dir(tmp.path());
+        std::fs::write(meta.join("eval-queries.yaml"), b"- id: q1\n").unwrap();
+
+        commit_wiki_with_store(&wiki_dir(tmp.path()), "wiki: meta", &store).unwrap().unwrap();
+
+        let repo = git2::Repository::open(wiki_dir(tmp.path())).unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        let keys = key.derive();
+        let token = keys.filename_token("00_meta/eval-queries.yaml");
+        let entry = tree.get_path(Path::new(&format!("meta/{token}"))).unwrap();
+        let blob = repo.find_blob(entry.id()).unwrap();
+        assert_eq!(filter_smudge(&keys, blob.content()).unwrap(), b"- id: q1\n");
     }
 
     #[test]

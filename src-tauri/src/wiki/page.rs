@@ -39,7 +39,13 @@ pub struct PageFrontmatter {
     /// thing (A2): silences the `alias-collision` lint for those pairs.
     #[serde(default, deserialize_with = "de_page_ref_list", skip_serializing_if = "Vec::is_empty")]
     pub distinct_from: Vec<String>,
-    /// Every other frontmatter key (e.g. `summary`), kept so JSON views
+    /// One or two sentences saying what the page is about (B2), written
+    /// by the agent. Indexed as its own, higher-weighted FTS column and
+    /// appended to every chunk's embedding context header. A list keeps
+    /// its first entry; an empty value counts as absent.
+    #[serde(default, deserialize_with = "de_opt_scalar", skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Every other frontmatter key (e.g. `status`), kept so JSON views
     /// of the frontmatter (`brain_get_page`, `pages.frontmatter`) do not
     /// silently drop fields no named member covers. On disk the
     /// frontmatter text is never re-serialised, so nothing is lost there.
@@ -825,9 +831,33 @@ Intro mentions [Dan](entities/dan-shapiro).
     }
 
     #[test]
-    fn the_json_view_of_the_frontmatter_keeps_unknown_keys_like_summary() {
+    fn the_json_view_of_the_frontmatter_keeps_the_summary() {
         let json = serde_json::to_value(frontmatter_with("summary: Short.\n")).unwrap();
         assert_eq!(json["summary"], serde_json::json!("Short."));
+    }
+
+    #[test]
+    fn the_summary_is_read_into_its_own_field() {
+        assert_eq!(
+            frontmatter_with("summary: Kunde A buys GRASP.\n").summary.as_deref(),
+            Some("Kunde A buys GRASP.")
+        );
+    }
+
+    #[test]
+    fn the_summary_is_not_kept_a_second_time_among_the_extra_keys() {
+        assert!(!frontmatter_with("summary: Short.\n").extra.contains_key("summary"));
+    }
+
+    #[test]
+    fn an_empty_summary_counts_as_absent() {
+        assert_eq!(frontmatter_with("summary: \"  \"\n").summary, None);
+    }
+
+    #[test]
+    fn the_json_view_of_the_frontmatter_keeps_unknown_keys_like_status() {
+        let json = serde_json::to_value(frontmatter_with("status: draft\n")).unwrap();
+        assert_eq!(json["status"], serde_json::json!("draft"));
     }
 
     #[test]

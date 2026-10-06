@@ -60,8 +60,8 @@ pub fn search_with_db(
 
 /// Hybrid search: combines FTS5 BM25 with cosine similarity over chunk
 /// embeddings. When the `chunk_vectors` (sqlite-vec) virtual table is
-/// available we use a single KNN sub-query to fetch the top 50 nearest
-/// chunks; otherwise we fall back to brute-force cosine over the BLOB
+/// available we use a single KNN sub-query to fetch the 200 nearest
+/// chunks (folded into dense page ranks); otherwise we fall back to brute-force cosine over the BLOB
 /// column on chunks of the FTS candidates.
 ///
 /// Score fusion uses Reciprocal Rank Fusion (RRF): for each result that
@@ -77,6 +77,109 @@ fn search_hybrid(db: &DbHandle, vault: &Path, query: &str) -> ViewerResult<Vec<S
         search_hybrid_on_conn(conn, embedder.as_ref(), query).map_err(crate::db::DbError::from)
     })
     .map_err(|err| super::ViewerError::Io(std::io::Error::other(err.to_string())))
+}
+
+/// The retrieval paths the eval (B1, `viewer::eval`) compares. `Hybrid` is
+/// what `brain_search` and the GUI search run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RetrievalMode {
+    FtsOnly,
+    DenseOnly,
+    Hybrid,
+}
+
+impl RetrievalMode {
+    pub const ALL: [RetrievalMode; 3] = [Self::FtsOnly, Self::DenseOnly, Self::Hybrid];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FtsOnly => "fts-only",
+            Self::DenseOnly => "dense-only",
+            Self::Hybrid => "hybrid",
+        }
+    }
+}
+
+/// FTS candidate PAGES before fusion.
+const CANDIDATES: usize = 50;
+
+/// Nearest CHUNKS fetched by the vector KNN before they are folded into
+/// page ranks. Larger than [`CANDIDATES`] so one long page with many
+/// similar chunks cannot fill the whole window on its own.
+const KNN_CHUNKS: usize = 200;
+
+/// BM25 ranking of `pages_fts` with per-column weights, in column order
+/// `id` (UNINDEXED, weight irrelevant), `title`, `body`, `summary`: a
+/// title hit counts 3×, a summary hit (B2) 5× a body hit. The summary
+/// outweighs the title because it is a deliberate one-to-two-sentence
+/// description of the page, while titles are often short names. These
+/// are starting values, to be tuned with `brain eval` on real vaults.
+const FTS_RANK: &str = "bm25(pages_fts, 0.0, 3.0, 1.0, 5.0)";
+
+/// One FTS candidate: id, title, path, snippet.
+type FtsRow = (String, Option<String>, Option<String>, String);
+
+/// The FTS5 candidates for an already sanitised MATCH query, best first
+/// (ties by id, so the order is deterministic). The snippet comes from
+/// whichever column matched best (`-1`), so a hit only in the title or
+/// summary is highlighted too.
+fn fts_candidates(conn: &rusqlite::Connection, match_query: &str) -> rusqlite::Result<Vec<FtsRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT pf.id, p.title, p.path, snippet(pages_fts, -1, '«', '»', ' … ', 24) \
+         FROM pages_fts pf \
+         LEFT JOIN pages p ON p.id = pf.id \
+         WHERE pages_fts MATCH ?1 \
+         ORDER BY {FTS_RANK} ASC, pf.id ASC \
+         LIMIT {CANDIDATES}"
+    ))?;
+    let rows = stmt
+        .query_map([match_query], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3).unwrap_or_default(),
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Page ids ranked by ONE retrieval mode, best first, at most `limit`.
+/// The eval's entry point: every mode runs the same code `brain_search`
+/// runs (FTS candidates, vector candidates, or their RRF fusion), so the
+/// numbers describe the real search.
+pub fn ranked_ids_on_conn(
+    conn: &rusqlite::Connection,
+    embedder: &dyn Embedder,
+    query: &str,
+    mode: RetrievalMode,
+    limit: usize,
+) -> rusqlite::Result<Vec<String>> {
+    let mut ids: Vec<String> = match mode {
+        RetrievalMode::FtsOnly => fts_candidates(conn, &sanitize_fts_query(query))?
+            .into_iter()
+            .map(|row| row.0)
+            .collect(),
+        RetrievalMode::DenseOnly => {
+            let q_vec = embedder.embed(query);
+            let ranks = if migrations::chunk_vectors_available(conn) {
+                knn_top_pages(conn, &q_vec, KNN_CHUNKS)?
+            } else {
+                bruteforce_top_pages(conn, &q_vec, None)?
+            };
+            let mut ranked: Vec<(String, usize)> = ranks.into_iter().collect();
+            ranked.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            ranked.into_iter().map(|(id, _)| id).collect()
+        }
+        RetrievalMode::Hybrid => search_hybrid_on_conn(conn, embedder, query)?
+            .into_iter()
+            .map(|hit| hit.id)
+            .collect(),
+    };
+    ids.truncate(limit);
+    Ok(ids)
 }
 
 /// The connection-only core of hybrid search. Split out from
@@ -100,26 +203,7 @@ pub fn search_hybrid_on_conn(
 
     {
         // FTS5 candidates.
-        let mut stmt = conn.prepare(
-            "SELECT pf.id, p.title, p.path, snippet(pages_fts, 2, '«', '»', ' … ', 24) \
-             FROM pages_fts pf \
-             LEFT JOIN pages p ON p.id = pf.id \
-             WHERE pages_fts MATCH ?1 \
-             ORDER BY bm25(pages_fts) ASC \
-             LIMIT 50",
-        )?;
-        type FtsRow = (String, Option<String>, Option<String>, String);
-        let fts_rows: Vec<FtsRow> = stmt
-            .query_map([&q], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, String>(3).unwrap_or_default(),
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(stmt);
+        let fts_rows = fts_candidates(conn, &q)?;
 
         // Per-page metadata cache so vector-only hits get a title and path.
         let mut meta: std::collections::HashMap<String, (Option<String>, Option<String>, String)> =
@@ -134,9 +218,10 @@ pub fn search_hybrid_on_conn(
         // brute-force over the FTS candidates' embedding BLOBs.
         let vec_rank: std::collections::HashMap<String, usize> =
             if migrations::chunk_vectors_available(conn) {
-                knn_top_pages(conn, &q_vec, 50)?
+                knn_top_pages(conn, &q_vec, KNN_CHUNKS)?
             } else {
-                bruteforce_top_pages(conn, &q_vec, &fts_rows.iter().map(|r| r.0.as_str()).collect::<Vec<_>>())?
+                let candidates: Vec<&str> = fts_rows.iter().map(|r| r.0.as_str()).collect();
+                bruteforce_top_pages(conn, &q_vec, Some(&candidates))?
             };
 
         // Pull metadata for any vector-only page that didn't appear in the
@@ -192,7 +277,15 @@ pub fn search_hybrid_on_conn(
                 }
             })
             .collect();
-        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        // Ties by id: the fused scores come out of a HashMap, so without
+        // a tie-break equal scores would come back in random order (and
+        // the eval would not be deterministic).
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         hits.truncate(20);
         Ok(hits)
     }
@@ -208,57 +301,70 @@ fn knn_top_pages(
     // sqlite-vec requires the KNN limit to sit on the vec0 sub-query
     // itself, not on an outer JOIN — otherwise the planner can't push it
     // down and emits "A LIMIT or 'k = ?' constraint is required on vec0
-    // knn queries.". `k` is bounded by callers (50 today) and not user
+    // knn queries.". `k` is bounded by callers (KNN_CHUNKS = 200) and not user
     // input, so inlining the literal isn't an injection vector.
     //
     // We capture the rowid + distance from vec0, then JOIN chunks
-    // separately to map back to page_id while preserving the KNN order.
+    // separately to map back to page_id while preserving the KNN order:
+    // the outer ORDER BY distance is what keeps it. (An earlier
+    // `WHERE c.id IN (…)` form returned the chunks in rowid order, so the
+    // "rank" was insertion order, not similarity.) A sub-query with LIMIT
+    // on the left of a join is never flattened by SQLite, so the KNN
+    // limit stays on the vec0 scan.
     let sql = format!(
-        "SELECT c.page_id FROM chunks c WHERE c.id IN ( \
-            SELECT rowid FROM chunk_vectors \
+        "SELECT c.page_id FROM ( \
+            SELECT rowid, distance FROM chunk_vectors \
             WHERE embedding MATCH ?1 \
             ORDER BY distance \
             LIMIT {k} \
-         )"
+         ) v JOIN chunks c ON c.id = v.rowid \
+         ORDER BY v.distance, c.id"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
         .query_map(rusqlite::params![&blob], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     let mut out: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for (rank, page_id) in rows.into_iter().enumerate() {
-        // Keep the BEST (lowest) rank per page.
-        out.entry(page_id).or_insert(rank);
+    for page_id in rows {
+        // Dense PAGE ranks (0, 1, 2, … with no gaps), by each page's best
+        // chunk: the FTS list ranks pages, so RRF must see page ranks here
+        // too — a page's other chunks must not push the next page down.
+        if !out.contains_key(&page_id) {
+            let rank = out.len();
+            out.insert(page_id, rank);
+        }
     }
     Ok(out)
 }
 
 /// Brute-force fallback when sqlite-vec isn't loaded. Scans `chunks` for
-/// the supplied page ids only — bounded by the FTS candidate count.
+/// the supplied page ids only — bounded by the FTS candidate count — or,
+/// with `None` (the eval's dense-only mode), every chunk.
 fn bruteforce_top_pages(
     conn: &rusqlite::Connection,
     q_vec: &[f32],
-    candidate_ids: &[&str],
+    candidate_ids: Option<&[&str]>,
 ) -> Result<std::collections::HashMap<String, usize>, rusqlite::Error> {
-    if candidate_ids.is_empty() {
-        return Ok(std::collections::HashMap::new());
-    }
-    let placeholders = vec!["?"; candidate_ids.len()].join(",");
-    let sql = format!(
-        "SELECT page_id, embedding FROM chunks \
-         WHERE page_id IN ({placeholders}) AND embedding IS NOT NULL"
-    );
+    let (sql, ids): (String, &[&str]) = match candidate_ids {
+        Some([]) => return Ok(std::collections::HashMap::new()),
+        Some(ids) => (
+            format!(
+                "SELECT page_id, embedding FROM chunks \
+                 WHERE page_id IN ({}) AND embedding IS NOT NULL",
+                vec!["?"; ids.len()].join(",")
+            ),
+            ids,
+        ),
+        None => (
+            "SELECT page_id, embedding FROM chunks WHERE embedding IS NOT NULL".to_string(),
+            &[],
+        ),
+    };
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
-        .query_map(
-            rusqlite::params_from_iter(candidate_ids.iter()),
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                ))
-            },
-        )?
+        .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?
         .collect::<Result<Vec<_>, _>>()?;
     let mut best_per_page: std::collections::HashMap<String, f32> =
         std::collections::HashMap::new();
@@ -274,7 +380,11 @@ fn bruteforce_top_pages(
         }
     }
     let mut sorted: Vec<(String, f32)> = best_per_page.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     Ok(sorted
         .into_iter()
         .enumerate()
@@ -595,5 +705,92 @@ mod tests {
         write_page(tmp.path(), "concepts", "lonely", "Lonely", "no inbound links");
         let bl = backlinks(tmp.path(), "concepts/lonely").unwrap();
         assert!(bl.is_empty());
+    }
+
+    /// Embeds every text containing "near" along axis 0, everything else
+    /// along axis 1.
+    struct AxisEmbedder;
+    impl Embedder for AxisEmbedder {
+        fn dim(&self) -> usize {
+            crate::embedding::EMBED_DIM
+        }
+        fn name(&self) -> &'static str {
+            "axis"
+        }
+        fn embed(&self, text: &str) -> Vec<f32> {
+            let mut v = vec![0.0; crate::embedding::EMBED_DIM];
+            v[usize::from(!text.contains("near"))] = 1.0;
+            v
+        }
+    }
+
+    fn ranked(db: &crate::db::DbHandle, query: &str, mode: RetrievalMode) -> Vec<String> {
+        db.with(|conn| Ok(ranked_ids_on_conn(conn, &AxisEmbedder, query, mode, 10)?))
+            .unwrap()
+    }
+
+    #[test]
+    fn full_text_ranking_puts_a_summary_hit_above_a_body_only_hit() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        let dir = wiki_dir(tmp.path()).join("entities");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.md"),
+            "---\nid: entities/a\ntype: entity\ntitle: A\n---\n\nThe body talks about pricing and delivery terms.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.md"),
+            "---\nid: entities/b\ntype: entity\ntitle: B\nsummary: Contract renewal for Kunde B.\n---\n\nThe body talks about pricing and delivery terms.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("c.md"),
+            "---\nid: entities/c\ntype: entity\ntitle: C\n---\n\nThe renewal is mentioned once in this body about pricing and delivery terms.\n",
+        )
+        .unwrap();
+        let db = crate::db::DbHandle::open(tmp.path()).unwrap();
+        crate::db::pages_index::rebuild_with(&db, tmp.path(), &AxisEmbedder).unwrap();
+        assert_eq!(ranked(&db, "renewal", RetrievalMode::FtsOnly), vec!["entities/b", "entities/c"]);
+    }
+
+    #[test]
+    fn dense_ranking_orders_pages_by_vector_distance_not_by_chunk_insertion_order() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        // entities/a is indexed (and its chunk inserted) first.
+        write_page(tmp.path(), "entities", "a", "A", "far away words");
+        write_page(tmp.path(), "entities", "b", "B", "near words");
+        let db = crate::db::DbHandle::open(tmp.path()).unwrap();
+        crate::db::pages_index::rebuild_with(&db, tmp.path(), &AxisEmbedder).unwrap();
+        assert_eq!(ranked(&db, "near", RetrievalMode::DenseOnly), vec!["entities/b", "entities/a"]);
+    }
+
+    #[test]
+    fn vector_page_ranks_are_dense_even_when_one_page_holds_the_closest_chunks() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        // Three "near" chunks on page a, one "far" chunk on page b.
+        write_page(tmp.path(), "entities", "a", "A", "# X\nnear one\n# Y\nnear two\n# Z\nnear three");
+        write_page(tmp.path(), "entities", "b", "B", "far words");
+        let db = crate::db::DbHandle::open(tmp.path()).unwrap();
+        crate::db::pages_index::rebuild_with(&db, tmp.path(), &AxisEmbedder).unwrap();
+        let ranks = db
+            .with(|conn| {
+                let q = AxisEmbedder.embed("near");
+                Ok(if migrations::chunk_vectors_available(conn) {
+                    knn_top_pages(conn, &q, KNN_CHUNKS)?
+                } else {
+                    bruteforce_top_pages(conn, &q, None)?
+                })
+            })
+            .unwrap();
+        let mut sorted: Vec<(String, usize)> = ranks.into_iter().collect();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec![("entities/a".to_string(), 0), ("entities/b".to_string(), 1)]
+        );
     }
 }

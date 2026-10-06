@@ -129,9 +129,10 @@ async fn run_loop<R: Runtime>(
 /// the watcher, producing an endless commit loop. Only real page-file
 /// changes (outside `.git/`) should wake the committer.
 ///
-/// Under `00_meta/` only the SYNCED files (AGENTS.md, CLAUDE.md) count —
-/// log.md, index.md and the audit reports under `00_meta/audit/` are
-/// written by BRAIN itself and would churn events forever.
+/// Under `00_meta/` only the SYNCED files (`MIRRORED_META_FILES`:
+/// AGENTS.md, CLAUDE.md, eval-queries.yaml) count — log.md, index.md, the
+/// audit reports under `00_meta/audit/`, the eval history and the dream
+/// queue/log are written by BRAIN itself and would churn events forever.
 pub(crate) fn is_relevant_event_path(meta_root: &Path, p: &Path) -> bool {
     if p.components().any(|c| c.as_os_str() == std::ffi::OsStr::new(".git")) {
         return false;
@@ -332,6 +333,18 @@ mod tests {
     fn editing_agents_md_wakes_the_auto_committer() {
         let meta = Path::new("/vault/00_meta");
         assert!(is_relevant_event_path(meta, &meta.join("AGENTS.md")));
+    }
+
+    #[test]
+    fn editing_the_synced_eval_set_wakes_the_auto_committer() {
+        let meta = Path::new("/vault/00_meta");
+        assert!(is_relevant_event_path(meta, &meta.join("eval-queries.yaml")));
+    }
+
+    #[test]
+    fn appending_to_the_local_eval_history_does_not_wake_the_auto_committer() {
+        let meta = Path::new("/vault/00_meta");
+        assert!(!is_relevant_event_path(meta, &meta.join("eval-history.md")));
     }
 
     #[test]

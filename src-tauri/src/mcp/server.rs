@@ -782,13 +782,14 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "brain_write_page",
-            "description": "Create or overwrite a wiki page. Caller must include valid YAML frontmatter (id, type, title) followed by the markdown body. Optional frontmatter: `aliases: [..]` (other names of the thing), `sources: [sources/..]` (where the facts come from), `valid_from` / `valid_to` (YYYY-MM-DD) and `superseded_by: <id>` (facts are never overwritten — a replaced page gets `superseded_by` and `valid_to`). Creating a NEW id is refused when another page of the same type probably is the same thing (same slug after normalisation, or one of its aliases — see brain_page_exists); the error names that page: update it instead, or pass allow_duplicate:true if they really are different. Overwriting an existing id is never refused. The watcher will lint and auto-commit.",
+            "description": "Create or overwrite a wiki page. Caller must include valid YAML frontmatter (id, type, title) followed by the markdown body. Expected on every new page: `summary:` — one or two sentences saying what the page is about (search ranks summary hits above body hits and embeds every chunk with it; without one the page gets a quiet `missing-summary` warning). Optional frontmatter: `aliases: [..]` (other names of the thing), `sources: [sources/..]` (where the facts come from), `valid_from` / `valid_to` (YYYY-MM-DD) and `superseded_by: <id>` (facts are never overwritten — a replaced page gets `superseded_by` and `valid_to`). Creating a NEW id is refused when another page of the same type probably is the same thing (same slug after normalisation, or one of its aliases — see brain_page_exists); the error names that page: update it instead, or pass allow_duplicate:true if they really are different. Overwriting an existing id is never refused. The watcher will lint and auto-commit.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "id": { "type": "string", "description": "page id, e.g. 'entities/alice'" },
                     "content": { "type": "string", "description": "full markdown including frontmatter" },
-                    "allow_duplicate": { "type": "boolean", "description": "create the page even though brain_page_exists reports an 'alias' or 'normalised' match. Default false." }
+                    "allow_duplicate": { "type": "boolean", "description": "create the page even though brain_page_exists reports an 'alias' or 'normalised' match. Default false." },
+                    "confirm_summary": { "type": "boolean", "description": "the page's `summary` is still accurate for the written body: mark it as current so the dream queue stops reporting it as summary-stale. Default false." }
                 },
                 "required": ["id", "content"]
             }
@@ -801,7 +802,8 @@ fn tool_descriptors() -> Vec<Value> {
                 "properties": {
                     "id": { "type": "string", "description": "page id, e.g. 'entities/alice'" },
                     "heading": { "type": "string", "description": "the section heading line to replace, e.g. '## Kontakt'" },
-                    "content": { "type": "string", "description": "the new section body (markdown, without the heading line)" }
+                    "content": { "type": "string", "description": "the new section body (markdown, without the heading line)" },
+                    "confirm_summary": { "type": "boolean", "description": "the page's existing `summary` is still accurate for the patched body: mark it as current so the dream queue stops reporting it as summary-stale (the file is not changed). Default false." }
                 },
                 "required": ["id", "heading", "content"]
             }
@@ -944,7 +946,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "brain_lint_report",
-            "description": "Return the current lint state of the wiki as { errors, warnings } — both are arrays of { path, kind, message }. Errors block auto-commits, warnings don't. Common warning kinds you should fix in place via brain_write_page: 'unregistered-type' (frontmatter type isn't one of entity/concept/source/topic — usually a plural slipped in), 'missing-title', 'non-canonical-wiki-link'. Common error kinds: 'frontmatter' (malformed YAML), 'duplicate-id' (two files share an id), 'broken-link' (wiki link points at a missing page; `[[id#heading]]` resolves to `id`). Hygiene warnings (advice, never block commits): 'orphan' (no other page links here and the file is unchanged for 90+ days — link it from a related page, merge it or delete it), 'duplicate-candidate' (two pages of the same type are semantically near-identical, score in the message — fold one into the other with brain_merge_pages if they describe the same thing), 'alias-collision' (two pages of one type share a name via an alias or the same slug — merge them, fix the alias, or add `distinct_from: [<other id>]` if they are different things), 'missing-sources' (an entity/concept page without `sources`), 'broken-source' (a `sources` entry without a page), 'invalid-date' (`valid_from`/`valid_to` not YYYY-MM-DD, or from after to), 'expired-but-linked' (`valid_to` has passed but current pages still link here — point them at the successor). Errors 'dangling-supersede' (`superseded_by` names a page that does not exist) and 'supersede-cycle' (pages supersede each other or themselves). An optional `notes` array carries info that is not a page finding (e.g. duplicate detection skipped because the embedding model is missing). Use this when the user asks you to clean up the wiki: loop through the report, fix each entry, then call again until clean.",
+            "description": "Return the current lint state of the wiki as { errors, warnings } — both are arrays of { path, kind, message }. Errors block auto-commits, warnings don't. Common warning kinds you should fix in place via brain_write_page: 'unregistered-type' (frontmatter type isn't one of entity/concept/source/topic — usually a plural slipped in), 'missing-title', 'non-canonical-wiki-link'. Common error kinds: 'frontmatter' (malformed YAML), 'duplicate-id' (two files share an id), 'broken-link' (wiki link points at a missing page; `[[id#heading]]` resolves to `id`). Hygiene warnings (advice, never block commits): 'orphan' (no other page links here and the file is unchanged for 90+ days — link it from a related page, merge it or delete it), 'duplicate-candidate' (two pages of the same type are semantically near-identical, score in the message — fold one into the other with brain_merge_pages if they describe the same thing), 'alias-collision' (two pages of one type share a name via an alias or the same slug — merge them, fix the alias, or add `distinct_from: [<other id>]` if they are different things), 'missing-sources' (an entity/concept page without `sources`), 'missing-summary' (a page without a `summary:` line — add one or two sentences), 'broken-source' (a `sources` entry without a page), 'invalid-date' (`valid_from`/`valid_to` not YYYY-MM-DD, or from after to), 'expired-but-linked' (`valid_to` has passed but current pages still link here — point them at the successor). Errors 'dangling-supersede' (`superseded_by` names a page that does not exist) and 'supersede-cycle' (pages supersede each other or themselves). An optional `notes` array carries info that is not a page finding (e.g. duplicate detection skipped because the embedding model is missing). Use this when the user asks you to clean up the wiki: loop through the report, fix each entry, then call again until clean.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -959,6 +961,49 @@ fn tool_descriptors() -> Vec<Value> {
                     "query": { "type": "string" }
                 },
                 "required": ["query"]
+            }
+        }),
+        json!({
+            "name": "brain_eval",
+            "description": "Measure search quality: runs every test question of the vault's eval set (00_meta/eval-queries.yaml) through full-text-only, vector-only and hybrid search and returns Recall@10, MRR and nDCG@10 per mode plus, per question, which expected pages each mode found (with rank) or missed. Deterministic: same index, same numbers. Each run is appended to 00_meta/eval-history.md. Use it before and after changing pages' summaries or search settings; add questions with brain_eval_add.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        json!({
+            "name": "brain_eval_add",
+            "description": "Add one test question to the eval set (00_meta/eval-queries.yaml, synced between machines): the question as the user would ask it and the page ids a good search should return in its top 10. Every expected id must be an existing page; a question or id already in the set is refused. Without `id`, one is generated from the query. Returns the stored entry.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "optional stable name, e.g. 'q-kunde-a-laufzeit'" },
+                    "query": { "type": "string" },
+                    "expected": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "page ids, e.g. ['entities/kunde-a']" },
+                    "note": { "type": "string" }
+                },
+                "required": ["query", "expected"]
+            }
+        }),
+        json!({
+            "name": "brain_dream_queue",
+            "description": "The dream queue: BRAIN's prioritised list of what to consolidate in the wiki — `{generated_at, items: [{priority 1..3, kind, pages, reason, suggested_action}], omitted}`. Kinds: broken-link / broken-source (fix-link), duplicate-candidate (merge), summary-stale (update-summary: the body changed since the summary was written), missing-summary on a hub page (write-summary), decay-candidate (archive-or-supersede: never read, unlinked, unchanged 90+ days), orphan (review-or-archive). Each page appears in one item at most. Read it when the user asks you to dream / tidy up ('träum mal'), then work top-down (see AGENTS.md, section Dreaming). Served from 00_meta/dream-queue.md when it is younger than 1 hour; `refresh: true` recomputes it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "refresh": { "type": "boolean", "description": "recompute even if the stored queue is fresh. Default false." }
+                }
+            }
+        }),
+        json!({
+            "name": "brain_dream_log",
+            "description": "Append one dated line to the dream log (00_meta/dream-log.md, local) — at the end of a dream session, say in one line what you changed and why (e.g. 'merged entities/acme-inc into entities/acme; wrote summaries for 3 hubs').",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "entry": { "type": "string" }
+                },
+                "required": ["entry"]
             }
         }),
     ]
@@ -1172,6 +1217,7 @@ fn call_tool(
                 .ok_or_else(|| "missing 'content'".to_string())?;
             let parsed = page::parse(content).map_err(|e| format!("invalid page content: {e}"))?;
             let allow_duplicate = allow_duplicate_arg(&args)?;
+            let confirm_summary = confirm_summary_arg(&args)?;
             // A2: refuse to CREATE a page that probably exists already
             // under another id. Overwriting an existing id is never blocked.
             let target = crate::wiki::encryption::page_path(vault, id).map_err(|e| e.to_string())?;
@@ -1274,6 +1320,10 @@ fn call_tool(
                 // The duplicate check could not run (index not built yet).
                 response["matches_checked"] = json!(false);
             }
+            if confirm_summary {
+                response["summary_confirmed"] =
+                    json!(confirm_summary_in_index(db, vault, id, &normalized_content));
+            }
             Ok(serde_json::to_string(&response).unwrap_or_default())
         }
         "brain_patch_page" => {
@@ -1302,7 +1352,14 @@ fn call_tool(
             // full rewrite of the same content would produce.
             let normalized_body = page::normalize_internal_links(&patched_body);
             let new_content = rebuild_page_file(&original, &normalized_body);
-            write_normalized_page(vault, id, &new_content)
+            let confirm = confirm_summary_arg(&args)?;
+            let response = write_normalized_page(vault, id, &new_content)?;
+            if !confirm {
+                return Ok(response);
+            }
+            let mut response: Value = serde_json::from_str(&response).unwrap_or_else(|_| json!({}));
+            response["summary_confirmed"] = json!(confirm_summary_in_index(db, vault, id, &new_content));
+            Ok(serde_json::to_string(&response).unwrap_or_default())
         }
         "brain_get_page_history" => {
             let id = args
@@ -1675,6 +1732,103 @@ fn call_tool(
             );
             lint::add_hygiene(&mut report, vault, rows);
             Ok(serde_json::to_string_pretty(&report).unwrap_or_default())
+        }
+        "brain_eval" => {
+            use crate::viewer::eval;
+            let set = eval::load_eval_set(vault).map_err(|e| e.to_string())?;
+            if set.is_empty() {
+                return Err(format!(
+                    "the eval set is empty — add test questions with brain_eval_add \
+                     (stored in 00_meta/{})",
+                    eval::EVAL_SET_FILENAME
+                ));
+            }
+            // Embed the queries BEFORE db_op (like brain_search): the first
+            // call may load the model, and N query embeddings must not
+            // count against the index timeout.
+            let embedder = crate::embedding::cached_for_vault(vault);
+            let vectors = eval::embed_queries(embedder.as_ref(), &set);
+            // One bounded db_op per query: a large set on a large vault
+            // must not hold the lock (and risk the timeout) as one block.
+            let facts = db_op(db, vault, "brain_eval", eval::index_facts)?;
+            let mut results = Vec::with_capacity(set.len());
+            for (entry, vector) in set.iter().zip(vectors) {
+                if entry.expected.is_empty() {
+                    results.push(None);
+                    continue;
+                }
+                let entry = entry.clone();
+                let result = db_op(db, vault, "brain_eval", move |conn| {
+                    eval::eval_query_on_conn(conn, &entry, &vector)
+                })?;
+                results.push(Some(result));
+            }
+            let report = eval::assemble_report(&set, results, &facts, embedder.name());
+            if let Err(err) = eval::append_history(vault, &report, chrono::Local::now()) {
+                tracing::warn!(?err, "could not append to the eval history");
+            }
+            Ok(serde_json::to_string_pretty(&report).unwrap_or_default())
+        }
+        "brain_eval_add" => {
+            use crate::viewer::eval;
+            let query = required_str(&args, "query")?.to_string();
+            let expected: Vec<String> = args
+                .get("expected")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "missing 'expected' (array of page ids)".to_string())?
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| "'expected' must contain page id strings".to_string())
+                })
+                .collect::<Result<_, _>>()?;
+            let optional = |key: &str| -> Result<Option<String>, String> {
+                match args.get(key) {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(Value::String(s)) => Ok(Some(s.clone())),
+                    Some(_) => Err(format!("'{key}' must be a string")),
+                }
+            };
+            let entry = eval::add_eval_query(
+                vault,
+                eval::NewEvalQuery {
+                    id: optional("id")?,
+                    query,
+                    expected,
+                    note: optional("note")?,
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(serde_json::to_string_pretty(&json!({ "added": entry })).unwrap_or_default())
+        }
+        "brain_dream_queue" => {
+            use crate::wiki::dream;
+            let refresh = match args.get("refresh") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(b)) => *b,
+                Some(_) => return Err("'refresh' must be a boolean".to_string()),
+            };
+            let now = chrono::Utc::now();
+            let cached = if refresh { None } else { dream::cached_queue(vault, now) };
+            let queue = match cached {
+                Some(queue) => queue,
+                None => {
+                    let rows = db_op(db, vault, "brain_dream_queue", dream::load_dream_rows)?;
+                    let queue = dream::build_queue(&rows, now);
+                    if let Err(err) = dream::write_dream_queue(vault, &queue) {
+                        tracing::warn!(?err, "could not write the dream queue");
+                    }
+                    queue
+                }
+            };
+            Ok(serde_json::to_string_pretty(&queue).unwrap_or_default())
+        }
+        "brain_dream_log" => {
+            let entry = required_str(&args, "entry")?;
+            let line = crate::wiki::dream::append_dream_log(vault, entry, chrono::Local::now())
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::to_string(&json!({ "logged": line })).unwrap_or_default())
         }
         other => Err(format!("unknown tool: {other}")),
     }
@@ -2131,6 +2285,14 @@ fn forget_in_index(
     id: &str,
     carry_to: Option<&str>,
 ) {
+    // The stored dream queue names pages by id; after a rename, merge or
+    // delete it is out of date, so drop the cache — the next
+    // brain_dream_queue recomputes it.
+    match std::fs::remove_file(crate::wiki::dream::dream_queue_path(vault)) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => tracing::warn!(?err, "could not drop the stored dream queue"),
+    }
     let ids = vec![id.to_string()];
     let carry_to = carry_to.map(str::to_string);
     if let Err(err) = db_op(db, vault, "forget refactored page", move |conn| {
@@ -2140,6 +2302,41 @@ fn forget_in_index(
         crate::db::pages_index::forget_pages(conn, &ids)
     }) {
         tracing::warn!(%err, "could not drop a refactored page id from the index");
+    }
+}
+
+/// Optional `confirm_summary` boolean argument, default false.
+fn confirm_summary_arg(args: &Value) -> Result<bool, String> {
+    match args.get("confirm_summary") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err("'confirm_summary' must be a boolean".to_string()),
+    }
+}
+
+/// Mark the indexed summary of `id` as current for the body of
+/// `content` (the page file as just written) — see
+/// `pages_index::confirm_summary`. False when the page has no indexed
+/// summary yet or the index is unavailable (logged).
+fn confirm_summary_in_index(
+    db: &mut Option<crate::db::DbHandle>,
+    vault: &std::path::Path,
+    id: &str,
+    content: &str,
+) -> bool {
+    let Ok(parsed) = page::parse(content) else {
+        return false;
+    };
+    let id = id.to_string();
+    let body = parsed.body;
+    match db_op(db, vault, "confirm summary", move |conn| {
+        crate::db::pages_index::confirm_summary(conn, &id, &body)
+    }) {
+        Ok(confirmed) => confirmed,
+        Err(err) => {
+            tracing::warn!(%err, "could not confirm the page summary");
+            false
+        }
     }
 }
 
@@ -2329,6 +2526,10 @@ mod tests {
             "brain_list_tags",
             "brain_embedding_status",
             "brain_lint_report",
+            "brain_eval",
+            "brain_eval_add",
+            "brain_dream_queue",
+            "brain_dream_log",
         ] {
             assert!(
                 resp.contains(name),
@@ -3120,6 +3321,243 @@ mod tests {
         .unwrap();
         crate::wiki::git::commit_all(&wiki, "baseline").unwrap();
         tmp
+    }
+
+    fn call(tmp: &tempfile::TempDir, name: &str, arguments: Value) -> Result<String, String> {
+        call_tool(&json!({ "name": name, "arguments": arguments }), tmp.path(), &mut None)
+    }
+
+    #[test]
+    fn brain_write_page_keeps_the_summary_line_in_the_written_file() {
+        let tmp = refactor_vault();
+        call(
+            &tmp,
+            "brain_write_page",
+            json!({
+                "id": "entities/bob",
+                "content": "---\nid: entities/bob\ntype: entity\ntitle: Bob\nsummary: Bob runs the ops team.\n---\n\nBody.\n"
+            }),
+        )
+        .expect("brain_write_page must succeed");
+        let path = crate::wiki::encryption::page_path(tmp.path(), "entities/bob").unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.contains("summary: Bob runs the ops team.\n"), "{text}");
+    }
+
+    #[test]
+    fn brain_eval_add_then_brain_eval_reports_metrics_for_the_three_modes() {
+        let tmp = refactor_vault();
+        call(&tmp, "brain_eval_add", json!({ "query": "Knows", "expected": ["entities/alice"] }))
+            .expect("brain_eval_add must succeed");
+        let out = call(&tmp, "brain_eval", json!({})).expect("brain_eval must succeed");
+        let parsed: Value = serde_json::from_str(&out).expect("JSON");
+        assert_eq!(parsed["modes"].as_array().map(Vec::len), Some(3));
+    }
+
+    #[test]
+    fn brain_eval_appends_its_run_to_the_eval_history() {
+        let tmp = refactor_vault();
+        call(&tmp, "brain_eval_add", json!({ "query": "Knows", "expected": ["entities/alice"] }))
+            .unwrap();
+        call(&tmp, "brain_eval", json!({})).unwrap();
+        assert!(crate::viewer::eval::eval_history_path(tmp.path()).is_file());
+    }
+
+    #[test]
+    fn brain_eval_on_an_empty_eval_set_points_at_brain_eval_add() {
+        let tmp = refactor_vault();
+        let err = call(&tmp, "brain_eval", json!({})).unwrap_err();
+        assert!(err.contains("brain_eval_add"), "{err}");
+    }
+
+    #[test]
+    fn brain_eval_add_refuses_an_expected_page_that_does_not_exist() {
+        let tmp = refactor_vault();
+        let err = call(&tmp, "brain_eval_add", json!({ "query": "q", "expected": ["entities/nobody"] }))
+            .unwrap_err();
+        assert!(err.contains("entities/nobody"), "{err}");
+    }
+
+    #[test]
+    fn brain_eval_add_rejects_a_non_string_note() {
+        let tmp = refactor_vault();
+        let err = call(
+            &tmp,
+            "brain_eval_add",
+            json!({ "query": "q", "expected": ["entities/alice"], "note": 3 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("'note' must be a string"), "{err}");
+    }
+
+    #[test]
+    fn brain_dream_queue_writes_and_returns_the_queue() {
+        let tmp = refactor_vault();
+        let out = call(&tmp, "brain_dream_queue", json!({ "refresh": true }))
+            .expect("brain_dream_queue must succeed");
+        let parsed: Value = serde_json::from_str(&out).expect("JSON");
+        let on_disk = crate::wiki::dream::read_queue_file(&crate::wiki::dream::dream_queue_path(tmp.path()));
+        assert_eq!(
+            on_disk.map(|q| q.generated_at),
+            parsed["generated_at"].as_str().map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn brain_dream_queue_serves_a_fresh_stored_queue_without_recomputing() {
+        let tmp = refactor_vault();
+        let stored = crate::wiki::dream::DreamQueue {
+            generated_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            items: Vec::new(),
+            omitted: 7,
+            notes: Vec::new(),
+        };
+        crate::wiki::dream::write_dream_queue(tmp.path(), &stored).unwrap();
+        let out = call(&tmp, "brain_dream_queue", json!({})).unwrap();
+        let parsed: Value = serde_json::from_str(&out).expect("JSON");
+        assert_eq!(parsed["omitted"], json!(7));
+    }
+
+    #[test]
+    fn brain_dream_queue_with_refresh_recomputes_a_fresh_stored_queue() {
+        let tmp = refactor_vault();
+        let stored = crate::wiki::dream::DreamQueue {
+            generated_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            items: Vec::new(),
+            omitted: 7,
+            notes: Vec::new(),
+        };
+        crate::wiki::dream::write_dream_queue(tmp.path(), &stored).unwrap();
+        let out = call(&tmp, "brain_dream_queue", json!({ "refresh": true })).unwrap();
+        let parsed: Value = serde_json::from_str(&out).expect("JSON");
+        assert_eq!(parsed["omitted"], json!(0));
+    }
+
+    /// Stand-in for the real model ("bge-m3", so duplicates are trusted):
+    /// texts with "pizza" point along axis 0, all others along axis 2.
+    struct PizzaModel;
+    impl crate::embedding::Embedder for PizzaModel {
+        fn dim(&self) -> usize {
+            crate::embedding::EMBED_DIM
+        }
+        fn name(&self) -> &'static str {
+            "bge-m3"
+        }
+        fn embed(&self, text: &str) -> Vec<f32> {
+            let mut v = vec![0.0; crate::embedding::EMBED_DIM];
+            v[if text.contains("pizza") { 0 } else { 2 }] = 1.0;
+            v
+        }
+    }
+
+    fn dream_items(out: &str) -> Vec<Value> {
+        let parsed: Value = serde_json::from_str(out).expect("JSON");
+        parsed["items"].as_array().cloned().unwrap_or_default()
+    }
+
+    /// H1 acceptance: a queue with a duplicate pair; the agent merges the
+    /// pair; the next queue has exactly that item fewer.
+    #[test]
+    fn merging_a_queued_duplicate_pair_removes_exactly_that_item_from_the_next_queue() {
+        use crate::vault::layout::{ensure_skeleton, wiki_dir};
+        let tmp = tempfile::TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        seed_marker(tmp.path());
+        let wiki = wiki_dir(tmp.path());
+        crate::wiki::git::init_repo(&wiki).unwrap();
+        for (id, extra, body) in [
+            ("entities/a", "", "pizza one"),
+            ("entities/b", "", "pizza two"),
+            ("entities/c", "sources: [sources/missing]\n", "other topic"),
+        ] {
+            std::fs::write(
+                wiki.join(format!("{id}.md")),
+                format!("---\nid: {id}\ntype: entity\ntitle: {id}\n{extra}---\n\n{body}\n"),
+            )
+            .unwrap();
+        }
+        crate::wiki::git::commit_all(&wiki, "baseline").unwrap();
+        let handle = crate::db::DbHandle::open(tmp.path()).unwrap();
+        crate::db::pages_index::rebuild_with(&handle, tmp.path(), &PizzaModel).unwrap();
+        let mut db = Some(handle);
+        let mut tool = |name: &str, arguments: Value| {
+            call_tool(&json!({ "name": name, "arguments": arguments }), tmp.path(), &mut db)
+        };
+
+        let before = dream_items(&tool("brain_dream_queue", json!({ "refresh": true })).unwrap());
+        tool("brain_merge_pages", json!({ "from_id": "entities/b", "into_id": "entities/a" }))
+            .expect("merge must succeed");
+        let after = dream_items(&tool("brain_dream_queue", json!({})).unwrap());
+
+        let before_len = before.len();
+        let expected: Vec<Value> = before
+            .into_iter()
+            .filter(|i| i["kind"] != json!("duplicate-candidate"))
+            .collect();
+        assert_eq!((after.len() + 1, after), (before_len, expected));
+    }
+
+    #[test]
+    fn a_rename_drops_the_stored_dream_queue() {
+        let tmp = refactor_vault();
+        call(&tmp, "brain_dream_queue", json!({ "refresh": true })).unwrap();
+        call(&tmp, "brain_rename_page", json!({ "id": "entities/old", "new_id": "entities/new" }))
+            .unwrap();
+        assert!(!crate::wiki::dream::dream_queue_path(tmp.path()).exists());
+    }
+
+    #[test]
+    fn brain_write_page_with_confirm_summary_marks_the_indexed_summary_as_current() {
+        let tmp = refactor_vault();
+        let page = |body: &str| {
+            format!("---\nid: entities/bob\ntype: entity\ntitle: Bob\nsummary: Bob runs ops.\n---\n\n{body}\n")
+        };
+        call(&tmp, "brain_write_page", json!({ "id": "entities/bob", "content": page("One.") }))
+            .unwrap();
+        let handle = crate::db::DbHandle::open(tmp.path()).unwrap();
+        crate::db::pages_index::rebuild(&handle, tmp.path()).unwrap();
+        let mut db = Some(handle.clone());
+        let out = call_tool(
+            &json!({
+                "name": "brain_write_page",
+                "arguments": { "id": "entities/bob", "content": page("Two."), "confirm_summary": true }
+            }),
+            tmp.path(),
+            &mut db,
+        )
+        .unwrap();
+        crate::db::pages_index::rebuild(&handle, tmp.path()).unwrap();
+        let fresh: bool = handle
+            .with(|conn| {
+                Ok(conn.query_row(
+                    "SELECT summary_body_hash = body_hash FROM pages WHERE id = 'entities/bob'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert!(fresh && out.contains("\"summary_confirmed\":true"), "{out}");
+    }
+
+    #[test]
+    fn brain_patch_page_rejects_a_non_boolean_confirm_summary() {
+        let tmp = refactor_vault();
+        let err = call(
+            &tmp,
+            "brain_patch_page",
+            json!({ "id": "entities/old", "heading": "## X", "content": "y", "confirm_summary": "yes" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("'confirm_summary' must be a boolean"), "{err}");
+    }
+
+    #[test]
+    fn brain_dream_log_appends_the_entry_to_the_dream_log() {
+        let tmp = refactor_vault();
+        call(&tmp, "brain_dream_log", json!({ "entry": "merged a into b" })).unwrap();
+        let text =
+            std::fs::read_to_string(crate::wiki::dream::dream_log_path(tmp.path())).unwrap();
+        assert!(text.trim_end().ends_with("merged a into b"), "{text}");
     }
 
     #[test]

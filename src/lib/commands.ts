@@ -72,6 +72,20 @@ export type RemoteStatus = {
   auto_sync: boolean;
 };
 
+/** Subset of the Rust `viewer::eval::EvalReport` the Settings card shows. */
+export type EvalReport = {
+  queries: number;
+  index_embedder: string | null;
+  query_embedder: string;
+  warning?: string;
+  modes: Array<{
+    mode: "fts-only" | "dense-only" | "hybrid";
+    recall_at_10: number;
+    mrr: number;
+    ndcg_at_10: number;
+  }>;
+};
+
 export type SyncReport = {
   outcome: "up-to-date" | "fast-forward" | "merged";
   conflicted_pages: string[];
@@ -120,6 +134,7 @@ export const commands = {
   openPageInExternalEditor: (id: string) =>
     invoke<void>("open_page_in_external_editor", { id }),
   rebuildIndex: () => invoke<number>("rebuild_index"),
+  runRetrievalEval: () => invoke<EvalReport>("run_retrieval_eval"),
   queryPages: (query: string) =>
     invoke<
       Array<{

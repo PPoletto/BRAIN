@@ -355,6 +355,47 @@ pub fn bytes_to_vec(bytes: &[u8]) -> Vec<f32> {
     out
 }
 
+/// Running sum of little-endian f32 vector blobs whose result is the
+/// L2-normalised mean — the "page vector" (mean of a page's chunk
+/// vectors) used by the duplicate lint and stored in `page_vectors`.
+/// The dimension is set by the first usable blob; blobs that are empty,
+/// not a whole number of f32s, or of another dimension are skipped.
+#[derive(Debug, Default, Clone)]
+pub struct MeanVector {
+    sum: Option<Vec<f32>>,
+}
+
+impl MeanVector {
+    pub fn add_blob(&mut self, blob: &[u8]) {
+        if blob.is_empty() || blob.len() % 4 != 0 {
+            return;
+        }
+        let dim = blob.len() / 4;
+        let sum = self.sum.get_or_insert_with(|| vec![0.0; dim]);
+        if sum.len() != dim {
+            return;
+        }
+        for (s, bytes) in sum.iter_mut().zip(blob.chunks_exact(4)) {
+            *s += f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        }
+    }
+
+    /// The normalised mean, or `None` when nothing usable was added or
+    /// the sum is the zero vector. (Normalising the sum equals
+    /// normalising the mean.)
+    pub fn finish(self) -> Option<Vec<f32>> {
+        let mut v = self.sum?;
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm <= f32::EPSILON {
+            return None;
+        }
+        for x in &mut v {
+            *x /= norm;
+        }
+        Some(v)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,5 +580,27 @@ mod tests {
         let _ = cache.get_or_load(tmp.path(), try_load_bge_m3);
         let _ = cache.evict_idle(Duration::ZERO);
         assert_eq!(cache.slot_kind(tmp.path()), Some("failed"));
+    }
+
+    #[test]
+    fn the_mean_vector_of_two_orthogonal_unit_blobs_is_the_normalised_diagonal() {
+        let mut mean = MeanVector::default();
+        mean.add_blob(&vec_to_bytes(&[1.0, 0.0]));
+        mean.add_blob(&vec_to_bytes(&[0.0, 1.0]));
+        let h = std::f32::consts::FRAC_1_SQRT_2;
+        assert_eq!(mean.finish(), Some(vec![h, h]));
+    }
+
+    #[test]
+    fn the_mean_vector_skips_a_blob_of_another_dimension() {
+        let mut mean = MeanVector::default();
+        mean.add_blob(&vec_to_bytes(&[2.0, 0.0]));
+        mean.add_blob(&vec_to_bytes(&[0.0, 1.0, 0.0]));
+        assert_eq!(mean.finish(), Some(vec![1.0, 0.0]));
+    }
+
+    #[test]
+    fn the_mean_vector_of_nothing_is_none() {
+        assert_eq!(MeanVector::default().finish(), None);
     }
 }

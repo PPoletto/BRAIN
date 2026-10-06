@@ -97,6 +97,48 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Use "Update vault templates" in Settings to give your agent the new
   instructions (aliases, the duplicate check, superseding instead of
   overwriting).
+- **Page summaries make pages easier to find.** A page can carry a short
+  `summary:` in its frontmatter (one or two sentences on what it is
+  about); the agent is asked to write one for every new page. Full-text
+  search ranks a match in the summary above a match in the body, and
+  semantic search indexes every passage together with the summary. Pages
+  without a summary get a quiet `missing-summary` hint in the lint report,
+  the audit and the Integrity page (no notification). Pages that already
+  had a summary are re-indexed once after the update; all other pages are
+  not.
+- **Measure search quality (`brain eval`).** Test questions with the
+  pages a good search should return live in `00_meta/eval-queries.yaml`
+  (synced between your machines; encrypted in an encrypted vault). The
+  agent adds questions with the new MCP tool `brain_eval_add`, which
+  checks that the pages exist and refuses duplicates. `brain eval
+  <vault>` on the command line, the MCP tool `brain_eval` and the new
+  "Search quality" card in Settings score full-text, semantic and hybrid
+  search (Recall@10, MRR, nDCG@10) and append each run to
+  `00_meta/eval-history.md` (kept on this machine). Same index, same
+  numbers. The report names the embedder of the index and of the
+  questions and warns when they differ (then the semantic numbers are
+  meaningless). **Two machines:** the eval set only syncs once BOTH run
+  this version — an older BRAIN keeps just its own list of synced files
+  and drops the eval set from what it shares (your local file stays).
+- **Dreaming: a work list for tidying up the wiki.** With the daily audit
+  BRAIN now also writes `00_meta/dream-queue.md`: a prioritised list of
+  what to consolidate — broken links and sources, likely duplicates,
+  summaries that no longer match their page, much-linked pages without a
+  summary, and pages nobody reads or links to (always "archive or
+  supersede", never delete). When you ask your agent to "dream", it reads
+  the list with the new MCP tool `brain_dream_queue` (recomputed when
+  older than an hour), works through at most ten items and notes what it
+  did with `brain_dream_log` in `00_meta/dream-log.md`. Both files stay
+  on this machine. If a summary flagged as outdated is still right, the
+  agent confirms it (`confirm_summary: true` on `brain_write_page` /
+  `brain_patch_page`) instead of rewriting it. The daily audit also tidies
+  the search index (compacts the full-text index, and reclaims space when
+  more than a fifth of the database file is unused). Use "Update vault
+  templates" in Settings to give your agent the dreaming rules.
+- **Mixed versions on two machines stay consistent.** When the other
+  machine still runs an older BRAIN and changes a page, this machine
+  re-indexes that page itself, so its search index always carries the
+  summaries.
 
 ### Changed
 
@@ -138,6 +180,24 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   supported — please use the initialize handshake" error instead of a
   generic "method not found". Current clients are unaffected; a client
   that switches to the new protocol now leaves a diagnosable log line.
+- **Title and summary matches count more in full-text search.** Full-text
+  ranking now weights a match in the page title three times and a match
+  in the summary five times a match in the body (before, all counted the
+  same). These are starting values, to be tuned with `brain eval`. Search
+  snippets now come from whichever part matched best, so a hit only in
+  the title or summary is highlighted too.
+- **Semantic search looks further.** It now considers the 200 closest
+  passages (was 50), so one long page with many similar passages no
+  longer crowds out other pages, and it ranks pages, not passages, before
+  combining with full-text search.
+
+### Fixed
+
+- **Semantic search now ranks by similarity (bug since the first
+  release).** The vector part of the search returned its candidate
+  passages in storage order instead of by similarity, so the closest
+  passage did not necessarily count most. It now ranks them by
+  similarity, which improves hybrid results.
 
 ## [0.3.4] — 2026-10-06
 

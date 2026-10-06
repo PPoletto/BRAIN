@@ -119,7 +119,12 @@ pub fn add_hygiene(
 /// a person decides. They are reported by `brain_lint_report`, the write
 /// responses, the audit and the Integrity page, but the watcher leaves
 /// them out of its after-commit toast ([`toast_warnings`]).
-pub const QUIET_WARNING_KINDS: &[&str] = &["missing-sources", "alias-collision", "expired-but-linked"];
+pub const QUIET_WARNING_KINDS: &[&str] = &[
+    "missing-sources",
+    "missing-summary",
+    "alias-collision",
+    "expired-but-linked",
+];
 
 /// The warnings the watcher shows in its after-commit toast: all but the
 /// [`QUIET_WARNING_KINDS`].
@@ -391,6 +396,16 @@ fn validity_rules(
                      (frontmatter `sources: [sources/…]`)",
                     fm.page_type
                 ),
+            });
+        }
+        if fm.summary.is_none() {
+            warnings.push(LintWarning {
+                path: path.clone(),
+                kind: "missing-summary".into(),
+                message: "page without `summary` — add one or two sentences saying what the page \
+                          is about (frontmatter `summary: …`); search ranks summary hits higher \
+                          and embeds every chunk with it"
+                    .into(),
             });
         }
         for source in &fm.sources {
@@ -1130,11 +1145,40 @@ mod tests {
             w("missing-sources"),
             w("alias-collision"),
             w("expired-but-linked"),
+            w("missing-summary"),
             w("missing-title"),
         ])
         .into_iter()
         .map(|w| w.kind)
         .collect();
         assert_eq!(shown, vec!["missing-title"]);
+    }
+
+    #[test]
+    fn a_page_without_a_summary_gets_a_missing_summary_warning() {
+        let tmp = make_vault();
+        write_page(tmp.path(), "topics", "t", &page_with("topics/t", "topic", "", "x"));
+        let report = lint_as_of(tmp.path(), TODAY).unwrap();
+        assert_eq!(kinds_for(&report, "missing-summary"), 1);
+    }
+
+    #[test]
+    fn a_page_with_a_summary_gets_no_missing_summary_warning() {
+        let tmp = make_vault();
+        write_page(tmp.path(), "topics", "t", &page_with("topics/t", "topic", "summary: About t.\n", "x"));
+        let report = lint_as_of(tmp.path(), TODAY).unwrap();
+        assert_eq!(kinds_for(&report, "missing-summary"), 0);
+    }
+
+    #[test]
+    fn missing_summary_is_a_quiet_warning_kind() {
+        assert!(QUIET_WARNING_KINDS.contains(&"missing-summary"));
+    }
+
+    #[test]
+    fn missing_summary_never_blocks_a_commit() {
+        let tmp = make_vault();
+        write_page(tmp.path(), "topics", "t", &page_with("topics/t", "topic", "", "x"));
+        assert!(lint_as_of(tmp.path(), TODAY).unwrap().is_clean());
     }
 }

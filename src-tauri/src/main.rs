@@ -35,6 +35,11 @@ fn main() {
     if args.get(1).map(String::as_str) == Some("sync") {
         std::process::exit(brain_lib::run_sync(args.get(2).map(String::as_str)));
     }
+    // `brain eval <vault-path>` — retrieval eval (B1): metrics table on
+    // stdout, one row appended to 00_meta/eval-history.md.
+    if args.get(1).map(String::as_str) == Some("eval") {
+        std::process::exit(brain_lib::run_eval(args.get(2).map(String::as_str)));
+    }
     if args.iter().any(|a| a == "mcp") {
         // Ensure stdout is line-buffered for stdio JSON-RPC. An error
         // here (stdin/stdout failure) must be visible in the client's

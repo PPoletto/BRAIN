@@ -91,6 +91,15 @@ use super::{DbHandle, DbResult};
 ///    must be re-embedded exactly once after the update; the version
 ///    bump below is what forces that. See the module docs for how an
 ///    interrupted upgrade resumes and why a finished one never repeats.
+///
+/// NOT bumped for B2 (`summary` in the context header): a page without a
+/// summary embeds byte-identical text to v3 (see
+/// `chunk::contextual_text`), so its vectors stay valid. Pages WITH a
+/// summary are re-embedded by the targeted check in [`is_unchanged`]:
+/// their stored `pages.summary` differs from the frontmatter (NULL right
+/// after the schema-v6 migration; afterwards adding or editing a summary
+/// changes the file hash anyway). That check is per page and written with
+/// the page, so an interrupted run resumes like any other.
 const INDEX_FORMAT_VERSION: i64 = 3;
 
 /// `schema_meta` key holding the format version of a COMPLETED rebuild.
@@ -106,7 +115,10 @@ const VERSION_KEY: &str = "index_format_version";
 ///
 /// History:
 ///  - v1: aliases, sources, valid_from, valid_to, superseded_by (A2/C).
-const META_FORMAT_VERSION: i64 = 1;
+///  - v2: `summary` / `body_hash` / `summary_body_hash` columns (B2/H1)
+///    and the `page_vectors` row, computed from the stored chunk vectors
+///    without embedding (H1).
+const META_FORMAT_VERSION: i64 = 2;
 
 /// `schema_meta` key holding [`META_FORMAT_VERSION`] of a completed rebuild.
 const META_VERSION_KEY: &str = "index_meta_version";
@@ -128,6 +140,42 @@ const MIXED_EMBEDDERS: &str = "mixed";
 /// or `None` for an index written before this was recorded.
 pub fn index_embedder(conn: &rusqlite::Connection) -> Option<String> {
     read_meta(conn, EMBEDDER_KEY)
+}
+
+/// True once a completed rebuild has filled the B2 summary columns
+/// (`pages.summary`, `body_hash`, `summary_body_hash`) for every page —
+/// i.e. the stored metadata version is at least 2. Until then a NULL
+/// `pages.summary` may only mean "not indexed yet", so the dream queue
+/// skips its summary rules.
+pub fn summaries_indexed(conn: &rusqlite::Connection) -> bool {
+    read_meta_i64(conn, META_VERSION_KEY).is_some_and(|v| v >= 2)
+}
+
+/// SHA-256 (hex) of a page body as the indexer stores it in
+/// `pages.body_hash` — the body as [`crate::wiki::page::parse`] returns it.
+pub fn body_hash(body: &str) -> String {
+    hex::encode(Sha256::digest(body.as_bytes()))
+}
+
+/// Confirm a page's summary as still accurate for `body` (the page body
+/// as now on disk): sets `summary_body_hash` to its hash, so the dream
+/// queue stops calling the summary stale — the next rebuild keeps it
+/// because the summary text did not change. The file is not touched.
+/// Returns false when the page has no indexed summary (nothing to
+/// confirm; a new summary is fresh anyway once indexed).
+pub fn confirm_summary(conn: &rusqlite::Connection, id: &str, body: &str) -> DbResult<bool> {
+    let n = conn.execute(
+        "UPDATE pages SET summary_body_hash = ?1 WHERE id = ?2 AND summary IS NOT NULL",
+        params![body_hash(body), id],
+    )?;
+    Ok(n > 0)
+}
+
+/// The format version of the last COMPLETED rebuild
+/// (`schema_meta.index_format_version`), or `None` for an index never
+/// fully built. The eval history records it next to its numbers.
+pub fn index_format_version(conn: &rusqlite::Connection) -> Option<i64> {
+    read_meta_i64(conn, VERSION_KEY)
 }
 
 /// Pages per committed batch. Small enough that a batch write (and the
@@ -430,27 +478,47 @@ fn prepare_page(path: &Path) -> DbResult<Option<PreparedPage>> {
 /// bge-m3 active meant a 30-60 s freeze per startup even when nothing
 /// had been edited. A cleared (NULL) hash — format upgrade or forced
 /// rebuild — never matches.
+///
+/// B2: a page whose frontmatter `summary` differs from the indexed
+/// `pages.summary` is also re-indexed, so its vectors get the summary in
+/// their context header and its FTS row the summary column. In normal
+/// operation a changed summary changes the file hash anyway; this only
+/// catches pages that already carried a summary before summaries were
+/// indexed (stored value NULL after the schema-v6 migration). Pages
+/// without a summary are unaffected (NULL = NULL).
+///
+/// Version skew (two PCs, one still on a pre-summary BRAIN): only the
+/// current full-write path sets `pages.summary_indexed_hash` to the
+/// file hash. A row whose `file_hash` was last written by an older client
+/// does not match it, so the page is re-indexed here (with summary
+/// header, summary FTS column, body hash and page vector).
 fn is_unchanged(conn: &rusqlite::Connection, page: &PreparedPage) -> DbResult<bool> {
-    let prev: Option<(Option<String>, i64)> = conn
+    type Prev = (Option<String>, Option<String>, Option<String>, i64);
+    let prev: Option<Prev> = conn
         .query_row(
-            "SELECT p.file_hash, COUNT(c.id) \
+            "SELECT p.file_hash, p.summary_indexed_hash, p.summary, COUNT(c.id) \
              FROM pages p LEFT JOIN chunks c ON c.page_id = p.id \
              WHERE p.id = ?1 \
              GROUP BY p.id",
             params![&page.parsed.frontmatter.id],
-            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .ok();
     Ok(matches!(
         prev,
-        Some((Some(prev_hash), chunk_count)) if prev_hash == page.file_hash && chunk_count > 0
+        Some((Some(prev_hash), Some(indexed_hash), prev_summary, chunk_count))
+            if prev_hash == page.file_hash
+                && indexed_hash == page.file_hash
+                && chunk_count > 0
+                && prev_summary == page.parsed.frontmatter.summary
     ))
 }
 
 /// Contextual chunking: the embedder sees "<title> (<type>) › <h1> ›
-/// <h2>" in front of each chunk so the vector encodes where the text
-/// belongs. Only the bare chunk text is stored — snippets, FTS and the
-/// UI never see the header. Queries are embedded bare.
+/// <h2> — <summary>" in front of each chunk so the vector encodes where
+/// the text belongs (the summary part only when the page has one). Only
+/// the bare chunk text is stored — snippets, FTS and the UI never see the
+/// header. Queries are embedded bare.
 fn embed_page<E: Embedder + ?Sized>(parsed: &ParsedPage, embedder: &E) -> Vec<(String, Vec<u8>)> {
     let id = &parsed.frontmatter.id;
     let context_title = parsed.frontmatter.title.as_deref().unwrap_or(id);
@@ -461,6 +529,7 @@ fn embed_page<E: Embedder + ?Sized>(parsed: &ParsedPage, embedder: &E) -> Vec<(S
                 context_title,
                 &parsed.frontmatter.page_type,
                 &chunk.heading_path,
+                parsed.frontmatter.summary.as_deref(),
                 &chunk.text,
             );
             let blob = vec_to_bytes(&embedder.embed(&embed_input));
@@ -488,6 +557,7 @@ fn write_page(
             )?;
             if refresh_meta {
                 write_page_meta(tx, &page.parsed)?;
+                write_page_vector_from_stored_chunks(tx, id)?;
             }
             return Ok(());
         }
@@ -498,12 +568,13 @@ fn write_page(
     let frontmatter_json = serde_json::to_string(&parsed.frontmatter).unwrap_or_default();
 
     tx.execute(
-        "INSERT INTO pages(id, type, path, title, frontmatter, body, updated_at, file_mtime, file_hash) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+        "INSERT INTO pages(id, type, path, title, frontmatter, body, updated_at, file_mtime, file_hash, summary_indexed_hash) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9) \
          ON CONFLICT(id) DO UPDATE SET \
             type=excluded.type, path=excluded.path, title=excluded.title, \
             frontmatter=excluded.frontmatter, body=excluded.body, updated_at=excluded.updated_at, \
-            file_mtime=excluded.file_mtime, file_hash=excluded.file_hash",
+            file_mtime=excluded.file_mtime, file_hash=excluded.file_hash, \
+            summary_indexed_hash=excluded.summary_indexed_hash",
         params![
             id,
             &parsed.frontmatter.page_type,
@@ -520,8 +591,13 @@ fn write_page(
     // Refresh FTS row (delete + insert keeps things simple).
     tx.execute("DELETE FROM pages_fts WHERE id = ?1", params![id])?;
     tx.execute(
-        "INSERT INTO pages_fts(id, title, body) VALUES (?1, ?2, ?3)",
-        params![id, title.unwrap_or(""), &parsed.body],
+        "INSERT INTO pages_fts(id, title, body, summary) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            id,
+            title.unwrap_or(""),
+            &parsed.body,
+            parsed.frontmatter.summary.as_deref().unwrap_or("")
+        ],
     )?;
 
     // Wiki-links: replace. `[[id#heading]]` is stored as a link to `id`
@@ -569,6 +645,7 @@ fn write_page(
         }
     }
     tx.execute("DELETE FROM chunks WHERE page_id = ?1", params![id])?;
+    let mut page_vector = crate::embedding::MeanVector::default();
     for (idx, (text, blob)) in chunks.iter().enumerate() {
         tx.execute(
             "INSERT INTO chunks(page_id, chunk_idx, text, embedding) VALUES (?1, ?2, ?3, ?4)",
@@ -581,13 +658,46 @@ fn write_page(
                 params![chunk_id, blob],
             );
         }
+        page_vector.add_blob(blob);
+    }
+    store_page_vector(tx, id, page_vector.finish())
+}
+
+/// Replace the `page_vectors` row of `id` (H1): the L2-normalised mean
+/// of its chunk vectors, or no row when the page has no usable vector.
+fn store_page_vector(conn: &rusqlite::Connection, id: &str, vector: Option<Vec<f32>>) -> DbResult<()> {
+    conn.execute("DELETE FROM page_vectors WHERE page_id = ?1", params![id])?;
+    if let Some(v) = vector {
+        conn.execute(
+            "INSERT INTO page_vectors(page_id, embedding) VALUES (?1, ?2)",
+            params![id, vec_to_bytes(&v)],
+        )?;
     }
     Ok(())
 }
 
+/// [`store_page_vector`] from the chunk vectors already in the index —
+/// the metadata refresh of an unchanged page (no embedding).
+fn write_page_vector_from_stored_chunks(conn: &rusqlite::Connection, id: &str) -> DbResult<()> {
+    let mut mean = crate::embedding::MeanVector::default();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT embedding FROM chunks WHERE page_id = ?1 AND embedding IS NOT NULL ORDER BY chunk_idx",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        while let Some(row) = rows.next()? {
+            if let rusqlite::types::ValueRef::Blob(blob) = row.get_ref(0)? {
+                mean.add_blob(blob);
+            }
+        }
+    }
+    store_page_vector(conn, id, mean.finish())
+}
+
 /// The frontmatter metadata derived without embedding (see
 /// [`META_FORMAT_VERSION`]): the `pages.frontmatter` JSON, the validity
-/// columns, `page_aliases` and `page_sources`. Replaces whatever was
+/// columns, the summary / body-hash columns, `page_aliases` and
+/// `page_sources`. Replaces whatever was
 /// stored for the page. The `pages` row must exist.
 fn write_page_meta(tx: &rusqlite::Transaction, parsed: &ParsedPage) -> DbResult<()> {
     let fm = &parsed.frontmatter;
@@ -602,6 +712,22 @@ fn write_page_meta(tx: &rusqlite::Transaction, parsed: &ParsedPage) -> DbResult<
             fm.superseded_by.as_deref(),
             id
         ],
+    )?;
+    // B2/H1: the summary, the body hash, and the body hash at the time
+    // the summary text last changed (stale summary = the two differ).
+    // UPDATE expressions see the OLD row, so `summary IS ?1` compares
+    // against the previously indexed summary.
+    let body_hash = body_hash(&parsed.body);
+    tx.execute(
+        "UPDATE pages SET \
+            summary_body_hash = CASE \
+                WHEN ?1 IS NULL THEN NULL \
+                WHEN summary IS ?1 THEN COALESCE(summary_body_hash, ?2) \
+                ELSE ?2 END, \
+            summary = ?1, \
+            body_hash = ?2 \
+         WHERE id = ?3",
+        params![fm.summary.as_deref(), &body_hash, id],
     )?;
     tx.execute("DELETE FROM page_aliases WHERE page_id = ?1", params![id])?;
     for alias in &fm.aliases {
@@ -635,7 +761,7 @@ fn prune_missing(tx: &rusqlite::Transaction, seen: &HashSet<String>) -> DbResult
 }
 
 /// Drop every index row of the given page ids — `pages`, `pages_fts`,
-/// outbound `wiki_links`, `page_tags`, `chunks` and, when sqlite-vec is
+/// outbound `wiki_links`, `page_tags`, `chunks`, `page_vectors` and, when sqlite-vec is
 /// loaded, the matching `chunk_vectors` rows — then re-flag broken links.
 /// The targeted counterpart of the prune step in [`rebuild`]: used after
 /// an MCP refactor (rename, delete, merge) removed a page file, so the MCP
@@ -679,6 +805,7 @@ fn delete_page_rows(conn: &rusqlite::Connection, id: &str) -> DbResult<()> {
     conn.execute("DELETE FROM page_aliases WHERE page_id = ?1", params![id])?;
     conn.execute("DELETE FROM page_sources WHERE page_id = ?1", params![id])?;
     conn.execute("DELETE FROM chunks WHERE page_id = ?1", params![id])?;
+    conn.execute("DELETE FROM page_vectors WHERE page_id = ?1", params![id])?;
     Ok(())
 }
 
@@ -860,6 +987,7 @@ mod tests {
             + count("SELECT count(*) FROM page_aliases WHERE page_id = ?1")
             + count("SELECT count(*) FROM page_sources WHERE page_id = ?1")
             + count("SELECT count(*) FROM page_access WHERE page_id = ?1")
+            + count("SELECT count(*) FROM page_vectors WHERE page_id = ?1")
             + count("SELECT count(*) FROM wiki_links WHERE src_id = ?1");
         if crate::db::migrations::chunk_vectors_available(conn) {
             total += conn
@@ -1719,5 +1847,274 @@ the contract renews for 12 months".to_string()]
         let embedder = RecordingEmbedder::new();
         rebuild_with(&db, tmp.path(), &embedder).unwrap();
         assert_eq!(embedder.count(), 0);
+    }
+
+    // ---- B2: summary ------------------------------------------------------
+
+    #[test]
+    fn rebuild_embeds_a_page_with_a_summary_with_the_summary_in_the_context_header() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        write_page_with(tmp.path(), "entities/acme", "summary: Customer since 2024.\n");
+        let db = DbHandle::open(tmp.path()).unwrap();
+        let embedder = RecordingEmbedder::new();
+        rebuild_with(&db, tmp.path(), &embedder).unwrap();
+        let inputs = embedder.inputs.lock().unwrap().clone();
+        assert_eq!(inputs, vec!["T (entity) — Customer since 2024.\n\nBody.".to_string()]);
+    }
+
+    /// The index as the pre-summary build left it: summaries not indexed,
+    /// metadata version 1.
+    fn index_without_summaries(db: &DbHandle) {
+        db.with(|conn| {
+            conn.execute("UPDATE pages SET summary = NULL, summary_body_hash = NULL", [])?;
+            write_meta(conn, META_VERSION_KEY, "1")
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn the_summary_upgrade_does_not_re_embed_an_existing_page_without_a_summary() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        write_page(tmp.path(), "entities", "alice", CONTRACT_BODY, &[]);
+        let db = DbHandle::open(tmp.path()).unwrap();
+        rebuild_with(&db, tmp.path(), &RecordingEmbedder::new()).unwrap();
+        index_without_summaries(&db);
+        let embedder = RecordingEmbedder::new();
+        rebuild_with(&db, tmp.path(), &embedder).unwrap();
+        assert_eq!(embedder.count(), 0);
+    }
+
+    #[test]
+    fn the_summary_upgrade_re_embeds_an_existing_page_that_has_a_summary() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        write_page_with(tmp.path(), "entities/acme", "summary: Customer since 2024.\n");
+        let db = DbHandle::open(tmp.path()).unwrap();
+        rebuild_with(&db, tmp.path(), &RecordingEmbedder::new()).unwrap();
+        index_without_summaries(&db);
+        let embedder = RecordingEmbedder::new();
+        rebuild_with(&db, tmp.path(), &embedder).unwrap();
+        assert_eq!(embedder.count(), 1);
+    }
+
+    #[test]
+    fn a_rebuild_after_the_summary_upgrade_does_not_re_embed_the_summary_page_again() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        write_page_with(tmp.path(), "entities/acme", "summary: Customer since 2024.\n");
+        let db = DbHandle::open(tmp.path()).unwrap();
+        rebuild_with(&db, tmp.path(), &RecordingEmbedder::new()).unwrap();
+        index_without_summaries(&db);
+        rebuild_with(&db, tmp.path(), &RecordingEmbedder::new()).unwrap();
+        let embedder = RecordingEmbedder::new();
+        rebuild_with(&db, tmp.path(), &embedder).unwrap();
+        assert_eq!(embedder.count(), 0);
+    }
+
+    #[test]
+    fn rebuild_writes_the_summary_into_the_fts_summary_column() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        write_page_with(tmp.path(), "entities/acme", "summary: Tiefkühlpizza supplier.\n");
+        let db = DbHandle::open(tmp.path()).unwrap();
+        rebuild(&db, tmp.path()).unwrap();
+        assert_eq!(
+            strings(&db, "SELECT id FROM pages_fts WHERE pages_fts MATCH 'summary : tiefkuhlpizza'"),
+            vec!["entities/acme"]
+        );
+    }
+
+    fn summary_hashes(db: &DbHandle) -> (String, String) {
+        let row = strings(
+            db,
+            "SELECT COALESCE(body_hash, '') || '|' || COALESCE(summary_body_hash, '') FROM pages",
+        );
+        let (a, b) = row[0].split_once('|').unwrap();
+        (a.to_string(), b.to_string())
+    }
+
+    fn write_summary_page(vault: &Path, summary: &str, body: &str) {
+        let dir = wiki_dir(vault).join("entities");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("acme.md"),
+            format!("---\nid: entities/acme\ntype: entity\ntitle: T\nsummary: {summary}\n---\n\n{body}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_new_page_with_a_summary_records_its_body_hash_as_the_summary_body_hash() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        write_summary_page(tmp.path(), "S1.", "Body one.");
+        let db = DbHandle::open(tmp.path()).unwrap();
+        rebuild(&db, tmp.path()).unwrap();
+        let (body_hash, summary_body_hash) = summary_hashes(&db);
+        assert_eq!(body_hash, summary_body_hash);
+    }
+
+    #[test]
+    fn changing_the_body_but_not_the_summary_leaves_the_summary_body_hash_behind() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        write_summary_page(tmp.path(), "S1.", "Body one.");
+        let db = DbHandle::open(tmp.path()).unwrap();
+        rebuild(&db, tmp.path()).unwrap();
+        write_summary_page(tmp.path(), "S1.", "Body two.");
+        rebuild(&db, tmp.path()).unwrap();
+        let (body_hash, summary_body_hash) = summary_hashes(&db);
+        assert_ne!(body_hash, summary_body_hash);
+    }
+
+    #[test]
+    fn changing_the_summary_together_with_the_body_refreshes_the_summary_body_hash() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        write_summary_page(tmp.path(), "S1.", "Body one.");
+        let db = DbHandle::open(tmp.path()).unwrap();
+        rebuild(&db, tmp.path()).unwrap();
+        write_summary_page(tmp.path(), "S2.", "Body two.");
+        rebuild(&db, tmp.path()).unwrap();
+        let (body_hash, summary_body_hash) = summary_hashes(&db);
+        assert_eq!(body_hash, summary_body_hash);
+    }
+
+    #[test]
+    fn a_page_last_indexed_by_an_older_client_is_re_embedded_by_the_next_rebuild() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        write_page(tmp.path(), "entities", "alice", "First text.", &[]);
+        let db = DbHandle::open(tmp.path()).unwrap();
+        rebuild_with(&db, tmp.path(), &RecordingEmbedder::new()).unwrap();
+        // The other PC (pre-summary BRAIN) edits the page and indexes it:
+        // it writes the new file_hash but knows nothing of
+        // summary_indexed_hash.
+        write_page(tmp.path(), "entities", "alice", "Second text.", &[]);
+        let raw = std::fs::read(wiki_dir(tmp.path()).join("entities/alice.md")).unwrap();
+        let new_hash = hex::encode(Sha256::digest(&raw));
+        db.with(|conn| {
+            conn.execute("UPDATE pages SET file_hash = ?1", params![new_hash])?;
+            Ok(())
+        })
+        .unwrap();
+        let embedder = RecordingEmbedder::new();
+        rebuild_with(&db, tmp.path(), &embedder).unwrap();
+        assert_eq!(embedder.count(), 1);
+    }
+
+    #[test]
+    fn a_full_write_records_the_file_hash_as_the_summary_indexed_hash() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        write_page(tmp.path(), "entities", "alice", "Text.", &[]);
+        let db = DbHandle::open(tmp.path()).unwrap();
+        rebuild(&db, tmp.path()).unwrap();
+        assert_eq!(
+            strings(&db, "SELECT CASE WHEN file_hash = summary_indexed_hash THEN 'same' END FROM pages"),
+            vec!["same"]
+        );
+    }
+
+    #[test]
+    fn confirming_a_stale_summary_makes_its_body_hash_current_after_the_next_rebuild() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        write_summary_page(tmp.path(), "S1.", "Body one.");
+        let db = DbHandle::open(tmp.path()).unwrap();
+        rebuild(&db, tmp.path()).unwrap();
+        write_summary_page(tmp.path(), "S1.", "Body two.");
+        db.with(|conn| confirm_summary(conn, "entities/acme", "Body two.\n")).unwrap();
+        rebuild(&db, tmp.path()).unwrap();
+        let (body_hash, summary_body_hash) = summary_hashes(&db);
+        assert_eq!(body_hash, summary_body_hash);
+    }
+
+    #[test]
+    fn summaries_count_as_indexed_only_after_a_rebuild_with_metadata_version_2() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        let db = DbHandle::open(tmp.path()).unwrap();
+        let before = db.with(|conn| Ok(summaries_indexed(conn))).unwrap();
+        rebuild(&db, tmp.path()).unwrap();
+        let after = db.with(|conn| Ok(summaries_indexed(conn))).unwrap();
+        assert_eq!((before, after), (false, true));
+    }
+
+    // ---- H1: page_vectors ---------------------------------------------------
+
+    fn stored_page_vector(db: &DbHandle, id: &str) -> Option<Vec<f32>> {
+        let id = id.to_string();
+        db.with(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT embedding FROM page_vectors WHERE page_id = ?1",
+                    params![id],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .ok()
+                .map(|b| crate::embedding::bytes_to_vec(&b)))
+        })
+        .unwrap()
+    }
+
+    /// The page vector recomputed from the page's chunk rows.
+    fn mean_of_stored_chunks(db: &DbHandle, id: &str) -> Option<Vec<f32>> {
+        let id = id.to_string();
+        db.with(move |conn| {
+            let mut stmt =
+                conn.prepare("SELECT embedding FROM chunks WHERE page_id = ?1 ORDER BY chunk_idx")?;
+            let blobs = stmt
+                .query_map(params![id], |row| row.get::<_, Vec<u8>>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut mean = crate::embedding::MeanVector::default();
+            for b in &blobs {
+                mean.add_blob(b);
+            }
+            Ok(mean.finish())
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn rebuild_stores_the_normalised_mean_of_the_chunk_vectors_as_the_page_vector() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        let long_body = format!("# A\n{}\n# B\nsecond section words", "w ".repeat(300));
+        write_page(tmp.path(), "entities", "alice", &long_body, &[]);
+        let db = DbHandle::open(tmp.path()).unwrap();
+        rebuild_with(&db, tmp.path(), &crate::embedding::hashed::HashedEmbedder::new()).unwrap();
+        let stored = stored_page_vector(&db, "entities/alice");
+        assert!(stored.is_some() && stored == mean_of_stored_chunks(&db, "entities/alice"));
+    }
+
+    #[test]
+    fn the_metadata_refresh_fills_the_page_vector_of_an_unchanged_page() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        write_page(tmp.path(), "entities", "alice", "Alice talks about NLSpec.", &[]);
+        let db = DbHandle::open(tmp.path()).unwrap();
+        let hashed = crate::embedding::hashed::HashedEmbedder::new();
+        rebuild_with(&db, tmp.path(), &hashed).unwrap();
+        db.with(|conn| {
+            conn.execute("DELETE FROM page_vectors", [])?;
+            write_meta(conn, META_VERSION_KEY, "1")
+        })
+        .unwrap();
+        rebuild_with(&db, tmp.path(), &hashed).unwrap();
+        assert!(stored_page_vector(&db, "entities/alice").is_some());
+    }
+
+    #[test]
+    fn forget_pages_removes_the_page_vector() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        write_page(tmp.path(), "entities", "alice", "Alice talks about NLSpec.", &[]);
+        let db = DbHandle::open(tmp.path()).unwrap();
+        rebuild_with(&db, tmp.path(), &crate::embedding::hashed::HashedEmbedder::new()).unwrap();
+        db.with(|conn| forget_pages(conn, &["entities/alice".to_string()])).unwrap();
+        assert!(stored_page_vector(&db, "entities/alice").is_none());
     }
 }

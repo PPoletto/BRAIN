@@ -2,6 +2,7 @@
 //! backlinks), and S10 Tier 3 (graph data).
 
 pub mod commands;
+pub mod eval;
 pub mod graph;
 pub mod query;
 pub mod search;

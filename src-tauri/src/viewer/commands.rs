@@ -83,6 +83,38 @@ pub fn query_pages(
         .map_err(|err| BrainError::Internal(err.to_string()))
 }
 
+/// B1: run the retrieval eval of the mounted vault (Settings → "Search
+/// quality") and append the run to `00_meta/eval-history.md`. Async +
+/// blocking task: embedding every test question takes a while.
+#[tauri::command]
+pub async fn run_retrieval_eval(
+    state: State<'_, Arc<crate::state::AppState>>,
+) -> BrainResult<super::eval::EvalReport> {
+    use super::eval;
+    let vault = current_vault(&state)?;
+    let db = state
+        .db()
+        .ok_or_else(|| BrainError::Internal("no SQLite index is open".into()))?;
+    tokio::task::spawn_blocking(move || {
+        let set = eval::load_eval_set(&vault).map_err(|e| BrainError::Internal(e.to_string()))?;
+        if set.is_empty() {
+            return Err(BrainError::Internal(
+                "no test questions yet — add them to 00_meta/eval-queries.yaml or let an agent \
+                 use brain_eval_add"
+                    .into(),
+            ));
+        }
+        let report = eval::run_eval(&db, &vault, &set)
+            .map_err(|e| BrainError::Internal(format!("eval failed: {e}")))?;
+        if let Err(err) = eval::append_history(&vault, &report, chrono::Local::now()) {
+            tracing::warn!(?err, "could not append to the eval history");
+        }
+        Ok(report)
+    })
+    .await
+    .map_err(|e| BrainError::Internal(format!("eval task panicked: {e}")))?
+}
+
 /// Forces a full rebuild of the SQLite page index from the filesystem.
 /// Mostly a fallback for users on older index format versions — the
 /// next bootstrap auto-detects the version mismatch and re-indexes

@@ -6,10 +6,11 @@
 //! the files: the link graph and the chunk vectors are already there. The
 //! work is split in two so callers can bound the DB part:
 //!
-//!  - [`load_rows`] does every DB read (under the connection lock). Chunk
-//!    vectors are STREAMED into per-page running sums — no blob is ever
-//!    collected — so the lock is held only for one sequential scan. The
-//!    MCP server runs it through its timeout/reopen wrapper (`db_op`).
+//!  - [`load_rows`] does every DB read (under the connection lock). Page
+//!    vectors come precomputed from `page_vectors` (H1); only pages that
+//!    have no row there yet have their chunk vectors STREAMED into
+//!    per-page running sums — no blob is ever collected. The MCP server
+//!    runs it through its timeout/reopen wrapper (`db_op`).
 //!  - [`evaluate`] is pure: it applies the rules to the loaded rows with
 //!    no lock held.
 //!
@@ -112,7 +113,7 @@ pub fn load_rows(conn: &rusqlite::Connection) -> DbResult<HygieneRows> {
             .collect::<Result<Vec<_>, _>>()?
     };
     let page_vectors = if index_embedder.as_deref() == Some(SEMANTIC_EMBEDDER) {
-        stream_page_vectors(conn)?
+        load_page_vectors(conn)?
     } else {
         HashMap::new()
     };
@@ -124,49 +125,60 @@ pub fn load_rows(conn: &rusqlite::Connection) -> DbResult<HygieneRows> {
     })
 }
 
+/// Page id → L2-normalised mean of its chunk vectors. Read from the
+/// precomputed `page_vectors` table (H1, maintained by the page-index
+/// rebuild); pages that have chunk vectors but no `page_vectors` row yet
+/// (an index from before the table existed, until its metadata refresh
+/// ran) are summed from their chunks as before. Both paths produce the
+/// same vector for a page ([`crate::embedding::MeanVector`]).
+pub fn load_page_vectors(conn: &rusqlite::Connection) -> DbResult<HashMap<String, Vec<f32>>> {
+    let mut out: HashMap<String, Vec<f32>> = HashMap::new();
+    {
+        let mut stmt = conn.prepare("SELECT page_id, embedding FROM page_vectors")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let ValueRef::Blob(blob) = row.get_ref(1)? else {
+                continue;
+            };
+            let mut mean = crate::embedding::MeanVector::default();
+            mean.add_blob(blob);
+            if let Some(v) = mean.finish() {
+                out.insert(row.get(0)?, v);
+            }
+        }
+    }
+    out.extend(stream_page_vectors(
+        conn,
+        "SELECT page_id, embedding FROM chunks \
+         WHERE embedding IS NOT NULL AND page_id NOT IN (SELECT page_id FROM page_vectors)",
+    )?);
+    Ok(out)
+}
+
 /// Page id → L2-normalised mean of its chunk vectors, accumulated row by
-/// row. Blobs that are empty, not a whole number of f32s, or of another
-/// dimension than the page's first chunk are skipped; pages whose sum is
-/// the zero vector are left out.
-fn stream_page_vectors(conn: &rusqlite::Connection) -> DbResult<HashMap<String, Vec<f32>>> {
-    let mut sums: HashMap<String, Vec<f32>> = HashMap::new();
-    let mut stmt =
-        conn.prepare("SELECT page_id, embedding FROM chunks WHERE embedding IS NOT NULL")?;
+/// row from `sql` (which selects `page_id, embedding`). Blobs that are
+/// empty, not a whole number of f32s, or of another dimension than the
+/// page's first chunk are skipped; pages whose sum is the zero vector are
+/// left out.
+fn stream_page_vectors(conn: &rusqlite::Connection, sql: &str) -> DbResult<HashMap<String, Vec<f32>>> {
+    let mut sums: HashMap<String, crate::embedding::MeanVector> = HashMap::new();
+    let mut stmt = conn.prepare(sql)?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         let ValueRef::Blob(blob) = row.get_ref(1)? else {
             continue;
         };
-        if blob.is_empty() || blob.len() % 4 != 0 {
-            continue;
-        }
-        let dim = blob.len() / 4;
         let page_id = row.get_ref(0)?.as_str().unwrap_or_default();
         if !sums.contains_key(page_id) {
-            sums.insert(page_id.to_string(), vec![0.0; dim]);
+            sums.insert(page_id.to_string(), Default::default());
         }
-        let Some(sum) = sums.get_mut(page_id) else {
-            continue;
-        };
-        if sum.len() != dim {
-            continue;
-        }
-        for (s, bytes) in sum.iter_mut().zip(blob.chunks_exact(4)) {
-            *s += f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if let Some(sum) = sums.get_mut(page_id) {
+            sum.add_blob(blob);
         }
     }
     Ok(sums
         .into_iter()
-        .filter_map(|(id, mut v)| {
-            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm <= f32::EPSILON {
-                return None;
-            }
-            for x in &mut v {
-                *x /= norm;
-            }
-            Some((id, v))
-        })
+        .filter_map(|(id, mean)| mean.finish().map(|v| (id, v)))
         .collect())
 }
 
@@ -206,18 +218,8 @@ fn strip_fragment(dst: &str) -> &str {
 /// counts for that id) and whose file has not changed for
 /// [`ORPHAN_MIN_AGE_DAYS`]. Pages with an unknown mtime are not reported.
 fn orphans(pages: &[PageRow], links: &[(String, String)], now_unix: i64) -> Vec<LintWarning> {
-    let mut linked: HashSet<&str> = HashSet::new();
-    for (src, dst) in links {
-        for target in [dst.as_str(), strip_fragment(dst)] {
-            if target != src {
-                linked.insert(target);
-            }
-        }
-    }
-    let cutoff = now_unix - ORPHAN_MIN_AGE_DAYS * 24 * 60 * 60;
-    pages
-        .iter()
-        .filter(|p| p.mtime > 0 && p.mtime < cutoff && !linked.contains(p.id.as_str()))
+    orphan_rows(pages, links, now_unix)
+        .into_iter()
         .map(|p| LintWarning {
             path: p.path.clone(),
             kind: "orphan".into(),
@@ -233,6 +235,80 @@ fn orphans(pages: &[PageRow], links: &[(String, String)], now_unix: i64) -> Vec<
         .collect()
 }
 
+/// Target id → the OTHER pages linking to it. A self-link does not
+/// count; a link to `id#heading` counts for `id`, and a link whose raw
+/// text equals an id counts for that id.
+fn inbound_sources(links: &[(String, String)]) -> HashMap<&str, HashSet<&str>> {
+    let mut inbound: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for (src, dst) in links {
+        for target in [dst.as_str(), strip_fragment(dst)] {
+            if target != src {
+                inbound.entry(target).or_default().insert(src.as_str());
+            }
+        }
+    }
+    inbound
+}
+
+/// The pages the `orphan` rule reports (see [`orphans`]).
+fn orphan_rows<'a>(pages: &'a [PageRow], links: &[(String, String)], now_unix: i64) -> Vec<&'a PageRow> {
+    let inbound = inbound_sources(links);
+    let cutoff = now_unix - ORPHAN_MIN_AGE_DAYS * 24 * 60 * 60;
+    pages
+        .iter()
+        .filter(|p| p.mtime > 0 && p.mtime < cutoff && !inbound.contains_key(p.id.as_str()))
+        .collect()
+}
+
+/// One indexed page with its link facts, for the dream queue (H1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PageFacts {
+    pub id: String,
+    pub page_type: String,
+    /// Unix seconds of the file's last modification; 0 = unknown.
+    pub mtime: i64,
+    /// Number of OTHER pages linking here (see [`inbound_sources`]).
+    pub inbound: usize,
+}
+
+impl HygieneRows {
+    /// Every indexed page (ordered by id) with its inbound-link count.
+    pub fn page_facts(&self) -> Vec<PageFacts> {
+        let inbound = inbound_sources(&self.links);
+        self.pages
+            .iter()
+            .map(|p| PageFacts {
+                id: p.id.clone(),
+                page_type: p.page_type.clone(),
+                mtime: p.mtime,
+                inbound: inbound.get(p.id.as_str()).map_or(0, HashSet::len),
+            })
+            .collect()
+    }
+
+    /// Ids of the pages the `orphan` rule reports at `now_unix`.
+    pub fn orphan_ids(&self, now_unix: i64) -> Vec<String> {
+        orphan_rows(&self.pages, &self.links, now_unix)
+            .into_iter()
+            .map(|p| p.id.clone())
+            .collect()
+    }
+
+    /// The `duplicate-candidate` pairs `(a, b, score)`, highest score
+    /// first (`a < b`). Empty unless the index was embedded by the real
+    /// model — the same gate as the lint rule.
+    pub fn duplicate_pairs(&self) -> Vec<(String, String, f32)> {
+        if self.index_embedder.as_deref() != Some(SEMANTIC_EMBEDDER) {
+            return Vec::new();
+        }
+        let mut ignored_notes = Vec::new();
+        duplicate_pair_rows(self, &mut ignored_notes)
+            .into_iter()
+            .map(|(score, a, b)| (a.id.clone(), b.id.clone(), score))
+            .collect()
+    }
+}
+
 fn format_local_date(unix: i64) -> String {
     chrono::DateTime::from_timestamp(unix, 0)
         .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
@@ -246,6 +322,28 @@ fn format_local_date(unix: i64) -> String {
 /// with more than [`DUPLICATE_MAX_PAGES_PER_TYPE`] pages are skipped with
 /// a note; pages without vectors are ignored.
 fn duplicate_candidates(rows: &HygieneRows, findings: &mut HygieneFindings) {
+    for (score, a, b) in duplicate_pair_rows(rows, &mut findings.notes) {
+        let message = format!(
+            "'{}' and '{}' may be duplicates (similarity {score:.2}) — if they describe the \
+             same thing, fold one into the other with brain_merge_pages",
+            a.id, b.id
+        );
+        for page in [a, b] {
+            findings.warnings.push(LintWarning {
+                path: page.path.clone(),
+                kind: "duplicate-candidate".into(),
+                message: message.clone(),
+            });
+        }
+    }
+}
+
+/// The pairs behind [`duplicate_candidates`], highest score first; a
+/// skipped over-sized type adds a note to `notes`.
+fn duplicate_pair_rows<'a>(
+    rows: &'a HygieneRows,
+    notes: &mut Vec<LintWarning>,
+) -> Vec<(f32, &'a PageRow, &'a PageRow)> {
     // Pages are loaded ORDER BY id, so within a group every pair is (a < b).
     let mut by_type: HashMap<&str, Vec<(&PageRow, &Vec<f32>)>> = HashMap::new();
     for page in &rows.pages {
@@ -260,7 +358,7 @@ fn duplicate_candidates(rows: &HygieneRows, findings: &mut HygieneFindings) {
     for page_type in types {
         let group = &by_type[page_type];
         if group.len() > DUPLICATE_MAX_PAGES_PER_TYPE {
-            findings.notes.push(LintWarning {
+            notes.push(LintWarning {
                 path: String::new(),
                 kind: SKIPPED_KIND.into(),
                 message: format!(
@@ -285,20 +383,7 @@ fn duplicate_candidates(rows: &HygieneRows, findings: &mut HygieneFindings) {
             .then_with(|| x.1.id.cmp(&y.1.id))
             .then_with(|| x.2.id.cmp(&y.2.id))
     });
-    for (score, a, b) in pairs {
-        let message = format!(
-            "'{}' and '{}' may be duplicates (similarity {score:.2}) — if they describe the \
-             same thing, fold one into the other with brain_merge_pages",
-            a.id, b.id
-        );
-        for page in [a, b] {
-            findings.warnings.push(LintWarning {
-                path: page.path.clone(),
-                kind: "duplicate-candidate".into(),
-                message: message.clone(),
-            });
-        }
-    }
+    pairs
 }
 
 #[cfg(test)]
@@ -627,6 +712,99 @@ mod tests {
         let (_tmp, db) = open_semantic_db();
         let findings = check(&db, true, NOW).unwrap();
         assert!(findings.notes.is_empty());
+    }
+
+    // ---- page_vectors (H1) -------------------------------------------------
+
+    fn insert_page_vector(db: &DbHandle, page_id: &str, v: &[f32]) {
+        db.with(|conn| {
+            conn.execute(
+                "INSERT INTO page_vectors(page_id, embedding) VALUES (?1, ?2)",
+                rusqlite::params![page_id, vec_to_bytes(v)],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_precomputed_page_vector_is_used_instead_of_summing_the_chunks() {
+        let (_tmp, db) = open_semantic_db();
+        insert_page(&db, "entities/a", "entity", NOW);
+        insert_chunk(&db, "entities/a", &unit(0, 0.0));
+        insert_page_vector(&db, "entities/a", &unit(2, 0.0));
+        let vectors = db.with(load_page_vectors).unwrap();
+        assert_eq!(vectors["entities/a"], unit(2, 0.0));
+    }
+
+    #[test]
+    fn a_page_without_a_precomputed_vector_falls_back_to_its_chunks() {
+        let (_tmp, db) = open_semantic_db();
+        insert_page(&db, "entities/a", "entity", NOW);
+        insert_chunk(&db, "entities/a", &unit(1, 0.0));
+        let vectors = db.with(load_page_vectors).unwrap();
+        assert_eq!(vectors["entities/a"], unit(1, 0.0));
+    }
+
+    /// Stand-in for the real model: recorded as "bge-m3" so the duplicate
+    /// rule trusts its vectors. Texts containing "pizza" point along axis
+    /// 0 (slightly tilted for "two"), everything else along axis 2.
+    struct FakeModel;
+    impl crate::embedding::Embedder for FakeModel {
+        fn dim(&self) -> usize {
+            crate::embedding::EMBED_DIM
+        }
+        fn name(&self) -> &'static str {
+            SEMANTIC_EMBEDDER
+        }
+        fn embed(&self, text: &str) -> Vec<f32> {
+            let mut v = vec![0.0; crate::embedding::EMBED_DIM];
+            if text.contains("pizza") {
+                v[0] = 1.0;
+                v[1] = if text.contains("two") { 0.1 } else { 0.0 };
+            } else {
+                v[2] = 1.0;
+            }
+            v
+        }
+    }
+
+    fn rebuilt_vault() -> (TempDir, DbHandle) {
+        let (tmp, db) = open_db();
+        for (slug, body) in [("a", "pizza one"), ("b", "pizza two"), ("c", "other topic")] {
+            let dir = crate::vault::layout::wiki_dir(tmp.path()).join("entities");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(format!("{slug}.md")),
+                format!("---\nid: entities/{slug}\ntype: entity\ntitle: {slug}\n---\n\n{body}\n"),
+            )
+            .unwrap();
+        }
+        crate::db::pages_index::rebuild_with(&db, tmp.path(), &FakeModel).unwrap();
+        (tmp, db)
+    }
+
+    #[test]
+    fn page_vectors_written_by_the_rebuild_find_the_duplicate_pair() {
+        let (_tmp, db) = rebuilt_vault();
+        let findings = check(&db, true, NOW).unwrap();
+        assert_eq!(kinds(&findings, "duplicate-candidate").len(), 2);
+    }
+
+    #[test]
+    fn duplicate_findings_from_page_vectors_equal_those_from_summing_the_chunks() {
+        let (_tmp, db) = rebuilt_vault();
+        let mut rows = db.with(load_rows).unwrap();
+        let from_table = evaluate(&rows, true, NOW).warnings;
+        rows.page_vectors = db
+            .with(|conn| {
+                stream_page_vectors(
+                    conn,
+                    "SELECT page_id, embedding FROM chunks WHERE embedding IS NOT NULL",
+                )
+            })
+            .unwrap();
+        assert_eq!(from_table, evaluate(&rows, true, NOW).warnings);
     }
 
     // ---- lint_with_index ---------------------------------------------------

@@ -5,6 +5,7 @@ import { open as openShell } from "@tauri-apps/plugin-shell";
 import {
   commands,
   type ClientStatus,
+  type EvalReport,
   type McpCommandHint,
   type RegistrationReport,
   type RemoteStatus,
@@ -329,7 +330,65 @@ function GeneralTab() {
       </Card>
       <AutostartCard />
       <RebuildIndexCard />
+      <SearchQualityCard />
     </div>
+  );
+}
+
+function SearchQualityCard() {
+  const [report, setReport] = useState<EvalReport | null>(null);
+  const action = useAsyncAction(() => commands.runRetrievalEval(), {
+    pending: "Running the retrieval eval…",
+    errorPrefix: "Eval failed",
+  });
+
+  async function run() {
+    const result = await action.trigger();
+    if (result) setReport(result);
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <div>
+          <CardTitle>Search quality</CardTitle>
+          <CardDescription>
+            Runs the test questions in <code>00_meta/eval-queries.yaml</code> through
+            full-text, vector and hybrid search and scores how well each finds the
+            expected pages. Each run is appended to <code>00_meta/eval-history.md</code>.
+          </CardDescription>
+        </div>
+        <Button variant="primary" size="sm" loading={action.loading} onClick={() => void run()}>
+          {action.loading ? "Running…" : "Run retrieval eval"}
+        </Button>
+      </CardHeader>
+      {report && (
+        <table className="mt-3 w-full text-sm text-neutral-300">
+          <caption className="mb-1 text-left text-xs text-neutral-500">
+            {report.queries} questions · embedder {report.index_embedder ?? "unknown"}
+            {report.warning && <span className="block text-amber-300">{report.warning}</span>}
+          </caption>
+          <thead>
+            <tr className="text-left text-neutral-500">
+              <th>Mode</th>
+              <th>Recall@10</th>
+              <th>MRR</th>
+              <th>nDCG@10</th>
+            </tr>
+          </thead>
+          <tbody>
+            {report.modes.map((m) => (
+              <tr key={m.mode}>
+                <td>{m.mode}</td>
+                <td>{m.recall_at_10.toFixed(3)}</td>
+                <td>{m.mrr.toFixed(3)}</td>
+                <td>{m.ndcg_at_10.toFixed(3)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </Card>
   );
 }
 

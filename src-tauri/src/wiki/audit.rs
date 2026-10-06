@@ -8,6 +8,9 @@
 //! through the newest report — consolidation as a planned operation,
 //! without an LLM inside BRAIN.
 //!
+//! Each run also refreshes the dream queue `00_meta/dream-queue.md`
+//! ([`super::dream`], H1 — the "Tiefschlaf" half of dreaming).
+//!
 //! Findings are never toasted (user decision): the report file and the
 //! Integrity page are the only places they show up. The audit is a
 //! BACKGROUND task: its label shows in the status bar, but it does not
@@ -220,7 +223,20 @@ fn relative_path(vault: &Path, path: &str) -> String {
 pub fn run_audit(vault: &Path, db: Option<&DbHandle>) -> WikiResult<PathBuf> {
     let _no_rebuild_meanwhile = db.map(DbHandle::rebuild_guard);
     let report = lint_with_index(vault, db)?;
-    Ok(write_audit_report(vault, &report)?)
+    let path = write_audit_report(vault, &report)?;
+    if let Some(db) = db {
+        write_dream_queue(vault, db);
+    }
+    Ok(path)
+}
+
+/// H1: the daily audit ("Tiefschlaf") also refreshes
+/// `00_meta/dream-queue.md`. A failure is logged, never fatal — the
+/// audit report is already written.
+fn write_dream_queue(vault: &Path, db: &DbHandle) {
+    if let Err(err) = super::dream::refresh_dream_queue(vault, db, chrono::Utc::now()) {
+        tracing::warn!(?err, "could not write the dream queue");
+    }
 }
 
 /// Abortable handle to the running audit scheduler, stored in
@@ -311,7 +327,22 @@ fn audit_once(state: &AppState, vault: &Path) -> WikiResult<Option<PathBuf>> {
     if state.vault_path().as_deref() != Some(vault) {
         return Ok(None);
     }
-    Ok(Some(write_audit_report(vault, &report)?))
+    let path = write_audit_report(vault, &report)?;
+    if let Some(db) = db.as_ref() {
+        deep_sleep_housekeeping(db);
+        write_dream_queue(vault, db);
+    }
+    Ok(Some(path))
+}
+
+/// H1 Tiefschlaf: FTS `optimize` and, if worthwhile, `VACUUM`
+/// ([`super::dream::deep_sleep_housekeeping`]). Best-effort: logged,
+/// never fatal.
+fn deep_sleep_housekeeping(db: &DbHandle) {
+    match db.with(super::dream::deep_sleep_housekeeping) {
+        Ok(vacuumed) => tracing::info!(vacuumed, "index housekeeping done"),
+        Err(err) => tracing::warn!(?err, "index housekeeping failed — retried with the next audit"),
+    }
 }
 
 #[cfg(test)]
@@ -458,6 +489,14 @@ mod tests {
         let db = DbHandle::open(tmp.path()).unwrap();
         let path = run_audit(tmp.path(), Some(&db)).unwrap();
         assert!(path.is_file());
+    }
+
+    #[test]
+    fn run_audit_also_writes_the_dream_queue() {
+        let tmp = vault();
+        let db = DbHandle::open(tmp.path()).unwrap();
+        run_audit(tmp.path(), Some(&db)).unwrap();
+        assert!(super::super::dream::dream_queue_path(tmp.path()).is_file());
     }
 
     #[test]

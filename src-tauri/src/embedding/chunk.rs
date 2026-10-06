@@ -16,8 +16,16 @@ const STRIDE: usize = 160;
 /// for typical German/English titles and headings.
 const MAX_HEADER_CHARS: usize = 160;
 
+/// Upper bound (in characters) for the whole context line when the page
+/// has a `summary` (B2): room for a one-to-two-sentence summary after the
+/// title/heading part.
+const MAX_HEADER_WITH_SUMMARY_CHARS: usize = 280;
+
 /// Separator between the page label and the heading path in the header.
 const PATH_SEP: &str = " › ";
+
+/// Separator between the title/heading part and the page summary.
+const SUMMARY_SEP: &str = " — ";
 
 /// One embeddable window of a page body.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,9 +96,23 @@ pub fn section_chunks(body: &str) -> Vec<Chunk> {
 
 /// The text that is actually embedded for a chunk: one line of context
 /// (`<title> (<type>) › <h1> › <h2>`), a blank line, then the chunk.
-/// The header is capped at [`MAX_HEADER_CHARS`] characters. Empty parts
-/// (no title, no type, empty heading path) are left out.
-pub fn contextual_text(title: &str, page_type: &str, heading_path: &[String], chunk: &str) -> String {
+/// The title/type/heading part is capped at [`MAX_HEADER_CHARS`]
+/// characters. Empty parts (no title, no type, empty heading path) are
+/// left out.
+///
+/// With a page `summary` (B2) the line becomes
+/// `<title> (<type>) › <h1> — <summary>`, capped as a whole at
+/// [`MAX_HEADER_WITH_SUMMARY_CHARS`]. The summary is appended AFTER the
+/// title/heading part has been capped, so a page without a summary gets a
+/// byte-identical header to before summaries existed — its stored vectors
+/// stay valid and no re-embed of the whole vault is needed.
+pub fn contextual_text(
+    title: &str,
+    page_type: &str,
+    heading_path: &[String],
+    summary: Option<&str>,
+    chunk: &str,
+) -> String {
     let title = collapse_ws(title);
     let page_type = collapse_ws(page_type);
     let mut header = match (title.is_empty(), page_type.is_empty()) {
@@ -109,14 +131,27 @@ pub fn contextual_text(title: &str, page_type: &str, heading_path: &[String], ch
         }
         header.push_str(&h);
     }
-    if header.chars().count() > MAX_HEADER_CHARS {
-        header = header.chars().take(MAX_HEADER_CHARS - 1).collect();
-        header.push('…');
+    cap_chars(&mut header, MAX_HEADER_CHARS);
+    let summary = summary.map(collapse_ws).unwrap_or_default();
+    if !summary.is_empty() {
+        if !header.is_empty() {
+            header.push_str(SUMMARY_SEP);
+        }
+        header.push_str(&summary);
+        cap_chars(&mut header, MAX_HEADER_WITH_SUMMARY_CHARS);
     }
     if header.is_empty() {
         return chunk.to_string();
     }
     format!("{header}\n\n{chunk}")
+}
+
+/// Truncate `s` to at most `max` characters, the last one being `…`.
+fn cap_chars(s: &mut String, max: usize) {
+    if s.chars().count() > max {
+        *s = s.chars().take(max - 1).collect();
+        s.push('…');
+    }
 }
 
 fn flush(out: &mut Vec<Chunk>, stack: &[(usize, String)], words: &[&str]) {
@@ -327,21 +362,58 @@ mod tests {
     #[test]
     fn contextual_text_renders_title_type_and_heading_path_on_one_line_then_a_blank_line_then_the_chunk() {
         let path = vec!["Vertrag".to_string(), "Laufzeit".to_string()];
-        let t = contextual_text("Kunde A", "entity", &path, "renews for 12 months");
+        let t = contextual_text("Kunde A", "entity", &path, None, "renews for 12 months");
         assert_eq!(t, "Kunde A (entity) › Vertrag › Laufzeit\n\nrenews for 12 months");
     }
 
     #[test]
     fn contextual_text_with_an_empty_heading_path_renders_only_title_and_type() {
-        let t = contextual_text("Kunde A", "entity", &[], "body");
+        let t = contextual_text("Kunde A", "entity", &[], None, "body");
         assert_eq!(t, "Kunde A (entity)\n\nbody");
     }
 
     #[test]
     fn contextual_text_caps_an_overlong_header_line() {
         let long = "x".repeat(500);
-        let t = contextual_text(&long, "entity", &[], "body");
+        let t = contextual_text(&long, "entity", &[], None, "body");
         let header = t.split("\n\n").next().unwrap();
         assert_eq!(header.chars().count(), MAX_HEADER_CHARS);
+    }
+
+    #[test]
+    fn contextual_text_with_a_summary_appends_it_after_the_heading_path() {
+        let path = vec!["Vertrag".to_string()];
+        let t = contextual_text("Kunde A", "entity", &path, Some("Customer since 2024."), "body");
+        assert_eq!(t, "Kunde A (entity) › Vertrag — Customer since 2024.\n\nbody");
+    }
+
+    #[test]
+    fn contextual_text_with_a_blank_summary_equals_the_header_without_a_summary() {
+        let path = vec!["Vertrag".to_string()];
+        assert_eq!(
+            contextual_text("Kunde A", "entity", &path, Some("  "), "body"),
+            contextual_text("Kunde A", "entity", &path, None, "body")
+        );
+    }
+
+    #[test]
+    fn contextual_text_caps_a_header_with_a_summary_at_280_characters() {
+        let summary = "s".repeat(500);
+        let t = contextual_text("Kunde A", "entity", &[], Some(&summary), "body");
+        let header = t.split("\n\n").next().unwrap();
+        assert_eq!(header.chars().count(), MAX_HEADER_WITH_SUMMARY_CHARS);
+    }
+
+    #[test]
+    fn an_overlong_title_without_a_summary_keeps_the_old_160_character_header() {
+        let long = "x".repeat(500);
+        let header = contextual_text(&long, "entity", &[], None, "body");
+        assert_eq!(header, format!("{}…\n\nbody", "x".repeat(MAX_HEADER_CHARS - 1)));
+    }
+
+    #[test]
+    fn a_summary_without_title_type_or_headings_is_the_whole_header() {
+        let t = contextual_text("", "", &[], Some("Only the summary."), "body");
+        assert_eq!(t, "Only the summary.\n\nbody");
     }
 }

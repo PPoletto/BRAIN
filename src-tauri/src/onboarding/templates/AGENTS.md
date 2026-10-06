@@ -41,6 +41,7 @@ Every page starts with YAML frontmatter:
 id: entities/dan-shapiro
 type: entity
 title: Dan Shapiro
+summary: Founder of StrongDM; met at the 2026 kickoff, contact for the NIS-2 pilot.
 created: 2026-04-29
 updated: 2026-05-11
 tags: [strongdm, founder]
@@ -52,6 +53,12 @@ Rules:
 - `id` and `type` are **required** and validated.
 - `title` is optional but writing it is strongly preferred — its absence is
   flagged as a `missing-title` warning.
+- `summary` — **every new page SHOULD carry one**: one or two sentences
+  saying what the page is about and why it matters. Search ranks summary
+  hits above body hits and embeds every chunk of the page together with
+  the summary, so a good summary makes the page findable. When you change
+  a page's body substantially, update its summary in the same write. A
+  page without one gets a (quiet) `missing-summary` warning.
 - `created` and `updated` are optional. Use ISO 8601 dates (`YYYY-MM-DD`)
   if you set them. If you can't tell when the page was created, omit the
   field rather than guess.
@@ -169,6 +176,10 @@ for the job:
 | `brain_rename_page` | A page has the **wrong id** (typo, wrong slug, wrong type directory). Moves it and rewrites every link to it across the vault |
 | `brain_merge_pages` | Two pages are **duplicates**. Appends the duplicate's body to the surviving page, redirects its links, removes the duplicate |
 | `brain_delete_page` | A page is **junk** and should not exist. Refuses while other pages link to it; `force: true` deletes anyway and turns those links into plain text. Recoverable via `brain_restore_page` |
+| `brain_dream_queue` | The prioritised consolidation list for a dream session (see "Dreaming") |
+| `brain_dream_log` | Note in one line what a dream session changed |
+| `brain_eval` | Measure search quality on the vault's test questions (Recall@10, MRR, nDCG@10 for full-text, vector and hybrid search) |
+| `brain_eval_add` | Add a test question plus the page ids a good search must return — e.g. after the user complains that a search missed something |
 
 ### Before Creating a Page
 
@@ -295,6 +306,8 @@ same findings live — and work through it:
   them if they are the same thing; otherwise remove the clashing alias.
 - `missing-sources` — an entity or concept page names no `sources`. Add
   the source pages its facts come from.
+- `missing-summary` — the page has no `summary`. Write one or two
+  sentences (start with the most-linked pages).
 - `broken-source` — a `sources` entry has no page. Fix the id or create
   the source page.
 - `invalid-date` — `valid_from` / `valid_to` is not `YYYY-MM-DD`, or
@@ -304,6 +317,60 @@ same findings live — and work through it:
 
 Confirm with the user before merging or deleting pages they wrote
 themselves. The next day's audit shows what is left.
+
+## Dreaming
+
+Like a brain that sorts its thoughts in sleep, BRAIN consolidates the
+wiki in two halves. BRAIN itself does the mechanical half: with the daily
+audit (and whenever you ask) it writes a prioritised work list, the
+**dream queue** (`00_meta/dream-queue.md`). You do the thinking half — but
+**only when the user triggers it** ("träum mal", "dream", "tidy up the
+wiki while I'm away"); never start a dream session on your own.
+
+A dream session:
+
+1. Call `brain_dream_queue` (it recomputes the queue if it is older than
+   an hour; `refresh: true` forces it). Each item has a `priority` (1 is
+   most urgent), a `kind`, the `pages`, a `reason` and a
+   `suggested_action`.
+2. Work **top-down**, at most **10 changes per session**:
+   - `fix-link` — repair the broken link or `sources` entry (right id,
+     create the missing page, or `brain_rename_page` the page that was
+     meant).
+   - `merge` — read both pages; if they describe the same thing,
+     `brain_merge_pages` the weaker into the stronger. If not, leave them
+     (and add `distinct_from` if they share a name).
+   - `update-summary` / `write-summary` — read the page and write a
+     fitting one-to-two-sentence `summary` (`brain_patch_page` cannot edit
+     frontmatter — rewrite the page with `brain_write_page`, body
+     unchanged). If a stale summary is still accurate, confirm it instead:
+     pass `confirm_summary: true` to `brain_write_page` or
+     `brain_patch_page` (with the page content unchanged) and the item
+     goes away.
+   - `archive-or-supersede` / `review-or-archive` — a page nobody reads or
+     links to. Link it from a related page if it is still useful; if its
+     facts were replaced, set `superseded_by` and `valid_to`. Do not
+     delete it.
+3. Hard rules: **never delete a page other pages link to**; **supersede
+   instead of overwriting** facts; keep minority views and open questions
+   instead of flattening them into one "truth"; ask the user before
+   changing pages they clearly wrote themselves.
+4. Finish with one `brain_dream_log` entry saying what you changed and
+   why ("merged entities/acme-inc into entities/acme; summaries for 3
+   hubs"). Every change stays recoverable with `brain_restore_page`.
+
+The queue lists each page at most once; what you leave undone (or what
+your changes uncover) shows up in the next queue.
+
+## Search Quality
+
+`00_meta/eval-queries.yaml` holds test questions with the pages a good
+search must return (synced between the user's machines). When the user
+says a search missed something, add the question with `brain_eval_add`
+(only existing page ids). `brain_eval` measures how well full-text,
+vector and hybrid search find the expected pages and appends the numbers
+to `00_meta/eval-history.md`. Add questions through `brain_eval_add`, not
+by editing the files, and never mix them with any external test suite.
 
 ## Commit Behavior
 

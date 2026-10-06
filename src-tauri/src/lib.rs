@@ -245,6 +245,64 @@ pub fn run_remote_cred(vault_arg: Option<&str>) -> i32 {
     }
 }
 
+/// Entry point for `brain eval <vault-path>` — run the retrieval eval
+/// (B1) over `00_meta/eval-queries.yaml`, print the metrics table and
+/// append the run to `00_meta/eval-history.md`. Runs a normal (hash
+/// fast path) index rebuild first. Returns a process exit code.
+pub fn run_eval(vault_arg: Option<&str>) -> i32 {
+    db::vec_loader::ensure_loaded();
+    let Some(vault_arg) = vault_arg else {
+        eprintln!("usage: brain eval <vault-path>");
+        return 2;
+    };
+    let vault = std::path::Path::new(vault_arg);
+    if !vault::layout::is_vault(vault) {
+        eprintln!("eval: '{}' is not a BRAIN vault", vault.display());
+        return 3;
+    }
+    let set = match viewer::eval::load_eval_set(vault) {
+        Ok(set) => set,
+        Err(e) => {
+            eprintln!("eval: {e}");
+            return 4;
+        }
+    };
+    if set.is_empty() {
+        eprintln!(
+            "eval: no test questions yet — add entries to 00_meta/{} (or use the MCP tool brain_eval_add)",
+            viewer::eval::EVAL_SET_FILENAME
+        );
+        return 5;
+    }
+    let db = match db::DbHandle::open(vault) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("eval: cannot open the index: {e}");
+            return 6;
+        }
+    };
+    // Bring the index up to date first (the hash fast path skips
+    // unchanged pages), so the numbers describe the pages on disk.
+    println!("Updating the index …");
+    if let Err(e) = db::pages_index::rebuild(&db, vault) {
+        eprintln!("eval: index rebuild failed: {e}");
+        return 6;
+    }
+    let report = match viewer::eval::run_eval(&db, vault, &set) {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!("eval: {e}");
+            return 7;
+        }
+    };
+    print!("{}", viewer::eval::render_table(&report));
+    match viewer::eval::append_history(vault, &report, chrono::Local::now()) {
+        Ok(path) => println!("\nAppended to {}", path.display()),
+        Err(e) => eprintln!("eval: could not append to the history: {e}"),
+    }
+    0
+}
+
 /// Entry point for `brain sync <vault-path>` — fetch → merge → push
 /// (S11 phase 6). Returns a process exit code.
 pub fn run_sync(vault_arg: Option<&str>) -> i32 {
@@ -406,6 +464,7 @@ pub fn run() {
             viewer::commands::get_graph,
             viewer::commands::query_pages,
             viewer::commands::rebuild_index,
+            viewer::commands::run_retrieval_eval,
             viewer::commands::open_page_in_external_editor,
             viewer::commands::load_graph_positions,
             viewer::commands::save_graph_positions,

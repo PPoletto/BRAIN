@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 use super::DbResult;
 
-const CURRENT_VERSION: i64 = 5;
+const CURRENT_VERSION: i64 = 7;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -158,10 +158,96 @@ pub fn apply(conn: &Connection) -> DbResult<()> {
         )?;
         tx.commit()?;
     }
+    if current < 6 {
+        // Same single-IMMEDIATE-transaction pattern as v5.
+        let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        apply_v6(&tx)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('version', '6')",
+            [],
+        )?;
+        tx.commit()?;
+    }
+    if current < 7 {
+        let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        apply_v7(&tx)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('version', '7')",
+            [],
+        )?;
+        tx.commit()?;
+    }
     conn.execute(
         "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('version', ?1)",
         rusqlite::params![CURRENT_VERSION.to_string()],
     )?;
+    Ok(())
+}
+
+/// B2 `summary` and H1 dream-queue / page-vector schema:
+///  - `pages.summary`, `pages.body_hash`, `pages.summary_body_hash` —
+///    the indexed summary, the SHA-256 of the indexed body, and the body
+///    hash at the time the summary text last changed. A summary is stale
+///    when the two hashes differ (`wiki::dream`). Derived data, filled by
+///    `pages_index` (its metadata version refreshes unchanged pages).
+///  - `pages_fts` gains a `summary` column (weighted above the body in
+///    `bm25`). FTS5 tables cannot `ALTER … ADD COLUMN`, so the table is
+///    recreated and refilled from `pages` (title + body; the summary
+///    column starts empty and is written when the page is re-indexed —
+///    pages that HAVE a summary are re-indexed once by the next rebuild
+///    because their stored `pages.summary` is still NULL).
+///  - `page_vectors(page_id, embedding)` — the L2-normalised mean of a
+///    page's chunk vectors, maintained by the rebuild; read by the
+///    duplicate lint instead of re-summing every chunk.
+fn apply_v6(conn: &Connection) -> DbResult<()> {
+    for column in ["summary", "body_hash", "summary_body_hash"] {
+        if !table_has_column(conn, "pages", column)? {
+            conn.execute_batch(&format!("ALTER TABLE pages ADD COLUMN {column} TEXT;"))?;
+        }
+    }
+    if !table_has_column(conn, "pages_fts", "summary")? {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS pages_fts;\
+             CREATE VIRTUAL TABLE pages_fts USING fts5(\
+                id UNINDEXED,\
+                title,\
+                body,\
+                summary,\
+                tokenize = 'unicode61 remove_diacritics 2'\
+             );\
+             INSERT INTO pages_fts(id, title, body, summary) \
+                SELECT id, COALESCE(title, ''), COALESCE(body, ''), '' FROM pages;",
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS page_vectors (\
+            page_id   TEXT PRIMARY KEY,\
+            embedding BLOB NOT NULL\
+         );",
+    )?;
+    Ok(())
+}
+
+/// Version-skew guard for a vault shared by two PCs where one still runs
+/// a pre-summary BRAIN: `pages.summary_indexed_hash` is the `file_hash`
+/// that the summary-aware indexer last fully wrote for the page. An older
+/// client re-indexing a page updates `file_hash` but not this column, so
+/// the next run of a current client sees the mismatch and re-indexes the
+/// page itself (`pages_index::is_unchanged`).
+///
+/// Existing rows are initialised with their `file_hash`: up to this
+/// migration every row was written by a pre-summary indexer, whose
+/// output differs from the current one only for pages WITH a summary —
+/// and those are re-indexed anyway, because their `pages.summary` is
+/// still NULL (v6). Initialising with NULL instead would re-embed every
+/// page of the vault once.
+fn apply_v7(conn: &Connection) -> DbResult<()> {
+    if !table_has_column(conn, "pages", "summary_indexed_hash")? {
+        conn.execute_batch(
+            "ALTER TABLE pages ADD COLUMN summary_indexed_hash TEXT;\
+             UPDATE pages SET summary_indexed_hash = file_hash;",
+        )?;
+    }
     Ok(())
 }
 
@@ -316,6 +402,86 @@ mod tests {
             .query_row("SELECT count(*) FROM pages WHERE valid_to IS NULL", [], |row| row.get(0))
             .unwrap();
         assert_eq!(ids, 1);
+    }
+
+    fn columns_of(conn: &Connection, table: &str) -> Vec<String> {
+        conn.prepare(&format!("PRAGMA table_info('{table}')"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn apply_v6_adds_the_summary_and_body_hash_columns_to_pages() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply(&conn).unwrap();
+        let cols = columns_of(&conn, "pages");
+        let wanted = ["summary", "body_hash", "summary_body_hash"];
+        assert!(wanted.iter().all(|w| cols.iter().any(|c| c == w)), "columns: {cols:?}");
+    }
+
+    #[test]
+    fn apply_v6_gives_the_fts_table_a_summary_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply(&conn).unwrap();
+        assert!(columns_of(&conn, "pages_fts").iter().any(|c| c == "summary"));
+    }
+
+    #[test]
+    fn apply_v6_creates_the_page_vectors_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply(&conn).unwrap();
+        assert!(columns_of(&conn, "page_vectors").iter().any(|c| c == "embedding"));
+    }
+
+    #[test]
+    fn upgrading_a_v5_database_to_v6_keeps_existing_pages_full_text_searchable() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply(&conn).unwrap();
+        // Back to the v5 shape: the three-column FTS table.
+        conn.execute_batch(
+            "DROP TABLE pages_fts; \
+             CREATE VIRTUAL TABLE pages_fts USING fts5(id UNINDEXED, title, body); \
+             INSERT INTO pages(id, type, path, title, body) \
+                VALUES ('entities/alice', 'entity', 'p', 'Alice', 'lives in Berlin'); \
+             INSERT INTO pages_fts(id, title, body) VALUES ('entities/alice', 'Alice', 'lives in Berlin'); \
+             UPDATE schema_meta SET value = '5' WHERE key = 'version';",
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        let hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pages_fts WHERE pages_fts MATCH 'berlin'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1);
+    }
+
+    #[test]
+    fn apply_v7_adds_the_summary_indexed_hash_column_to_pages() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply(&conn).unwrap();
+        assert!(columns_of(&conn, "pages").iter().any(|c| c == "summary_indexed_hash"));
+    }
+
+    #[test]
+    fn upgrading_a_v6_database_initialises_summary_indexed_hash_with_the_file_hash() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATION_V1).unwrap();
+        conn.execute_batch(
+            "INSERT INTO schema_meta(key, value) VALUES ('version', '4'); \
+             INSERT INTO pages(id, type, path, file_hash) VALUES ('entities/a', 'entity', 'p', 'h1');",
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        let hash: Option<String> = conn
+            .query_row("SELECT summary_indexed_hash FROM pages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(hash.as_deref(), Some("h1"));
     }
 
     #[test]
