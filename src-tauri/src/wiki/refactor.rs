@@ -4,8 +4,8 @@
 //! Before this module a page created under a wrong id was permanent: the
 //! MCP toolset could create, patch and restore pages but never move or
 //! remove one, and every `[[link]]` kept pointing at the bad id. The three
-//! operations here are the shared core behind `brain_rename_page`,
-//! `brain_delete_page` and `brain_merge_pages`; the MCP arms are thin.
+//! operations here are the shared core behind the MCP tool
+//! `brain_refactor` (actions rename, delete and merge); its arms are thin.
 //!
 //! Invariants every operation keeps:
 //!
@@ -15,11 +15,9 @@
 //!   access, and every resolved path is checked to lie under the wiki
 //!   directory. The MCP server applies the same validator (via
 //!   `check_page_id`) to every arm that resolves a page id:
-//!   `brain_get_page`, `brain_get_pages` (per id), `brain_get_context`,
-//!   `brain_page_exists`, `brain_write_page`, `brain_write_batch` (per
-//!   page), `brain_patch_page`, `brain_get_page_history`,
-//!   `brain_restore_page`, `brain_rename_page`, `brain_merge_pages`,
-//!   `brain_delete_page`.
+//!   `brain_get_pages` (per id), `brain_lookup`, `brain_write_page`,
+//!   `brain_write_batch` (per page), `brain_patch_page`, `brain_history`
+//!   (list and restore) and `brain_refactor` (rename, merge, delete).
 //! - **Every file location goes through the id→path resolver**
 //!   ([`page_relpath_with_store`]). An encrypted vault stores pages under
 //!   opaque HMAC filenames derived from the id, so a rename moves the file
@@ -42,7 +40,7 @@
 //! - **Nothing is lost.** Before the first change, any uncommitted work in
 //!   the wiki is committed as a path-free checkpoint, so everything a
 //!   delete or merge removes is in git history and can be brought back
-//!   with `brain_restore_page`. The file changes themselves run as a small
+//!   with `brain_history` (action restore). The file changes themselves run as a small
 //!   journal: if one fails, the ones already made are undone.
 //! - **One operation, one commit** through [`commit_wiki_with_store`], the
 //!   single commit entry point (plus the checkpoint when there was pending
@@ -81,7 +79,7 @@ pub enum RefactorError {
     IdMismatch { requested: String, found: String },
 
     #[error(
-        "a page with id '{0}' already exists — choose a different id, or use brain_merge_pages \
+        "a page with id '{0}' already exists — choose a different id, or use brain_refactor (action merge) \
          to fold one page into the other"
     )]
     TargetExists(String),
@@ -91,14 +89,14 @@ pub enum RefactorError {
 
     #[error(
         "'{a}' and '{b}' are the same file on this disk (the ids differ only in letter case) — \
-         use brain_rename_page to fix the case instead of merging"
+         use brain_refactor (action rename) to fix the case instead of merging"
     )]
     SameFile { a: String, b: String },
 
     #[error(
         "page '{id}' is still linked (or named in superseded_by / sources) from {count} page(s): {list}. Rename it \
-         (brain_rename_page) if only its id is wrong, merge it into the right page \
-         (brain_merge_pages) if it is a duplicate, or pass force=true to delete it anyway and \
+         (brain_refactor, action rename) if only its id is wrong, merge it into the right page \
+         (brain_refactor, action merge) if it is a duplicate, or pass force=true to delete it anyway and \
          turn those links into plain text",
         count = referrers.len(),
         list = referrers.join(", ")

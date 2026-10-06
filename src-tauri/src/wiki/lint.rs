@@ -521,7 +521,7 @@ fn alias_collisions(pages: &[(PathBuf, ParsedPage)], warnings: &mut Vec<LintWarn
             kind: "alias-collision".into(),
             message: format!(
                 "'{id}' has the same name as {} (via id or alias) — if they are the same \
-                 thing, fold one into the other with brain_merge_pages; if they are different, \
+                 thing, fold one into the other with brain_refactor (action merge); if they are different, \
                  change the clashing alias or add `distinct_from: [<other id>]`",
                 others.iter().map(|o| format!("'{o}'")).collect::<Vec<_>>().join(", ")
             ),

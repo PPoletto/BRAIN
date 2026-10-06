@@ -18,7 +18,7 @@
 //! `muller-gmbh` / `mueller-gmbh` are the same name while `joel` / `jol`
 //! or `kohler` / `koehler` are not.
 //!
-//! `brain_page_exists` reports all three; `brain_write_page` /
+//! `brain_lookup` reports all three; `brain_write_page` /
 //! `brain_write_batch` refuse to CREATE a page with an `alias` or
 //! `normalised` match ([`MatchReason::blocks_create`]) unless the caller
 //! passes `allow_duplicate: true`. `similar` is too fuzzy to block.

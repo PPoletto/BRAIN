@@ -109,7 +109,7 @@ export const commands = {
       last_known_vault_missing: boolean;
     }>("bootstrap_app"),
   resetBrain: () => invoke<void>("reset_brain"),
-  /// Refreshes the bundled AGENTS.md / CLAUDE.md in the mounted
+  /// Refreshes the bundled AGENTS.md / CLAUDE.md / SKILL.md in the mounted
   /// vault's 00_meta/ from the binary's embedded copies. Returns one
   /// entry per template file describing whether it was created,
   /// overwritten or already up-to-date. `.mcp.json` is intentionally

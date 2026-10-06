@@ -1,9 +1,25 @@
-//! Minimal MCP-compatible JSON-RPC server over stdio.
+//! MCP server over stdio — hand-rolled JSON-RPC 2.0, dual-era.
 //!
-//! Speaks the subset of MCP that Claude Code, Claude Desktop, Codex and
-//! Continue.dev actually invoke during a session: `initialize`,
-//! `tools/list`, `tools/call`. Each line on stdin is one JSON-RPC
-//! envelope; responses are one line per request on stdout.
+//! Serves both MCP eras from one process (see
+//! `docs/research/2026-10-mcp-spec-2026-07-28-gap.md`):
+//!
+//! - **Legacy** (`initialize` handshake): revisions 2024-11-05, 2025-03-26,
+//!   2025-06-18 and 2025-11-25. `initialize` echoes the client's requested
+//!   revision when we support it, otherwise answers 2025-11-25. Features a
+//!   revision does not know (tool annotations before 2025-03-26; tool
+//!   `title`, `outputSchema` and `structuredContent` before 2025-06-18) are
+//!   left out for that client.
+//! - **Modern** (2026-07-28, stateless): the era is decided per request
+//!   from `params._meta["io.modelcontextprotocol/protocolVersion"]`; no
+//!   handshake. Results carry `resultType: "complete"` and
+//!   `_meta["io.modelcontextprotocol/serverInfo"]`; list results and
+//!   `server/discover` carry `ttlMs` + `cacheScope`.
+//!
+//! Methods: `initialize` + `ping` (legacy only), `server/discover` (modern
+//! only), `tools/list`, `tools/call`, `prompts/list`, `prompts/get`,
+//! `resources/list`, `resources/templates/list`, `resources/read`.
+//! Each line on stdin is one JSON-RPC envelope; responses are one line per
+//! request on stdout; notifications never get a reply.
 //!
 //! The server runs in the `brain mcp` subprocess. The vault path is
 //! provided via the `BRAIN_VAULT_PATH` environment variable so a single
@@ -13,14 +29,47 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use super::tools;
 use crate::vault::layout::{raw_dir, wiki_dir};
 use crate::viewer::{graph, search, tree};
 use crate::wiki::{duplicates, history as wiki_history, lint, page, refactor};
 
-const PROTOCOL_VERSION: &str = "2024-11-05";
-// `serverInfo.name` shown in MCP `initialize` handshake responses. We use
+/// Legacy (initialize-based) revisions we negotiate, oldest first.
+const LEGACY_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
+/// What `initialize` answers when the client asks for a revision we do not
+/// know (or none).
+const LATEST_LEGACY_VERSION: &str = "2025-11-25";
+/// Modern (stateless, per-request `_meta`) revisions we serve.
+const MODERN_VERSIONS: &[&str] = &["2026-07-28"];
+
+const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+const META_CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
+const META_CLIENT_INFO: &str = "io.modelcontextprotocol/clientInfo";
+const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
+
+/// Cache hint (modern era) for the static lists and `server/discover`: the
+/// lists are compiled into the binary and an update restarts the process.
+const LIST_TTL_MS: u64 = 3_600_000;
+
+/// JSON-RPC "invalid params" — also what MCP prescribes for an unknown
+/// tool and for a missing required `_meta` field.
+const INVALID_PARAMS: i64 = -32602;
+const METHOD_NOT_FOUND: i64 = -32601;
+/// MCP 2026-07-28 `UnsupportedProtocolVersionError`.
+const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+/// MCP "resource not found".
+const RESOURCE_NOT_FOUND: i64 = -32002;
+/// `resources/read` of a vault resource without a (reachable) vault.
+/// Application-defined, deliberately outside `-32768..-32000` (the
+/// JSON-RPC reserved range, whose `-32000..-32019` sub-range MCP
+/// 2026-07-28 calls legacy and whose `-32020..-32099` it reserves). Tool
+/// calls report a missing vault as an `isError` result instead (it was
+/// `-32000` before Slice 0.3).
+const NO_VAULT: i64 = -31000;
+
+// `serverInfo.name` shown in MCP handshake / discovery responses. We use
 // the uppercase brand to match `BRAIN_SERVER_KEY` and the rest of the UI.
 const SERVER_NAME: &str = "BRAIN";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -65,6 +114,66 @@ struct RpcError {
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<Value>,
+}
+
+/// Protocol state of one stdio process. Only the legacy era has any: the
+/// revision the last `initialize` negotiated ("An `initialize` request
+/// selects legacy semantics, scoped to the stdio process"). Modern
+/// requests carry everything in `_meta` and never read or write this.
+#[derive(Debug, Default)]
+struct Session {
+    legacy_version: Option<&'static str>,
+}
+
+/// Which MCP era a request belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Era {
+    Legacy,
+    Modern,
+}
+
+/// Optional protocol features, by the revision the client speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Features {
+    /// Tool `annotations` (since 2025-03-26).
+    annotations: bool,
+    /// Tool `title`, `outputSchema` and `structuredContent`, prompt and
+    /// resource `title` (since 2025-06-18).
+    structured: bool,
+}
+
+impl Features {
+    const MODERN: Self = Self {
+        annotations: true,
+        structured: true,
+    };
+
+    fn for_legacy(version: &str) -> Self {
+        // Revision ids are ISO dates, so string order is release order.
+        Self {
+            annotations: version >= "2025-03-26",
+            structured: version >= "2025-06-18",
+        }
+    }
+}
+
+/// The outcome of one request before serialisation.
+#[derive(Debug)]
+enum Reply {
+    Result(Value),
+    Error {
+        code: i64,
+        message: String,
+        data: Option<Value>,
+    },
+}
+
+fn rpc_error(code: i64, message: impl Into<String>) -> Reply {
+    Reply::Error {
+        code,
+        message: message.into(),
+        data: None,
+    }
 }
 
 /// Belt-and-suspenders against orphaned `brain mcp` processes.
@@ -143,7 +252,10 @@ fn spawn_health_heartbeat() {
             crate::embedding::evict_idle_embedders(crate::embedding::EMBEDDER_IDLE_TTL);
             let mut sys = System::new();
             sys.refresh_processes(ProcessesToUpdate::Some(&[me]), true);
-            let rss_mb = sys.process(me).map(|p| p.memory() / (1024 * 1024)).unwrap_or(0);
+            let rss_mb = sys
+                .process(me)
+                .map(|p| p.memory() / (1024 * 1024))
+                .unwrap_or(0);
             tracing::info!(
                 uptime_min = started.elapsed().as_secs() / 60,
                 rss_mb,
@@ -173,9 +285,7 @@ pub fn run_stdio() -> std::io::Result<()> {
     // request. Liveness is decided dynamically by `maybe_reopen_db`
     // plus the `is_vault` guard inside `call_tool`, never captured
     // once.
-    let configured_vault = std::env::var("BRAIN_VAULT_PATH")
-        .map(PathBuf::from)
-        .ok();
+    let configured_vault = std::env::var("BRAIN_VAULT_PATH").map(PathBuf::from).ok();
 
     // SQLite index handle — same DB the GUI uses, WAL mode for
     // concurrent reads. Opened lazily and self-healing across vault
@@ -187,6 +297,7 @@ pub fn run_stdio() -> std::io::Result<()> {
     // and is (re)opened on the first request where the vault is
     // reachable.
     let mut db: Option<crate::db::DbHandle> = None;
+    let mut session = Session::default();
 
     // The embedding model is deliberately NOT warmed up here. Every MCP
     // client (Claude Desktop, Claude Code, Cursor, ...) spawns its own
@@ -257,7 +368,7 @@ pub fn run_stdio() -> std::io::Result<()> {
                     &id_for_panic,
                     &method_for_log,
                     std::panic::AssertUnwindSafe(|| {
-                        handle_request(&req, configured_vault.as_deref(), &mut db)
+                        handle_request(&req, configured_vault.as_deref(), &mut db, &mut session)
                     }),
                 )
             }
@@ -305,11 +416,12 @@ fn handle_request(
     req: &RpcRequest,
     vault: Option<&std::path::Path>,
     db: &mut Option<crate::db::DbHandle>,
+    session: &mut Session,
 ) -> String {
     // JSON-RPC 2.0 §4.1: a Request object without an `id` member is a
     // Notification, and the Server MUST NOT reply to it. We catch every
-    // notification here so the protocol-error and method-not-found arms
-    // below never accidentally produce output for an `id`-less envelope.
+    // notification here (both eras; incl. `notifications/initialized`)
+    // so no arm below ever produces output for an `id`-less envelope.
     if req.id.is_none() {
         return String::new();
     }
@@ -317,80 +429,301 @@ fn handle_request(
     if req.jsonrpc != "2.0" {
         return error_response(&id, -32600, "expected jsonrpc 2.0", None);
     }
-    match req.method.as_str() {
-        "initialize" => ok_response(
-            &id,
-            json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
-                "capabilities": { "tools": { "listChanged": false } }
-            }),
-        ),
-        "tools/list" => ok_response(&id, json!({ "tools": tool_descriptors() })),
-        "tools/call" => {
-            // `brain_ping` is answered here, BEFORE the vault gate and
-            // before `call_tool` — it is a pure liveness probe and must
-            // never touch the filesystem or DB, even when no vault is
-            // configured or the disk is hung. This is the contract the
-            // 0.2.19 pre-flight probe accidentally broke; keeping ping
-            // above the gate is what restores "ping always answers".
-            let tool_name = req.params.get("name").and_then(Value::as_str).unwrap_or("");
-            if tool_name == "brain_ping" {
-                return ok_response(
-                    &id,
-                    json!({
-                        "content": [{ "type": "text", "text": brain_ping_payload() }],
-                        "isError": false
-                    }),
-                );
-            }
-            match vault {
-                Some(v) => match call_tool(&req.params, v, db) {
-                    Ok(payload) => ok_response(
-                        &id,
-                        json!({
-                            "content": [{ "type": "text", "text": payload }],
-                            "isError": false
-                        }),
-                    ),
-                    Err(err) => ok_response(
-                        &id,
-                        json!({
-                            "content": [{ "type": "text", "text": err }],
-                            "isError": true
-                        }),
-                    ),
-                },
-                None => {
-                    error_response(&id, -32000, "no Brain vault is mounted on this host", None)
+    let era = match detect_era(&req.params) {
+        Ok(era) => era,
+        Err(reply) => return render(&id, Era::Legacy, reply),
+    };
+    let features = match era {
+        Era::Modern => Features::MODERN,
+        Era::Legacy => {
+            Features::for_legacy(session.legacy_version.unwrap_or(LATEST_LEGACY_VERSION))
+        }
+    };
+    let reply = dispatch(req, era, features, vault, db, session);
+    render(&id, era, reply)
+}
+
+/// Era of one request (gap doc §4): modern iff `params._meta` carries the
+/// protocol version as a string. A legacy revision there (a client that
+/// tags its legacy requests) stays legacy. A modern request with a
+/// revision we do not serve gets `-32022`; one without
+/// `clientCapabilities` gets `-32602` (both MUST in 2026-07-28).
+fn detect_era(params: &Value) -> Result<Era, Reply> {
+    let meta = params.get("_meta");
+    let Some(version) = meta
+        .and_then(|m| m.get(META_PROTOCOL_VERSION))
+        .and_then(Value::as_str)
+    else {
+        return Ok(Era::Legacy);
+    };
+    if LEGACY_VERSIONS.contains(&version) {
+        return Ok(Era::Legacy);
+    }
+    if !MODERN_VERSIONS.contains(&version) {
+        return Err(Reply::Error {
+            code: UNSUPPORTED_PROTOCOL_VERSION,
+            message: "Unsupported protocol version".to_string(),
+            data: Some(json!({ "supported": MODERN_VERSIONS, "requested": version })),
+        });
+    }
+    if meta.and_then(|m| m.get(META_CLIENT_CAPABILITIES)).is_none() {
+        return Err(rpc_error(
+            INVALID_PARAMS,
+            format!("missing required params._meta field \"{META_CLIENT_CAPABILITIES}\""),
+        ));
+    }
+    Ok(Era::Modern)
+}
+
+/// The revision `initialize` answers: the requested one when we serve it,
+/// else our latest legacy revision.
+fn negotiate_legacy(requested: Option<&str>) -> &'static str {
+    requested
+        .and_then(|r| LEGACY_VERSIONS.iter().find(|v| **v == r).copied())
+        .unwrap_or(LATEST_LEGACY_VERSION)
+}
+
+fn server_info() -> Value {
+    json!({ "name": SERVER_NAME, "version": SERVER_VERSION })
+}
+
+/// Usage hint for the client (`instructions` of `initialize` from
+/// 2025-03-26 and of `server/discover`).
+const INSTRUCTIONS: &str = "BRAIN is the user's wiki memory. Read resource brain://agents-md before \
+writing pages. Check brain_lookup before creating a page; write linked pages with \
+brain_write_batch; never overwrite facts — supersede.";
+
+fn capabilities() -> Value {
+    json!({
+        "tools": { "listChanged": false },
+        "prompts": { "listChanged": false },
+        "resources": { "listChanged": false }
+    })
+}
+
+/// Serialise a reply. Modern results get `resultType: "complete"` and
+/// `_meta[serverInfo]`; legacy results stay as the handler built them.
+fn render(id: &Value, era: Era, reply: Reply) -> String {
+    match reply {
+        Reply::Result(mut result) => {
+            if era == Era::Modern {
+                if let Value::Object(map) = &mut result {
+                    map.insert("resultType".into(), json!("complete"));
+                    let meta = map.entry("_meta").or_insert_with(|| json!({}));
+                    if let Value::Object(meta) = meta {
+                        meta.insert(META_SERVER_INFO.into(), server_info());
+                    }
                 }
             }
+            ok_response(id, result)
         }
-        "ping" => ok_response(&id, json!({})),
-        "server/discover" => {
-            tracing::info!(
-                "mcp: client probed server/discover (MCP 2026-07-28) — answering -32601 so a \
-                 dual-era client falls back to the initialize handshake"
-            );
-            error_response(&id, -32601, &server_discover_unsupported_message(), None)
-        }
-        _ => error_response(&id, -32601, &format!("method not found: {}", req.method), None),
+        Reply::Error {
+            code,
+            message,
+            data,
+        } => error_response(id, code, &message, data),
     }
 }
 
-/// The 2026-07-28 MCP revision ("stateless") added `server/discover`. We
-/// still speak the legacy, `initialize`-based revision, so we answer the
-/// probe with a plain `-32601`. Per the 2026-07-28 stdio binding
-/// ("Backward Compatibility"), a dual-era client treats any error that is
-/// NOT a recognised modern error (e.g. `-32022` UnsupportedProtocolVersion)
-/// as "legacy server" and falls back to `initialize` — so this code must
-/// stay a non-modern one. The message only makes the failure diagnosable
-/// for a modern-only client and in its log.
-fn server_discover_unsupported_message() -> String {
+/// Adds the modern-era cache hints to a cacheable result.
+fn cacheable(era: Era, mut result: Value, scope: &str, ttl_ms: u64) -> Value {
+    if era == Era::Modern {
+        result["ttlMs"] = json!(ttl_ms);
+        result["cacheScope"] = json!(scope);
+    }
+    result
+}
+
+fn dispatch(
+    req: &RpcRequest,
+    era: Era,
+    features: Features,
+    vault: Option<&std::path::Path>,
+    db: &mut Option<crate::db::DbHandle>,
+    session: &mut Session,
+) -> Reply {
+    let legacy_only = |method: &str| {
+        rpc_error(
+            METHOD_NOT_FOUND,
+            format!(
+                "{method} is not part of MCP {} (stateless, per-request _meta) — only legacy clients use it",
+                MODERN_VERSIONS[0]
+            ),
+        )
+    };
+    match req.method.as_str() {
+        "initialize" => {
+            if era == Era::Modern {
+                return legacy_only("initialize");
+            }
+            let requested = req.params.get("protocolVersion").and_then(Value::as_str);
+            let negotiated = negotiate_legacy(requested);
+            session.legacy_version = Some(negotiated);
+            let mut result = json!({
+                "protocolVersion": negotiated,
+                "serverInfo": server_info(),
+                "capabilities": capabilities()
+            });
+            // `instructions` exists in InitializeResult since 2025-03-26.
+            if Features::for_legacy(negotiated).annotations {
+                result["instructions"] = json!(INSTRUCTIONS);
+            }
+            Reply::Result(result)
+        }
+        "ping" => match era {
+            Era::Legacy => Reply::Result(json!({})),
+            Era::Modern => legacy_only("ping"),
+        },
+        "server/discover" => match era {
+            Era::Modern => Reply::Result(cacheable(
+                era,
+                json!({
+                    "supportedVersions": MODERN_VERSIONS,
+                    "capabilities": capabilities(),
+                    "instructions": INSTRUCTIONS,
+                    "_meta": { META_SERVER_INFO: server_info() }
+                }),
+                "public",
+                LIST_TTL_MS,
+            )),
+            Era::Legacy => {
+                tracing::info!(
+                    "mcp: client probed server/discover without the 2026-07-28 _meta — answering \
+                     -32601 so a dual-era client falls back to the initialize handshake"
+                );
+                rpc_error(METHOD_NOT_FOUND, server_discover_legacy_message())
+            }
+        },
+        "tools/list" => Reply::Result(cacheable(
+            era,
+            json!({ "tools": tool_descriptors(features) }),
+            "public",
+            LIST_TTL_MS,
+        )),
+        "tools/call" => tools_call(&req.params, features, vault, db),
+        "prompts/list" => Reply::Result(cacheable(
+            era,
+            json!({ "prompts": prompt_descriptors(features) }),
+            "public",
+            LIST_TTL_MS,
+        )),
+        "prompts/get" => prompt_get(&req.params),
+        "resources/list" => Reply::Result(cacheable(
+            era,
+            json!({ "resources": resource_descriptors(features) }),
+            "public",
+            LIST_TTL_MS,
+        )),
+        "resources/templates/list" => Reply::Result(cacheable(
+            era,
+            json!({ "resourceTemplates": [] }),
+            "public",
+            LIST_TTL_MS,
+        )),
+        // Vault content: private to this user and changes any time.
+        "resources/read" => match resource_read(&req.params, vault, db) {
+            Reply::Result(v) => Reply::Result(cacheable(era, v, "private", 0)),
+            err => err,
+        },
+        _ => rpc_error(
+            METHOD_NOT_FOUND,
+            format!("method not found: {}", req.method),
+        ),
+    }
+}
+
+/// `-32601` message for a `server/discover` WITHOUT the modern `_meta`.
+/// Per the 2026-07-28 stdio binding ("Backward Compatibility"), a dual-era
+/// client treats any error that is not a recognised modern error as
+/// "legacy server" and falls back to `initialize` — so this code must stay
+/// a non-modern one. The message makes the failure diagnosable.
+fn server_discover_legacy_message() -> String {
     format!(
-        "server/discover (MCP 2026-07-28) not yet supported — this server speaks \
-         {PROTOCOL_VERSION}; please use the initialize handshake"
+        "server/discover needs the MCP {} per-request params._meta (\"{META_PROTOCOL_VERSION}\", \
+         \"{META_CLIENT_CAPABILITIES}\"); legacy clients use the initialize handshake",
+        MODERN_VERSIONS[0]
     )
+}
+
+/// `tools/call`. The tool name is validated BEFORE the vault gate: a
+/// removed or unknown name is a protocol error (`-32602`, both eras) that
+/// needs no vault. `brain_ping` is answered here too, before the gate.
+fn tools_call(
+    params: &Value,
+    features: Features,
+    vault: Option<&std::path::Path>,
+    db: &mut Option<crate::db::DbHandle>,
+) -> Reply {
+    let Some(name) = params.get("name").and_then(Value::as_str) else {
+        return rpc_error(INVALID_PARAMS, "missing tool 'name'");
+    };
+    if !tools::is_known(name) {
+        return match tools::removed(name) {
+            Some(r) => rpc_error(INVALID_PARAMS, tools::replaced_message(r)),
+            None => rpc_error(INVALID_PARAMS, format!("Unknown tool: {name}")),
+        };
+    }
+    // A missing (without default) or unknown `action` is a malformed call,
+    // like an unknown tool: protocol error, no vault needed.
+    let action = params.get("arguments").and_then(|a| a.get("action"));
+    if let Err(err) = tools::resolve_action(name, action) {
+        return rpc_error(INVALID_PARAMS, err);
+    }
+    // `brain_ping` is a pure liveness probe: by default it never touches
+    // the filesystem or DB, even when no vault is configured or the disk
+    // is hung. This is the contract the 0.2.19 pre-flight probe
+    // accidentally broke; keeping ping above the gate is what restores
+    // "ping always answers". `detail: true` opts into a bounded look at
+    // the vault, model and index (see `brain_ping_detail`).
+    if name == "brain_ping" {
+        let args = params.get("arguments").cloned().unwrap_or(json!({}));
+        let payload = match args.get("detail") {
+            None | Some(Value::Null) | Some(Value::Bool(false)) => Ok(brain_ping_payload()),
+            Some(Value::Bool(true)) => Ok(brain_ping_detail(vault, db)),
+            Some(_) => Err("'detail' must be a boolean".to_string()),
+        };
+        return tool_result(payload, features);
+    }
+    match vault {
+        Some(v) => tool_result(call_tool(params, v, db), features),
+        // A tool error the model can read and relay (like
+        // BRAIN_VAULT_DISCONNECTED), not a protocol error.
+        None => tool_result(Err(no_vault_message().to_string()), features),
+    }
+}
+
+/// The tool error (and resource-read error message) when the server has
+/// no vault configured at all.
+fn no_vault_message() -> &'static str {
+    "BRAIN_VAULT_NOT_CONFIGURED: no Brain vault is mounted on this host. Tell the user to \
+     open BRAIN, mount the vault and register this client again."
+}
+
+/// The `tools/call` result for a tool's outcome. The text block carries
+/// compact JSON (or the plain text a tool returned); clients that speak
+/// 2025-06-18+ also get the object as `structuredContent`. A tool error
+/// is an `isError` result the model can read, never a protocol error.
+fn tool_result(outcome: Result<String, String>, features: Features) -> Reply {
+    match outcome {
+        Ok(text) => {
+            let parsed = serde_json::from_str::<Value>(&text).ok();
+            let text = parsed.as_ref().map(Value::to_string).unwrap_or(text);
+            let mut result = json!({
+                "content": [{ "type": "text", "text": text }],
+                "isError": false
+            });
+            if features.structured {
+                if let Some(object @ Value::Object(_)) = parsed {
+                    result["structuredContent"] = object;
+                }
+            }
+            Reply::Result(result)
+        }
+        Err(err) => Reply::Result(json!({
+            "content": [{ "type": "text", "text": err }],
+            "isError": true
+        })),
+    }
 }
 
 /// What a client declared about itself on the wire: the protocol version
@@ -409,6 +742,21 @@ struct ClientDeclaration {
 }
 
 impl ClientDeclaration {
+    /// The revision we answer this client with: the negotiated legacy
+    /// revision for `initialize`, the modern revision when we serve it,
+    /// else `"unsupported"`.
+    fn negotiated_version(&self) -> &'static str {
+        if self.style == "initialize" {
+            negotiate_legacy(Some(&self.protocol_version))
+        } else {
+            MODERN_VERSIONS
+                .iter()
+                .find(|v| **v == self.protocol_version)
+                .copied()
+                .unwrap_or("unsupported")
+        }
+    }
+
     fn log(&self) {
         tracing::info!(
             style = self.style,
@@ -416,7 +764,7 @@ impl ClientDeclaration {
             client_protocol_version = %self.protocol_version,
             client_name = %self.client_name,
             client_version = %self.client_version,
-            server_protocol_version = PROTOCOL_VERSION,
+            negotiated_protocol_version = self.negotiated_version(),
             "mcp: client declared its protocol version"
         );
     }
@@ -433,8 +781,6 @@ impl ClientDeclaration {
 ///   `protocolVersion` are accepted too, for non-conforming clients.
 ///   Yields `None` when no version is present anywhere.
 fn client_declaration(envelope: &Value) -> Option<ClientDeclaration> {
-    const META_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
-    const META_CLIENT: &str = "io.modelcontextprotocol/clientInfo";
     let method = envelope.get("method").and_then(Value::as_str)?;
     let params = envelope.get("params");
     let meta = params.and_then(|p| p.get("_meta"));
@@ -451,11 +797,11 @@ fn client_declaration(envelope: &Value) -> Option<ClientDeclaration> {
         )
     } else {
         let version = meta
-            .and_then(|m| m.get(META_VERSION))
+            .and_then(|m| m.get(META_PROTOCOL_VERSION))
             .or_else(|| params.and_then(|p| p.get("protocolVersion")))
             .or_else(|| envelope.get("protocolVersion"))?;
         let client_info = meta
-            .and_then(|m| m.get(META_CLIENT))
+            .and_then(|m| m.get(META_CLIENT_INFO))
             .or_else(|| params.and_then(|p| p.get("clientInfo")))
             .or_else(|| envelope.get("clientInfo"));
         ("per-request", Some(version), client_info)
@@ -471,22 +817,102 @@ fn client_declaration(envelope: &Value) -> Option<ClientDeclaration> {
 
 /// The `brain_ping` payload. Pure in-memory — server identity, compiled
 /// version, process uptime. No filesystem, no DB. Shared by the
-/// `handle_request` fast path and kept as a function so the contract
+/// `tools_call` fast path and kept as a function so the contract
 /// (zero I/O) is obvious and testable.
 fn brain_ping_payload() -> String {
-    serde_json::to_string(&json!({
+    brain_ping_value().to_string()
+}
+
+fn brain_ping_value() -> Value {
+    json!({
         "status": "ok",
         "server": SERVER_NAME,
         "version": SERVER_VERSION,
         "uptime_seconds": process_uptime_seconds(),
-    }))
-    .unwrap_or_default()
+    })
 }
 
-/// Builds (or refreshes) the SQLite index if it's empty. Cheap on small
-/// vaults, important for never-mounted-by-GUI vaults so MCP search has
-/// real data to query. We deliberately skip a full rebuild when the
-/// index already has rows — the GUI's wiki watcher keeps it fresh.
+/// `brain_ping` with `detail: true` (formerly a separate status tool):
+/// the ping payload plus the vault, the embedding model and the index —
+/// all via non-building, bounded paths. The model is never loaded (only
+/// the process cache is peeked) and the index is never built or created
+/// (see [`ping_index_counts`]).
+fn brain_ping_detail(vault: Option<&std::path::Path>, db: &Option<crate::db::DbHandle>) -> String {
+    let mut payload = brain_ping_value();
+    let Some(vault) = vault else {
+        payload["vault"] = json!({ "configured": false });
+        return payload.to_string();
+    };
+    let reachable = crate::vault::layout::is_vault(vault);
+    payload["vault"] = json!({
+        "configured": true,
+        "reachable": reachable,
+        "path": display_path(vault),
+    });
+    if !reachable {
+        return payload.to_string();
+    }
+    let files_present = crate::embedding::model_available(vault);
+    let state = crate::embedding::model_state(vault);
+    // With complete model files the next search uses (and, if needed,
+    // loads) bge-m3 — unless a load already failed for these files.
+    let semantic = files_present && state != "failed";
+    let fallback = crate::embedding::hashed::HashedEmbedder::new();
+    payload["embedder"] = json!({
+        "active": if semantic { "bge-m3" } else { crate::embedding::Embedder::name(&fallback) },
+        "semantic": semantic,
+        "model_files_present": files_present,
+        "model_state": state,
+        "model_dir": display_path(&crate::vault::layout::models_dir(vault).join("bge-m3")),
+        "dim": crate::embedding::EMBED_DIM,
+    });
+    let counts = ping_index_counts(db, vault).filter(|(pages, _)| *pages > 0);
+    payload["index"] = match counts {
+        Some((pages, chunks)) => json!({ "available": true, "pages": pages, "chunks": chunks }),
+        None => json!({
+            "available": false,
+            "note": "index not built yet, or not readable within 2 s"
+        }),
+    };
+    payload.to_string()
+}
+
+/// (pages, chunks) of the index for `brain_ping detail`, or `None`. Never
+/// creates anything: without a held handle and without a database file in
+/// `03_db/` it does not open one (opening would create the file and its
+/// schema), and opening an existing file runs on a worker thread bounded
+/// by `COUNTER_DB_TIMEOUT` — like the count itself — so a hung disk cannot
+/// stall the ping.
+fn ping_index_counts(
+    db: &Option<crate::db::DbHandle>,
+    vault: &std::path::Path,
+) -> Option<(i64, i64)> {
+    let handle = match db {
+        Some(handle) => handle.clone(),
+        None => {
+            let file = crate::vault::layout::db_dir(vault).join(crate::db::DB_FILENAME);
+            if !file.is_file() {
+                return None;
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            let vault = vault.to_path_buf();
+            std::thread::spawn(move || {
+                let _ = tx.send(crate::db::DbHandle::open(&vault));
+            });
+            rx.recv_timeout(COUNTER_DB_TIMEOUT).ok()?.ok()?
+        }
+    };
+    let counted = handle.with_timeout(COUNTER_DB_TIMEOUT, |conn| {
+        let pages: i64 = conn.query_row("SELECT COUNT(*) FROM pages", [], |r| r.get(0))?;
+        let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
+        Ok((pages, chunks))
+    });
+    match counted {
+        Ok(Ok(counts)) => Some(counts),
+        _ => None,
+    }
+}
+
 /// Timeout budget for a single DB operation in the MCP subprocess.
 /// Strictly greater than `DbHandle`'s `busy_timeout` (5 s) so a
 /// legitimate lock wait against the GUI writer is never misread as a
@@ -552,7 +978,11 @@ where
         Ok(Ok(value)) => Ok(value),
         Ok(Err(err)) if crate::db::is_connection_fatal(&err) => {
             // Stale connection — drop, reopen, retry once.
-            tracing::warn!(?err, op = op_name, "DB op hit a fatal connection error; reopening");
+            tracing::warn!(
+                ?err,
+                op = op_name,
+                "DB op hit a fatal connection error; reopening"
+            );
             *db = None;
             match crate::db::DbHandle::open(vault) {
                 Ok(reopened) => {
@@ -590,6 +1020,10 @@ fn display_path(p: &std::path::Path) -> String {
     p.to_string_lossy().replace('\\', "/")
 }
 
+/// Builds (or refreshes) the SQLite index if it's empty. Cheap on small
+/// vaults, important for never-mounted-by-GUI vaults so MCP search has
+/// real data to query. We deliberately skip a full rebuild when the
+/// index already has rows — the GUI's wiki watcher keeps it fresh.
 fn ensure_index_built(db: &crate::db::DbHandle, vault: &std::path::Path) {
     let count: i64 = db
         .with(|conn| {
@@ -686,209 +1120,215 @@ fn paths_equal(reported: &str, target: &std::path::Path) -> bool {
     r == t
 }
 
-fn tool_descriptors() -> Vec<Value> {
+// ---- Tool descriptors ------------------------------------------------------
+
+/// Behaviour hints of a tool (MCP `ToolAnnotations`, 2025-03-26+). Every
+/// BRAIN tool works on the local vault only, so `openWorldHint` is false.
+#[derive(Clone, Copy)]
+struct Hints {
+    read_only: bool,
+    destructive: bool,
+    idempotent: bool,
+}
+
+const READ_ONLY: Hints = Hints {
+    read_only: true,
+    destructive: false,
+    idempotent: true,
+};
+
+/// One tool as `tools/list` advertises it, before per-revision trimming.
+struct ToolSpec {
+    name: &'static str,
+    title: &'static str,
+    description: &'static str,
+    input: Value,
+    output: Value,
+    hints: Hints,
+}
+
+/// `response_format` input property: what each level includes.
+fn response_format_schema(concise: &str, detailed: &str) -> Value {
+    json!({
+        "type": "string",
+        "enum": ["concise", "detailed"],
+        "default": "concise",
+        "description": format!("concise (default): {concise}. detailed: {detailed}.")
+    })
+}
+
+fn page_id_schema() -> Value {
+    json!({ "type": "string", "description": "page id `<type dir>/<slug>`, e.g. 'entities/alice'" })
+}
+
+/// A loose object schema for `outputSchema`: names and coarse types of
+/// the top-level fields only, nothing required, extra fields allowed — a
+/// client that validates `structuredContent` against it must never reject
+/// a legitimate result (concise and detailed share one schema).
+fn object_schema(properties: Value) -> Value {
+    json!({ "type": "object", "properties": properties })
+}
+
+fn tool_specs() -> Vec<ToolSpec> {
+    let write = |destructive: bool, idempotent: bool| Hints {
+        read_only: false,
+        destructive,
+        idempotent,
+    };
     vec![
-        json!({
-            "name": "brain_ping",
-            "description": "Liveness probe — returns server status, version and process uptime in seconds. Does NOT require a mounted vault, so it works even if the disk is disconnected or the indexer is busy. Use this between bulk-ingest batches to detect a stuck server within seconds instead of waiting for the IPC timeout. Never returns an error.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {}
-            }
-        }),
-        json!({
-            "name": "brain_search",
-            "description": "Hybrid lexical + semantic search across the wiki. Combines FTS5 BM25 (matches the surface tokens, handles hyphenation and stemming) with sqlite-vec KNN over bge-m3 embeddings (matches paraphrase / near-synonyms even when no shared word is present) and fuses the two ranked lists via reciprocal-rank fusion. Returns hits sorted by fused score. Note: semantic matching depends on bge-m3 being loaded — call brain_embedding_status to confirm (semantic: true). For structured filters by frontmatter fields (type, tag, created, …) use brain_query instead.",
-            "inputSchema": {
-                "type": "object",
-                "properties": { "query": { "type": "string" } },
-                "required": ["query"]
-            }
-        }),
-        json!({
-            "name": "brain_get_page",
-            "description": "Read a wiki page by id (e.g. 'entities/alice'). Returns title, frontmatter, body. If the page has been replaced (frontmatter `superseded_by`), the response also carries `superseded_by: <id>` and `notice: \"Superseded by <id>\"` — read the successor for current facts. Never copy the notice into a page.",
-            "inputSchema": {
-                "type": "object",
-                "properties": { "id": { "type": "string" } },
-                "required": ["id"]
-            }
-        }),
-        json!({
-            "name": "brain_get_pages",
-            "description": "Bulk-read variant of brain_get_page (superseded pages are marked the same way). Pass an array of ids; the response contains one entry per id in request order, each shaped `{id, found, page?}`. Missing ids are returned as `{id, found: false}` rather than aborting the call — so the agent can decide per-id whether to create-or-skip. Use for refactor sweeps and consistency audits where 5–20 related pages need to be inspected at once.",
-            "inputSchema": {
+        ToolSpec {
+            name: "brain_ping",
+            title: "Ping BRAIN",
+            description: "Liveness probe: server status, version and uptime, answered instantly even without a vault. Use it between bulk-write batches or when another BRAIN tool seems stuck. Not for page data — use brain_search or brain_get_pages. `detail: true` adds the vault, the embedding model (semantic bge-m3 or the hashed fallback) and index counts — it reads only what exists, never loads the model or creates the index: use it when search results look non-semantic.",
+            input: json!({
                 "type": "object",
                 "properties": {
-                    "ids": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "minItems": 1
-                    }
+                    "detail": { "type": "boolean", "default": false, "description": "also report vault, embedding model and index (reads the vault, time-bounded; never loads or creates anything)" }
+                }
+            }),
+            output: object_schema(json!({
+                "status": { "type": "string" },
+                "server": { "type": "string" },
+                "version": { "type": "string" },
+                "uptime_seconds": { "type": "integer" },
+                "vault": { "type": "object" },
+                "embedder": { "type": "object" },
+                "index": { "type": "object" }
+            })),
+            hints: READ_ONLY,
+        },
+        ToolSpec {
+            name: "brain_search",
+            title: "Search the wiki",
+            description: "Ranked free-text search over all pages (full-text + semantic, fused). Use it to find pages about something when you do not know their ids. Not for filtering or listing by type/tag/date — use brain_query; not for checking whether a page exists before creating one — use brain_lookup.",
+            input: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "words or a question" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 20, "default": 10, "description": "maximum hits" },
+                    "response_format": response_format_schema("id, title, score and a plain snippet of at most 80 characters (the summary when the page has one) per hit", "also path and the highlighted full-text snippet")
+                },
+                "required": ["query"]
+            }),
+            output: object_schema(json!({ "hits": { "type": "array" } })),
+            hints: READ_ONLY,
+        },
+        ToolSpec {
+            name: "brain_lookup",
+            title: "Look up a page name",
+            description: "Cheap existence and duplicate check, no page bodies. Use it before creating a page: pass the planned id ('entities/acme') or just a name ('ACME Corp'). Returns `exists` and `matches` of the same type, each {id, title, reason}: `exact` (name form), `alias` (a frontmatter alias), `normalised` (same slug after lowercasing, ä→ae/ö→oe/ü→ue/ß→ss, punctuation → '-') or `similar` (a letter or two apart). Any match: update that page (add your name to its aliases) instead of creating a duplicate. `matches_checked: false` = index not built, no matches looked up. Not for reading content — use brain_get_pages.",
+            input: json!({
+                "type": "object",
+                "properties": {
+                    "query_or_id": { "type": "string", "description": "a page id like 'entities/acme' (checks that type) or a bare name like 'ACME Corp' (checks all four types)" }
+                },
+                "required": ["query_or_id"]
+            }),
+            output: object_schema(json!({
+                "query_or_id": { "type": "string" },
+                "id": { "type": "string" },
+                "exists": { "type": "boolean" },
+                "matches": { "type": "array" },
+                "matches_checked": { "type": "boolean" }
+            })),
+            hints: READ_ONLY,
+        },
+        ToolSpec {
+            name: "brain_get_pages",
+            title: "Read pages",
+            description: "Read one or more pages by id (one page: `ids: ['entities/alice']`). Use it once brain_search, brain_query or brain_lookup told you which pages matter. One entry per id in request order: {id, found: true, page} or {id, found: false, error} — a missing id never fails the call. `include_context: true` adds each page's 1-hop neighbourhood: `outbound` (ids it links to) and `backlinks` (pages linking to it) — use it before editing, merging or deleting a page. A superseded page carries `superseded_by` and `notice`: read the successor for current facts and never copy the notice into a page. Not for finding pages — use brain_search or brain_query.",
+            input: json!({
+                "type": "object",
+                "properties": {
+                    "ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "page ids, e.g. ['entities/alice', 'concepts/nlspec']" },
+                    "include_context": { "type": "boolean", "default": false, "description": "also return outbound links and backlinks per page" },
+                    "response_format": response_format_schema("id, title, summary and body; context as ids", "also the full frontmatter (JSON) — use detailed before rewriting a page with brain_write_page — and backlinks with title and path")
                 },
                 "required": ["ids"]
-            }
-        }),
-        json!({
-            "name": "brain_page_exists",
-            "description": "Existence check before creating a page: returns {id, exists, matches, matches_checked}. `matches` lists other pages of the same type that are probably the same thing, each {id, title, reason}: reason 'alias' (the slug names one of the page's frontmatter `aliases`), 'normalised' (same slug after lowercasing, umlauts ä→ae/ö→oe/ü→ue/ß→ss and punctuation/`_`/space → `-`; also 'muller-gmbh' vs 'mueller-gmbh') or 'similar' (a near spelling — one letter apart on short slugs, two on long ones). `exists: false` with non-empty matches means the page probably exists already under that id — use and update it instead of creating a duplicate. brain_write_page refuses to create a page with an 'alias' or 'normalised' match unless you pass allow_duplicate:true. Does not read the page body (one file check plus a lookup in the search index); matches come from that index, so a page written in the last few seconds may not be listed yet, and `matches_checked: false` means the index is not built yet and no matches could be looked up.",
-            "inputSchema": {
+            }),
+            output: object_schema(json!({ "pages": { "type": "array" } })),
+            hints: READ_ONLY,
+        },
+        ToolSpec {
+            name: "brain_query",
+            title: "List and filter pages",
+            description: "Structured listing by page metadata, newest `updated` first. Use it to list or filter pages (type, tag, title, dates, validity, most-read) and to count tags. Not for relevance search over text — use brain_search. Syntax: fields id, type (entity|concept|source|topic), title, tag, created, updated with `:` (equals), `:>`, `:<`; AND, OR, NOT, parentheses, \"quoted values\". Empty or `*` lists all current pages. Superseded/expired pages are hidden unless `valid:all` (`valid:expired` = only those). `sort:salience` (top level, with AND) puts the most-read pages first. Examples: `type:entity AND tag:customer`, `updated:>2026-04-01 AND NOT type:source`, `type:entity AND sort:salience`. Returns at most `limit` (default 100) hits; when `next_offset` is present, call again with `offset: next_offset`.",
+            input: json!({
                 "type": "object",
                 "properties": {
-                    "id": {
-                        "type": "string",
-                        "description": "page id, e.g. 'entities/alice'"
-                    }
-                },
-                "required": ["id"]
-            }
-        }),
-        json!({
-            "name": "brain_get_context",
-            "description": "Return a wiki page plus the pages it links to and pages that link to it (1-hop). If the page has been replaced (frontmatter `superseded_by`), the response carries top-level `superseded_by: <id>` and `notice: \"Superseded by <id>\"` — follow it for current facts. Never copy the notice into a page.",
-            "inputSchema": {
-                "type": "object",
-                "properties": { "id": { "type": "string" } },
-                "required": ["id"]
-            }
-        }),
-        json!({
-            "name": "brain_list_pages",
-            "description": "List wiki page ids grouped by type (entities, concepts, sources, topics). All arguments are optional; with no args the response shape is the legacy four-bucket layout. Use the filters on large vaults to keep responses small and fast: 'type' restricts to a single bucket, 'prefix' matches an id prefix like 'entities/dextra', 'limit' caps each bucket's size, 'offset' enables pagination.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "type": {
-                        "type": "string",
-                        "enum": ["entities", "concepts", "sources", "topics"],
-                        "description": "Restrict to a single bucket; the others are returned empty."
-                    },
-                    "prefix": {
-                        "type": "string",
-                        "description": "Id-prefix substring filter, e.g. 'entities/dextra'."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Maximum entries per bucket (default: no limit)."
-                    },
-                    "offset": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "Skip the first N entries per bucket (default: 0)."
-                    }
+                    "query": { "type": "string", "default": "*", "description": "filter expression; empty or '*' = all current pages" },
+                    "prefix": { "type": "string", "description": "only ids starting with this, e.g. 'entities/acme'" },
+                    "limit": { "type": "integer", "minimum": 1, "default": 100, "description": "maximum hits returned; `total` says how many matched" },
+                    "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "skip this many hits (use `next_offset` of the previous call)" },
+                    "facet": { "type": "string", "enum": ["tags"], "description": "'tags': return {tags: [{tag, count}]} over the matching pages instead of hits — use it to learn which tags exist before filtering with tag:" },
+                    "response_format": response_format_schema("id, type and title per hit", "also path, updated_at, read/search-hit counters and validity fields")
                 }
-            }
-        }),
-        json!({
-            "name": "brain_write_page",
-            "description": "Create or overwrite a wiki page. Caller must include valid YAML frontmatter (id, type, title) followed by the markdown body. Expected on every new page: `summary:` — one or two sentences saying what the page is about (search ranks summary hits above body hits and embeds every chunk with it; without one the page gets a quiet `missing-summary` warning). Optional frontmatter: `aliases: [..]` (other names of the thing), `sources: [sources/..]` (where the facts come from), `valid_from` / `valid_to` (YYYY-MM-DD) and `superseded_by: <id>` (facts are never overwritten — a replaced page gets `superseded_by` and `valid_to`). Creating a NEW id is refused when another page of the same type probably is the same thing (same slug after normalisation, or one of its aliases — see brain_page_exists); the error names that page: update it instead, or pass allow_duplicate:true if they really are different. Overwriting an existing id is never refused. The watcher will lint and auto-commit.",
-            "inputSchema": {
+            }),
+            output: object_schema(json!({
+                "total": { "type": "integer" },
+                "offset": { "type": "integer" },
+                "returned": { "type": "integer" },
+                "next_offset": { "type": "integer" },
+                "hits": { "type": "array" },
+                "facet": { "type": "string" },
+                "tags": { "type": "array" },
+                "note": { "type": "string" }
+            })),
+            hints: READ_ONLY,
+        },
+        ToolSpec {
+            name: "brain_graph",
+            title: "Link graph",
+            description: "The wiki's link graph (nodes + edges), optionally only some page types. Use it for structure analysis: hubs, clusters, isolated pages. Not for one page's neighbours — use brain_get_pages with include_context.",
+            input: json!({
                 "type": "object",
                 "properties": {
-                    "id": { "type": "string", "description": "page id, e.g. 'entities/alice'" },
-                    "content": { "type": "string", "description": "full markdown including frontmatter" },
-                    "allow_duplicate": { "type": "boolean", "description": "create the page even though brain_page_exists reports an 'alias' or 'normalised' match. Default false." },
-                    "confirm_summary": { "type": "boolean", "description": "the page's `summary` is still accurate for the written body: mark it as current so the dream queue stops reporting it as summary-stale. Default false." }
+                    "types": { "type": "array", "items": { "type": "string", "enum": ["entity", "concept", "source", "topic"] }, "description": "only nodes of these page types (default: all)" },
+                    "response_format": response_format_schema("node ids, edges as [source, target] pairs, counts", "nodes with type, title and tags, edges as {source, target}")
+                }
+            }),
+            output: object_schema(json!({
+                "node_count": { "type": "integer" },
+                "edge_count": { "type": "integer" },
+                "nodes": { "type": "array" },
+                "edges": { "type": "array" }
+            })),
+            hints: READ_ONLY,
+        },
+        ToolSpec {
+            name: "brain_write_page",
+            title: "Write a page",
+            description: "Create or fully overwrite ONE page. Use it for a new page or to rewrite a page including its frontmatter (summary, aliases, superseded_by). Not for several pages that link to each other — use brain_write_batch; not for changing one section — use brain_patch_page. `content` = YAML frontmatter (id, type: entity|concept|source|topic — singular, title, summary: one or two sentences; optional tags, aliases, sources: [sources/…], valid_from/valid_to YYYY-MM-DD, superseded_by) followed by the markdown body; link pages as [[type-dir/slug]]. Creating a NEW id is refused when brain_lookup would report an alias or normalised match (the error names the page); overwriting an existing id never is. Facts are not overwritten: supersede the old page instead (superseded_by + valid_to). Returns {wrote, previous_size_bytes, new_size_bytes, warnings}; lint errors on this page fail the call and list the findings. The watcher commits.",
+            input: json!({
+                "type": "object",
+                "properties": {
+                    "id": page_id_schema(),
+                    "content": { "type": "string", "description": "full markdown file: frontmatter + body" },
+                    "allow_duplicate": { "type": "boolean", "default": false, "description": "create the page although an alias/normalised match exists — only for genuinely different things (then set distinct_from)" },
+                    "confirm_summary": { "type": "boolean", "default": false, "description": "the page's summary is still accurate for this body: clears its summary-stale dream-queue item" }
                 },
                 "required": ["id", "content"]
-            }
-        }),
-        json!({
-            "name": "brain_patch_page",
-            "description": "Edit ONE section of an existing page instead of rewriting the whole thing. `heading` is a markdown heading line (e.g. '## Kontakt'); its section — from that heading to the next heading of the same or higher level — is replaced with `content` (the section body, without repeating the heading). If the heading isn't present, the section is appended. Frontmatter is preserved untouched and wiki-links are normalised, so the result equals a full rewrite of that section. Prefer this over brain_write_page for targeted updates: the diff (and, on an encrypted/synced vault, the merge surface) stays tiny. The page must already exist; use brain_write_page to create it. Commit is delegated to the watcher.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string", "description": "page id, e.g. 'entities/alice'" },
-                    "heading": { "type": "string", "description": "the section heading line to replace, e.g. '## Kontakt'" },
-                    "content": { "type": "string", "description": "the new section body (markdown, without the heading line)" },
-                    "confirm_summary": { "type": "boolean", "description": "the page's existing `summary` is still accurate for the patched body: mark it as current so the dream queue stops reporting it as summary-stale (the file is not changed). Default false." }
-                },
-                "required": ["id", "heading", "content"]
-            }
-        }),
-        json!({
-            "name": "brain_get_page_history",
-            "description": "Return the Git commits that touched a single page, newest first. Each entry has `{sha, ts, message, files_changed}`. Use this together with `brain_restore_page` to roll back a page that was accidentally overwritten or to inspect how a fact changed over time. Walks the repo's revwalk and filters per-commit by diff — work is proportional to commits scanned, not commits matched; the default `limit` (20) is usually enough.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": {
-                        "type": "string",
-                        "description": "page id, e.g. 'entities/alice' — `.md` is appended automatically"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "maximum commits to return (default 20)"
-                    }
-                },
-                "required": ["id"]
-            }
-        }),
-        json!({
-            "name": "brain_restore_page",
-            "description": "Replace the current content of a page with the version that existed at the given Git sha. Records a `revert: restored <page> from <short-sha>` commit on top so the history stays append-only — nothing is destructively rewritten. Pair with `brain_get_page_history` to discover available shas. Returns the new commit sha on success.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": {
-                        "type": "string",
-                        "description": "page id, e.g. 'entities/alice' — `.md` is appended automatically"
-                    },
-                    "sha": {
-                        "type": "string",
-                        "description": "Git commit sha (full or short) to restore the page from"
-                    }
-                },
-                "required": ["id", "sha"]
-            }
-        }),
-        json!({
-            "name": "brain_rename_page",
-            "description": "Give an existing page a new id — use this when a page was created under a WRONG id (typo, wrong slug, wrong type directory). Moves the page, sets its frontmatter `id` (and `type`, if the type directory changes) and rewrites every link to the old id in every page of the vault: `[[old]]` → `[[new]]`, `[[old|Alias]]` → `[[new|Alias]]`, `[Text](old)` → `[Text](new)`. Only exact-id links change (`[[old-2]]` is untouched); links inside code blocks are rewritten too. Frontmatter `superseded_by: old` and `sources` entries naming `old` are pointed at the new id as well. `new_id` must be `<type>/<slug>` with type one of entities, concepts, sources, topics, and a slug of letters, digits, `.`, `_`, `-` (no spaces or parentheses); it must not exist yet — if it does, the two pages are duplicates: use brain_merge_pages instead. A case-only rename (`Old` → `old`) works. Records one commit (after a checkpoint commit of any pending edits). Returns `{old_id, new_id, rewritten_pages, rewritten_links, commit}`; if `commit` is null with a `note`, the rename is already on disk — do not repeat it.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string", "description": "current page id, e.g. 'entities/dan-shapio'" },
-                    "new_id": { "type": "string", "description": "the correct page id, e.g. 'entities/dan-shapiro'" }
-                },
-                "required": ["id", "new_id"]
-            }
-        }),
-        json!({
-            "name": "brain_merge_pages",
-            "description": "Fold a DUPLICATE page into the page that should survive. Appends the body of `from_id` to `into_id` under a `## Merged from <from_id>` heading (target frontmatter and title kept, tags united), redirects every link to `from_id` in the vault to `into_id` (aliases kept) — and every frontmatter `superseded_by` / `sources` entry naming it —, adds `from_id` and its aliases to the target's `aliases`, and removes `from_id`. Links between the two pages become plain text so the merged page never links to itself. Review and tidy the merged page afterwards with brain_patch_page — the appended section is a verbatim copy. Records one commit (after a checkpoint commit of any pending edits); the removed page stays recoverable: brain_get_page_history on `from_id`, then brain_restore_page with a sha from before the merge. Returns `{from_id, into_id, rewritten_pages, rewritten_links, commit}` (plus `note` if the commit is still pending).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "from_id": { "type": "string", "description": "the duplicate page to fold in and remove" },
-                    "into_id": { "type": "string", "description": "the page that survives and receives the content" }
-                },
-                "required": ["from_id", "into_id"]
-            }
-        }),
-        json!({
-            "name": "brain_delete_page",
-            "description": "Delete a page that should not exist at all (junk, test page, empty stub). Not for a wrong id — use brain_rename_page — and not for a duplicate — use brain_merge_pages. REFUSES while other pages link to it — or name it in frontmatter `superseded_by` / `sources` — and lists those pages. With `force: true` it deletes anyway, turns every link to it into plain text (`[[id|Alias]]` → `Alias`, `[[id]]` → the page title) and removes those `superseded_by` lines / `sources` entries. Records one commit (after a checkpoint commit of any pending edits), so the content is never lost: brain_get_page_history on the deleted id, then brain_restore_page with a sha from before the delete. Returns `{deleted, defused_in, defused_links, commit}` (plus `note` if the commit is still pending).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string", "description": "page id to delete, e.g. 'entities/test-page'" },
-                    "force": { "type": "boolean", "description": "delete even while other pages link to it (links become plain text). Default false." }
-                },
-                "required": ["id"]
-            }
-        }),
-        json!({
-            "name": "brain_write_batch",
-            "description": "Atomic multi-page write. Pass `pages: [{id, content}, ...]` — all pages are parsed and normalised first (phase 1; if any one fails to parse, nothing is written), then all are written to disk (phase 2), then lint runs ONCE over the whole vault (phase 3) and the response is scoped to the union of paths in the batch. Use this when several pages reference each other and would cascade broken-link errors if written one-by-one. Response: `{wrote: [{id, previous_size_bytes, new_size_bytes, warnings}]}`. Errors abort with a structured message naming the offending id. Like brain_write_page, creating a NEW id that probably duplicates an existing page (or an earlier entry of the same batch) is refused before anything is written, unless the entry — or the whole call — sets allow_duplicate:true. Commit is delegated to the watcher (same as brain_write_page).",
-            "inputSchema": {
+            }),
+            output: object_schema(json!({
+                "wrote": { "type": "string" },
+                "previous_size_bytes": { "type": "integer" },
+                "new_size_bytes": { "type": "integer" },
+                "warnings": { "type": "array" },
+                "matches_checked": { "type": "boolean" },
+                "summary_confirmed": { "type": "boolean" }
+            })),
+            hints: write(true, true),
+        },
+        ToolSpec {
+            name: "brain_write_batch",
+            title: "Write several pages atomically",
+            description: "Atomic multi-page write: every entry is validated first (one bad entry → nothing is written), all are written, then lint runs once. Use it whenever new pages link to each other (ingest), so the links between them resolve. Not for a single page — use brain_write_page. Entries have the brain_write_page format; the duplicate refusal applies too, also against earlier entries of the batch. Returns {wrote: [{id, previous_size_bytes, new_size_bytes, warnings}]}. The watcher commits.",
+            input: json!({
                 "type": "object",
                 "properties": {
                     "pages": {
                         "type": "array",
+                        "minItems": 1,
                         "items": {
                             "type": "object",
                             "properties": {
@@ -897,117 +1337,609 @@ fn tool_descriptors() -> Vec<Value> {
                                 "allow_duplicate": { "type": "boolean" }
                             },
                             "required": ["id", "content"]
-                        },
-                        "minItems": 1
+                        }
                     },
-                    "allow_duplicate": { "type": "boolean", "description": "allow_duplicate for every entry. Default false." }
+                    "allow_duplicate": { "type": "boolean", "default": false, "description": "allow_duplicate for every entry" }
                 },
                 "required": ["pages"]
-            }
-        }),
-        json!({
-            "name": "brain_write_raw_file",
-            "description": "Place a raw artifact under 01_raw/<connector>/<relative path>. Use for ingest before creating a source page.",
-            "inputSchema": {
+            }),
+            output: object_schema(json!({
+                "wrote": { "type": "array" },
+                "matches_checked": { "type": "boolean" }
+            })),
+            hints: write(true, true),
+        },
+        ToolSpec {
+            name: "brain_patch_page",
+            title: "Replace one section",
+            description: "Replace one section of an existing page: from the `heading` line (e.g. '## Kontakt') to the next heading of the same or higher level; the section is appended when the heading is missing. Use it for targeted updates — small diff, frontmatter untouched. Not for creating a page or editing frontmatter — use brain_write_page.",
+            input: json!({
                 "type": "object",
                 "properties": {
-                    "connector": { "type": "string" },
-                    "relative_path": { "type": "string" },
+                    "id": page_id_schema(),
+                    "heading": { "type": "string", "description": "the full heading line, e.g. '## Kontakt'" },
+                    "content": { "type": "string", "description": "the new section body, without the heading line" },
+                    "confirm_summary": { "type": "boolean", "default": false, "description": "the page's summary is still accurate for the patched body: clears its summary-stale dream-queue item" }
+                },
+                "required": ["id", "heading", "content"]
+            }),
+            output: object_schema(json!({
+                "wrote": { "type": "string" },
+                "previous_size_bytes": { "type": "integer" },
+                "new_size_bytes": { "type": "integer" },
+                "warnings": { "type": "array" },
+                "summary_confirmed": { "type": "boolean" }
+            })),
+            hints: write(true, true),
+        },
+        ToolSpec {
+            name: "brain_refactor",
+            title: "Rename, merge or delete a page",
+            description: "Fix the structure of the wiki; every change rewrites the references in the vault and records one commit, and the old state stays restorable with brain_history. action 'rename' (`id`, `new_id`): a page created under a WRONG id (typo, wrong slug or type directory) gets its correct id; [[old]], [[old|Alias]], [Text](old), superseded_by and sources entries follow. action 'merge' (`from_id`, `into_id`): a DUPLICATE is folded into the page that survives — body appended under '## Merged from <from_id>', tags and aliases united, links redirected, from_id removed; tidy the appended section afterwards with brain_patch_page. action 'delete' (`id`, optional `force`): a page that should not exist at all (junk, test page); refuses while other pages refer to it and lists them, `force: true` deletes anyway and turns those links into plain text. Not for editing content — use brain_write_page or brain_patch_page. Returns the action, the ids, rewritten_pages/rewritten_links (or defused_in/defused_links) and `commit`; without `commit` but with a `note`, the change is already on disk — do not repeat it.",
+            input: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["rename", "merge", "delete"], "description": "rename: needs id + new_id; merge: needs from_id + into_id; delete: needs id (optional force)" },
+                    "id": { "type": "string", "description": "rename/delete: the page id, e.g. 'entities/dan-shapio'" },
+                    "new_id": { "type": "string", "description": "rename: correct id `<entities|concepts|sources|topics>/<slug>`, slug of letters, digits, '.', '_', '-'; must not exist yet (if it does, merge instead)" },
+                    "from_id": { "type": "string", "description": "merge: the duplicate to fold in and remove" },
+                    "into_id": { "type": "string", "description": "merge: the page that survives" },
+                    "force": { "type": "boolean", "default": false, "description": "delete: delete even while other pages refer to it" }
+                },
+                "required": ["action"]
+            }),
+            output: object_schema(json!({
+                "action": { "type": "string" },
+                "old_id": { "type": "string" },
+                "new_id": { "type": "string" },
+                "from_id": { "type": "string" },
+                "into_id": { "type": "string" },
+                "deleted": { "type": "string" },
+                "rewritten_pages": { "type": "array" },
+                "rewritten_links": { "type": "integer" },
+                "rewritten_references": { "type": "integer" },
+                "defused_in": { "type": "array" },
+                "defused_links": { "type": "integer" },
+                "removed_references": { "type": "integer" },
+                "commit": { "type": "string" },
+                "note": { "type": "string" }
+            })),
+            hints: write(true, false),
+        },
+        ToolSpec {
+            name: "brain_lint_report",
+            title: "Lint report",
+            description: "The lint state of the whole wiki. Use it at the start and end of a cleanup session and after bulk writes. Not needed after a single write — brain_write_page and brain_write_batch responses already carry that page's findings. Errors block auto-commits (broken-link, frontmatter, duplicate-id, unregistered-type, dangling-supersede, supersede-cycle); warnings are advice (missing-summary, missing-sources, missing-title, orphan, duplicate-candidate, alias-collision, broken-source, invalid-date, expired-but-linked, non-canonical-wiki-link, …). Work one kind at a time: concise for the overview, then detailed with `kind`. The `lint-session` prompt has the fix for each kind.",
+            input: json!({
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "description": "only findings of this kind, e.g. 'broken-link'" },
+                    "response_format": response_format_schema("every error, warning counts per kind, notes", "every error and warning with path, kind and message")
+                }
+            }),
+            output: object_schema(json!({
+                "error_count": { "type": "integer" },
+                "warning_count": { "type": "integer" },
+                "warning_kinds": { "type": "object" },
+                "errors": { "type": "array" },
+                "warnings": { "type": "array" },
+                "notes": { "type": "array" },
+                "hint": { "type": "string" }
+            })),
+            hints: READ_ONLY,
+        },
+        ToolSpec {
+            name: "brain_history",
+            title: "Page history and restore",
+            description: "Git history of one page. action 'list' (default; `id`, optional `limit`): the commits that touched the page, newest first, {sha, ts, message, files_changed} — use it to find the version to restore after a bad overwrite, merge or delete (pass the OLD id for a removed page) or to see how a fact changed. action 'restore' (`id`, `sha`): replace the page with its version at that sha and record a `revert:` commit — history stays append-only; confirm with the user first, later changes to the page are dropped. Not for the current content — use brain_get_pages; not for small corrections — use brain_patch_page.",
+            input: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list", "restore"], "default": "list", "description": "list: needs id (optional limit); restore: needs id + sha" },
+                    "id": { "type": "string", "description": "page id, e.g. 'entities/alice' ('.md' optional)" },
+                    "limit": { "type": "integer", "minimum": 1, "default": 20, "description": "list: maximum commits" },
+                    "sha": { "type": "string", "description": "restore: commit sha (full or short) from action 'list'" }
+                },
+                "required": ["id"]
+            }),
+            output: object_schema(json!({
+                "action": { "type": "string" },
+                "commits": { "type": "array" },
+                "restored": { "type": "string" },
+                "from_sha": { "type": "string" }
+            })),
+            hints: write(true, true),
+        },
+        ToolSpec {
+            name: "brain_write_raw_file",
+            title: "Store a raw artifact",
+            description: "Store a raw artifact (email, transcript, exported document) verbatim under 01_raw/<connector>/<relative_path>. Use it as the first ingest step, before writing the `source` page that summarises it. Not for wiki pages — use brain_write_page or brain_write_batch. Returns {wrote: '01_raw/…'}.",
+            input: json!({
+                "type": "object",
+                "properties": {
+                    "connector": { "type": "string", "description": "source channel, e.g. 'email', 'notes', 'confluence'" },
+                    "relative_path": { "type": "string", "description": "plain relative path, e.g. '2026-10-06-kickoff.txt' (no '..', drive letters or leading '/')" },
                     "content": { "type": "string" }
                 },
                 "required": ["connector", "relative_path", "content"]
-            }
-        }),
-        json!({
-            "name": "brain_graph",
-            "description": "Return the wiki graph as nodes + edges, optionally filtered by page type list.",
-            "inputSchema": {
+            }),
+            output: object_schema(json!({ "wrote": { "type": "string" } })),
+            hints: write(true, true),
+        },
+        ToolSpec {
+            name: "brain_eval",
+            title: "Search-quality eval",
+            description: "Search-quality measurement on the vault's eval set (00_meta/eval-queries.yaml). action 'run' (default): Recall@10, MRR and nDCG@10 for full-text, vector and hybrid search plus per-question hits and misses, appended to 00_meta/eval-history.md — use it before and after changing summaries or search settings. action 'add': store one test question (`query`) with the page ids a good search must return (`expected`, existing pages; optional `id`, `note`) — e.g. after the user says a search missed something. Not for searching — use brain_search.",
+            input: json!({
                 "type": "object",
                 "properties": {
-                    "types": { "type": "array", "items": { "type": "string" } }
+                    "action": { "type": "string", "enum": ["run", "add"], "default": "run", "description": "'run' the eval set (default) or 'add' a question to it (needs query + expected)" },
+                    "query": { "type": "string", "description": "add: the question as the user would ask it" },
+                    "expected": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "add: page ids a good search returns in its top 10" },
+                    "id": { "type": "string", "description": "add: optional stable name, e.g. 'q-kunde-a-laufzeit'" },
+                    "note": { "type": "string", "description": "add: optional note" }
                 }
-            }
-        }),
-        json!({
-            "name": "brain_embedding_status",
-            "description": "Report which embedder is currently active for the vault: real bge-m3 semantic vectors (when the model files in `04_models/bge-m3/` are present) or the deterministic HashedEmbedder fallback (no model files → mathematically-valid KNN but no semantic meaning). Returns `{embedder, semantic, model_dir, dim, chunk_count_indexed}`. If `semantic: false`, the hybrid-search semantic pass scores carry no meaning and `brain_search` behaves effectively as FTS5-only. Read this when the agent suspects semantic search isn't working.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {}
-            }
-        }),
-        json!({
-            "name": "brain_list_tags",
-            "description": "Return every distinct tag in the vault with its page count, sorted by count descending (alphabetic on ties). Use this to discover which tags exist before writing a `brain_query tag:<value>` filter — saves the agent from guessing names. Requires the SQLite index to be populated (i.e. the vault was rebuilt at least once after seeding).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {}
-            }
-        }),
-        json!({
-            "name": "brain_lint_report",
-            "description": "Return the current lint state of the wiki as { errors, warnings } — both are arrays of { path, kind, message }. Errors block auto-commits, warnings don't. Common warning kinds you should fix in place via brain_write_page: 'unregistered-type' (frontmatter type isn't one of entity/concept/source/topic — usually a plural slipped in), 'missing-title', 'non-canonical-wiki-link'. Common error kinds: 'frontmatter' (malformed YAML), 'duplicate-id' (two files share an id), 'broken-link' (wiki link points at a missing page; `[[id#heading]]` resolves to `id`). Hygiene warnings (advice, never block commits): 'orphan' (no other page links here and the file is unchanged for 90+ days — link it from a related page, merge it or delete it), 'duplicate-candidate' (two pages of the same type are semantically near-identical, score in the message — fold one into the other with brain_merge_pages if they describe the same thing), 'alias-collision' (two pages of one type share a name via an alias or the same slug — merge them, fix the alias, or add `distinct_from: [<other id>]` if they are different things), 'missing-sources' (an entity/concept page without `sources`), 'missing-summary' (a page without a `summary:` line — add one or two sentences), 'broken-source' (a `sources` entry without a page), 'invalid-date' (`valid_from`/`valid_to` not YYYY-MM-DD, or from after to), 'expired-but-linked' (`valid_to` has passed but current pages still link here — point them at the successor). Errors 'dangling-supersede' (`superseded_by` names a page that does not exist) and 'supersede-cycle' (pages supersede each other or themselves). An optional `notes` array carries info that is not a page finding (e.g. duplicate detection skipped because the embedding model is missing). Use this when the user asks you to clean up the wiki: loop through the report, fix each entry, then call again until clean.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {}
-            }
-        }),
-        json!({
-            "name": "brain_query",
-            "description": "Dataview-style structured query against page metadata. Supports fields id, type, title, tag, created, updated; operators `:` (eq), `:>`, `:<`; AND, OR, NOT; quoted values for spaces. Validity: by default (`valid:now`) pages whose `valid_to` has passed or that have `superseded_by` are left out; add `valid:all` to include them or `valid:expired` to list only them. Order: newest `updated` first; add `sort:salience` (top-level, with AND) to list the most-read pages first. Each hit has {id, type, path, title, updated_at, reads, search_hits, last_read_at} plus valid_from/valid_to/superseded_by when set. Examples: `type:source AND tag:customer AND updated:>2026-04-01`, `tag:nis2 OR tag:dora`, `NOT type:source AND title:\"NLSpec\"`, `type:entity AND valid:all AND sort:salience`. Use this for filtered listings; use brain_search for free-text search.",
-            "inputSchema": {
+            }),
+            output: object_schema(json!({
+                "queries": { "type": "integer" },
+                "modes": { "type": "array" },
+                "per_query": { "type": "array" },
+                "added": { "type": "object" }
+            })),
+            hints: write(false, false),
+        },
+        ToolSpec {
+            name: "brain_dream",
+            title: "Dream (consolidate the wiki)",
+            description: "Consolidation ('dreaming') — only when the user asks for it ('träum mal', 'tidy up the wiki'). action 'queue': BRAIN's prioritised work list {generated_at, items: [{priority 1..3, kind, pages, reason, suggested_action}], omitted}, served from 00_meta/dream-queue.md when under an hour old (`refresh: true` recomputes). action 'log': append one line (`entry`) to 00_meta/dream-log.md at the end of the session saying what you changed and why. Work the queue with the `dream` prompt: at most 10 changes, never delete linked pages, supersede instead of overwrite. Not for a lint cleanup — use brain_lint_report.",
+            input: json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string" }
+                    "action": { "type": "string", "enum": ["queue", "log"], "description": "'queue' to read the work list, 'log' to record the session (needs entry)" },
+                    "refresh": { "type": "boolean", "default": false, "description": "queue: recompute even if the stored queue is fresh" },
+                    "entry": { "type": "string", "description": "log: one line, e.g. 'merged entities/acme-inc into entities/acme; summaries for 3 hubs'" }
                 },
-                "required": ["query"]
-            }
-        }),
-        json!({
-            "name": "brain_eval",
-            "description": "Measure search quality: runs every test question of the vault's eval set (00_meta/eval-queries.yaml) through full-text-only, vector-only and hybrid search and returns Recall@10, MRR and nDCG@10 per mode plus, per question, which expected pages each mode found (with rank) or missed. Deterministic: same index, same numbers. Each run is appended to 00_meta/eval-history.md. Use it before and after changing pages' summaries or search settings; add questions with brain_eval_add.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {}
-            }
-        }),
-        json!({
-            "name": "brain_eval_add",
-            "description": "Add one test question to the eval set (00_meta/eval-queries.yaml, synced between machines): the question as the user would ask it and the page ids a good search should return in its top 10. Every expected id must be an existing page; a question or id already in the set is refused. Without `id`, one is generated from the query. Returns the stored entry.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string", "description": "optional stable name, e.g. 'q-kunde-a-laufzeit'" },
-                    "query": { "type": "string" },
-                    "expected": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "page ids, e.g. ['entities/kunde-a']" },
-                    "note": { "type": "string" }
-                },
-                "required": ["query", "expected"]
-            }
-        }),
-        json!({
-            "name": "brain_dream_queue",
-            "description": "The dream queue: BRAIN's prioritised list of what to consolidate in the wiki — `{generated_at, items: [{priority 1..3, kind, pages, reason, suggested_action}], omitted}`. Kinds: broken-link / broken-source (fix-link), duplicate-candidate (merge), summary-stale (update-summary: the body changed since the summary was written), missing-summary on a hub page (write-summary), decay-candidate (archive-or-supersede: never read, unlinked, unchanged 90+ days), orphan (review-or-archive). Each page appears in one item at most. Read it when the user asks you to dream / tidy up ('träum mal'), then work top-down (see AGENTS.md, section Dreaming). Served from 00_meta/dream-queue.md when it is younger than 1 hour; `refresh: true` recomputes it.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "refresh": { "type": "boolean", "description": "recompute even if the stored queue is fresh. Default false." }
-                }
-            }
-        }),
-        json!({
-            "name": "brain_dream_log",
-            "description": "Append one dated line to the dream log (00_meta/dream-log.md, local) — at the end of a dream session, say in one line what you changed and why (e.g. 'merged entities/acme-inc into entities/acme; wrote summaries for 3 hubs').",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "entry": { "type": "string" }
-                },
-                "required": ["entry"]
-            }
-        }),
+                "required": ["action"]
+            }),
+            output: object_schema(json!({
+                "generated_at": { "type": "string" },
+                "items": { "type": "array" },
+                "omitted": { "type": "integer" },
+                "notes": { "type": "array" },
+                "logged": { "type": "string" }
+            })),
+            hints: write(false, false),
+        },
     ]
 }
+
+/// `tools/list` entries for a client with `features`: `title` and
+/// `outputSchema` from 2025-06-18, `annotations` from 2025-03-26.
+fn tool_descriptors(features: Features) -> Vec<Value> {
+    tool_specs()
+        .into_iter()
+        .map(|spec| {
+            let mut tool = json!({
+                "name": spec.name,
+                "description": spec.description,
+                "inputSchema": spec.input,
+            });
+            if features.structured {
+                tool["title"] = json!(spec.title);
+                tool["outputSchema"] = spec.output;
+            }
+            if features.annotations {
+                tool["annotations"] = json!({
+                    "title": spec.title,
+                    "readOnlyHint": spec.hints.read_only,
+                    "destructiveHint": spec.hints.destructive,
+                    "idempotentHint": spec.hints.idempotent,
+                    "openWorldHint": false
+                });
+            }
+            tool
+        })
+        .collect()
+}
+
+// ---- Prompts ---------------------------------------------------------------
+
+/// One MCP prompt argument: (name, description, required).
+type PromptArg = (&'static str, &'static str, bool);
+
+struct PromptSpec {
+    name: &'static str,
+    title: &'static str,
+    description: &'static str,
+    arguments: &'static [PromptArg],
+}
+
+const PROMPTS: &[PromptSpec] = &[
+    PromptSpec {
+        name: "ingest",
+        title: "Ingest into BRAIN",
+        description: "Turn a raw artifact into wiki pages: raw file → source page → entity/concept pages, written in one brain_write_batch.",
+        arguments: &[
+            (
+                "source",
+                "what to ingest: a path under 01_raw/, pasted text, or a description of the material",
+                true,
+            ),
+            (
+                "connector",
+                "01_raw/ sub-folder for the raw file, e.g. 'email' or 'notes' (default: pick a fitting one)",
+                false,
+            ),
+        ],
+    },
+    PromptSpec {
+        name: "lint-session",
+        title: "Wiki cleanup session",
+        description: "Work through the newest audit / lint report and fix the findings kind by kind.",
+        arguments: &[(
+            "focus",
+            "only this finding kind, e.g. 'broken-link' (default: all, errors first)",
+            false,
+        )],
+    },
+    PromptSpec {
+        name: "dream",
+        title: "Dream (consolidate the wiki)",
+        description: "User-triggered consolidation: read the dream queue, work it top-down under hard rules, end with a dream-log entry.",
+        arguments: &[(
+            "max_changes",
+            "maximum changes in this session (default 10)",
+            false,
+        )],
+    },
+];
+
+fn prompt_descriptors(features: Features) -> Vec<Value> {
+    PROMPTS
+        .iter()
+        .map(|p| {
+            let arguments: Vec<Value> = p
+                .arguments
+                .iter()
+                .map(|(name, description, required)| {
+                    json!({ "name": name, "description": description, "required": required })
+                })
+                .collect();
+            let mut prompt = json!({
+                "name": p.name,
+                "description": p.description,
+                "arguments": arguments,
+            });
+            if features.structured {
+                prompt["title"] = json!(p.title);
+            }
+            prompt
+        })
+        .collect()
+}
+
+/// `prompts/get`: the prompt text with its arguments filled in.
+fn prompt_get(params: &Value) -> Reply {
+    let Some(name) = params.get("name").and_then(Value::as_str) else {
+        return rpc_error(INVALID_PARAMS, "missing prompt 'name'");
+    };
+    let Some(spec) = PROMPTS.iter().find(|p| p.name == name) else {
+        let known: Vec<&str> = PROMPTS.iter().map(|p| p.name).collect();
+        return rpc_error(
+            INVALID_PARAMS,
+            format!("Unknown prompt: {name} (available: {})", known.join(", ")),
+        );
+    };
+    let args = params.get("arguments").cloned().unwrap_or(json!({}));
+    let arg = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    for (key, _, required) in spec.arguments {
+        // MCP prompt arguments are strings; anything else is a malformed
+        // call, never silently replaced by the default.
+        if args
+            .get(*key)
+            .is_some_and(|v| !v.is_string() && !v.is_null())
+        {
+            return rpc_error(
+                INVALID_PARAMS,
+                format!("prompt argument '{key}' must be a string"),
+            );
+        }
+        if *required && arg(key).is_none() {
+            return rpc_error(
+                INVALID_PARAMS,
+                format!("prompt '{name}' needs the argument '{key}'"),
+            );
+        }
+    }
+    let text = match name {
+        "ingest" => ingest_prompt(arg("source").unwrap_or_default(), arg("connector")),
+        "lint-session" => lint_session_prompt(arg("focus")),
+        _ => {
+            let max = match arg("max_changes") {
+                None => 10,
+                Some(raw) => match raw.parse::<u32>() {
+                    Ok(n) if n > 0 => n,
+                    _ => {
+                        return rpc_error(
+                            INVALID_PARAMS,
+                            "'max_changes' must be a positive whole number",
+                        );
+                    }
+                },
+            };
+            dream_prompt(max)
+        }
+    };
+    Reply::Result(json!({
+        "description": spec.description,
+        "messages": [{ "role": "user", "content": { "type": "text", "text": text } }]
+    }))
+}
+
+fn ingest_prompt(source: &str, connector: Option<&str>) -> String {
+    let connector = connector
+        .map(|c| format!("connector \"{c}\""))
+        .unwrap_or_else(|| "a fitting connector such as email, notes or confluence".to_string());
+    format!(
+        "Ingest the following into the BRAIN wiki: {source}
+
+Follow the vault conventions (resource brain://agents-md). Steps:
+1. Raw file: if the material is not under 01_raw/ yet, store it verbatim with brain_write_raw_file ({connector}; relative_path: a date-prefixed file name).
+2. Find what exists: brain_search for the main names and topics, then brain_lookup for every entity or concept page you plan to create (by name or planned id). An existing page or a match means: extend that page and add your spelling to its aliases — never create a duplicate.
+3. Plan the pages: one `sources/<yyyy-mm-dd>-<slug>` page for the artifact (what it is, key facts, the raw file path), entity pages for the people, organisations and products it names, concept pages for methods and terms, and a topic page only for a synthesis across several sources.
+4. Write all new and changed pages in ONE brain_write_batch call. Every page: frontmatter id, type (singular: entity, concept, source or topic), title, summary (one or two sentences); entity and concept pages also `sources: [sources/<the source page>]`. Link with [[type-dir/slug]] only to pages that exist or are in the same batch. Before changing an existing page, read it with brain_get_pages (response_format \"detailed\") and keep its frontmatter.
+5. Check the response: fix lint errors it reports. If new_size_bytes is much smaller than previous_size_bytes on an existing page, stop and tell the user.
+6. Changed facts are never overwritten: supersede the old page (superseded_by + valid_to) and write the new state.
+Finish with a short report for the user: pages created, pages updated, open questions."
+    )
+}
+
+fn lint_session_prompt(focus: Option<&str>) -> String {
+    let scope = match focus {
+        Some(kind) => format!("Work only on findings of kind `{kind}`."),
+        None => {
+            "Errors first (they block auto-commits), then warnings, one kind at a time.".to_string()
+        }
+    };
+    format!(
+        "Run a cleanup session on the BRAIN wiki.
+1. Read the newest audit (resource brain://audit/latest) or call brain_lint_report for the live state (concise: counts per kind). {scope}
+2. For each kind, get its findings with brain_lint_report (response_format \"detailed\", kind \"<kind>\") and fix them:
+- broken-link / broken-source: correct the id, create the missing page, or rename the page that was meant (brain_refactor action \"rename\").
+- unregistered-type / frontmatter / missing-title: rewrite the page with brain_write_page (type is singular: entity, concept, source, topic).
+- dangling-supersede / supersede-cycle: point superseded_by at an existing, current page.
+- duplicate-candidate / alias-collision: read both pages (brain_get_pages); the same thing → brain_refactor action \"merge\" the weaker into the stronger; different things → add distinct_from (or fix the clashing alias).
+- orphan: link it from a related page or merge it; delete it (brain_refactor action \"delete\") only if it is junk.
+- missing-summary / missing-sources: add a one-to-two-sentence summary / the source pages with brain_write_page, body unchanged.
+- expired-but-linked: point the links at the successor.
+- invalid-date: write YYYY-MM-DD; valid_from must not lie after valid_to.
+- non-canonical-wiki-link / wikilink-pipe-in-table-cell: rewrite as [[type-dir/slug]] (no |alias inside table cells).
+3. Ask the user before merging or deleting pages they wrote themselves.
+4. Call brain_lint_report again at the end and report what you fixed and what is left."
+    )
+}
+
+fn dream_prompt(max_changes: u32) -> String {
+    format!(
+        "Dream: consolidate the BRAIN wiki (the user asked for it).
+
+Hard rules:
+- At most {max_changes} changes in this session.
+- Never delete a page that other pages link to.
+- Supersede instead of overwriting facts (superseded_by + valid_to on the old page; keep its body).
+- Keep minority views and open questions; do not flatten them into one \"truth\".
+- Ask before changing pages the user clearly wrote themselves.
+
+Steps:
+1. brain_dream with action \"queue\" (refresh: true if the wiki changed a lot since the last queue).
+2. Work top-down (priority 1 first). By suggested_action:
+- fix-link: repair the broken link or sources entry (right id, create the missing page, or brain_refactor action \"rename\" on the page that was meant).
+- merge: read both pages (brain_get_pages); the same thing → brain_refactor action \"merge\" the weaker into the stronger, then tidy the appended section with brain_patch_page; different things → add distinct_from.
+- update-summary / write-summary: read the page and write a fitting one-to-two-sentence summary with brain_write_page (body unchanged). If the existing summary is still right, confirm it instead: brain_write_page with the page unchanged and confirm_summary: true.
+- archive-or-supersede / review-or-archive: link it from a related page if it is still useful; if its facts were replaced, set superseded_by and valid_to. Do not delete it.
+3. Stop after {max_changes} changes or when the queue is done; what is left shows up in the next queue.
+4. End with brain_dream action \"log\" and one line saying what you changed and why (e.g. \"merged entities/acme-inc into entities/acme; summaries for 3 hubs\"). Every change stays restorable with brain_history action \"restore\"."
+    )
+}
+
+// ---- Resources -------------------------------------------------------------
+
+const RESOURCE_AGENTS_MD: &str = "brain://agents-md";
+const RESOURCE_AUDIT_LATEST: &str = "brain://audit/latest";
+const RESOURCE_DREAM_QUEUE: &str = "brain://dream-queue";
+
+/// (uri, name, title, description, mimeType)
+const RESOURCES: &[(&str, &str, &str, &str, &str)] = &[
+    (
+        RESOURCE_AGENTS_MD,
+        "agents-md",
+        "AGENTS.md — vault conventions",
+        "The vault's 00_meta/AGENTS.md: page types, frontmatter, links, tool map, ingest/cleanup/dream workflows. Read it before writing pages.",
+        "text/markdown",
+    ),
+    (
+        RESOURCE_AUDIT_LATEST,
+        "audit-latest",
+        "Newest wiki audit",
+        "The newest daily audit report (00_meta/audit/<date>.md): all lint and hygiene findings of the whole wiki.",
+        "text/markdown",
+    ),
+    (
+        RESOURCE_DREAM_QUEUE,
+        "dream-queue",
+        "Dream queue",
+        "BRAIN's prioritised consolidation work list (as brain_dream action 'queue'), recomputed when older than an hour.",
+        "application/json",
+    ),
+];
+
+fn resource_descriptors(features: Features) -> Vec<Value> {
+    RESOURCES
+        .iter()
+        .map(|(uri, name, title, description, mime)| {
+            let mut resource = json!({
+                "uri": uri,
+                "name": name,
+                "description": description,
+                "mimeType": mime,
+            });
+            if features.structured {
+                resource["title"] = json!(title);
+            }
+            resource
+        })
+        .collect()
+}
+
+/// `resources/read`. AGENTS.md falls back to the bundled template when no
+/// vault (or no file) is there, so the conventions are always readable;
+/// the audit and the dream queue need the vault.
+fn resource_read(
+    params: &Value,
+    vault: Option<&std::path::Path>,
+    db: &mut Option<crate::db::DbHandle>,
+) -> Reply {
+    let Some(uri) = params.get("uri").and_then(Value::as_str) else {
+        return rpc_error(INVALID_PARAMS, "missing resource 'uri'");
+    };
+    let Some((_, _, _, _, mime)) = RESOURCES.iter().find(|r| r.0 == uri) else {
+        return Reply::Error {
+            code: RESOURCE_NOT_FOUND,
+            message: "Resource not found".to_string(),
+            data: Some(json!({ "uri": uri })),
+        };
+    };
+    let reachable = vault.filter(|v| crate::vault::layout::is_vault(v));
+    let text = match uri {
+        RESOURCE_AGENTS_MD => reachable
+            .and_then(|v| {
+                std::fs::read_to_string(
+                    crate::vault::layout::meta_dir(v).join(crate::vault::layout::AGENTS_FILENAME),
+                )
+                .ok()
+            })
+            .unwrap_or_else(|| crate::onboarding::template::AGENTS_MD.to_string()),
+        _ => {
+            let Some(v) = reachable else {
+                return match vault {
+                    None => rpc_error(NO_VAULT, no_vault_message()),
+                    Some(path) => rpc_error(NO_VAULT, vault_disconnected_message(path)),
+                };
+            };
+            if uri == RESOURCE_AUDIT_LATEST {
+                match latest_audit(v) {
+                    Some(text) => text,
+                    None => {
+                        return Reply::Error {
+                            code: RESOURCE_NOT_FOUND,
+                            message: "no audit report yet — BRAIN writes one shortly after mount \
+                                      and then daily; call brain_lint_report for the live state"
+                                .to_string(),
+                            data: Some(json!({ "uri": uri })),
+                        };
+                    }
+                }
+            } else {
+                match dream_queue(v, db, false) {
+                    Ok(queue) => serde_json::to_string(&queue).unwrap_or_default(),
+                    Err(err) => return rpc_error(-32603, err),
+                }
+            }
+        }
+    };
+    Reply::Result(json!({
+        "contents": [{ "uri": uri, "mimeType": mime, "text": text }]
+    }))
+}
+
+/// Text of the newest `00_meta/audit/<YYYY-MM-DD>.md` (file names sort by
+/// date), `None` when there is none.
+fn latest_audit(vault: &std::path::Path) -> Option<String> {
+    let newest = std::fs::read_dir(crate::wiki::audit::audit_dir(vault))
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "md"))
+        .max()?;
+    std::fs::read_to_string(newest).ok()
+}
+
+fn vault_disconnected_message(vault: &std::path::Path) -> String {
+    format!(
+        "BRAIN_VAULT_DISCONNECTED: the BRAIN vault at '{}' is not currently accessible. \
+         The disk holding the vault was unplugged or the path is no longer valid. \
+         Tell the user to reconnect the BRAIN drive and try again. \
+         Do not attempt to recreate or guess at the missing data.",
+        vault.display()
+    )
+}
+
+/// The dream queue: the stored one when fresh (and `refresh` is false),
+/// else recomputed from the index and stored.
+fn dream_queue(
+    vault: &std::path::Path,
+    db: &mut Option<crate::db::DbHandle>,
+    refresh: bool,
+) -> Result<crate::wiki::dream::DreamQueue, String> {
+    use crate::wiki::dream;
+    let now = chrono::Utc::now();
+    if !refresh {
+        if let Some(queue) = dream::cached_queue(vault, now) {
+            return Ok(queue);
+        }
+    }
+    let rows = db_op(db, vault, "brain_dream", dream::load_dream_rows)?;
+    let queue = dream::build_queue(&rows, now);
+    if let Err(err) = dream::write_dream_queue(vault, &queue) {
+        tracing::warn!(?err, "could not write the dream queue");
+    }
+    Ok(queue)
+}
+
+// ---- Tool arguments ----------------------------------------------------------
+
+/// `response_format` of the read tools (Slice D).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Format {
+    Concise,
+    Detailed,
+}
+
+fn format_arg(args: &Value) -> Result<Format, String> {
+    match args.get("response_format") {
+        None | Some(Value::Null) => Ok(Format::Concise),
+        Some(Value::String(s)) if s == "concise" => Ok(Format::Concise),
+        Some(Value::String(s)) if s == "detailed" => Ok(Format::Detailed),
+        Some(_) => Err("'response_format' must be \"concise\" or \"detailed\"".to_string()),
+    }
+}
+
+/// Optional non-negative integer argument.
+fn optional_usize(args: &Value, key: &str) -> Result<Option<usize>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .map(|n| Some(n as usize))
+            .ok_or_else(|| format!("'{key}' must be a non-negative integer")),
+    }
+}
+
+/// Optional string argument.
+fn optional_str<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.as_str())),
+        Some(_) => Err(format!("'{key}' must be a string")),
+    }
+}
+
+// ---- Tool dispatch -----------------------------------------------------------
 
 fn call_tool(
     params: &Value,
@@ -1020,7 +1952,7 @@ fn call_tool(
         .ok_or_else(|| "missing 'name'".to_string())?;
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
-    // NOTE: `brain_ping` is handled upstream in `handle_request`, before
+    // NOTE: `brain_ping` is handled upstream in `tools_call`, before
     // the vault gate and before this function — it must never reach the
     // `is_vault` stat below or any DB code. Do not re-add a ping branch
     // here.
@@ -1033,21 +1965,18 @@ fn call_tool(
     // model recognises lets it react with "BRAIN is disconnected,
     // reconnect the drive and try again" instead of guessing.
     if !crate::vault::layout::is_vault(vault) {
-        return Err(format!(
-            "BRAIN_VAULT_DISCONNECTED: the BRAIN vault at '{}' is not currently accessible. \
-             The disk holding the vault was unplugged or the path is no longer valid. \
-             Tell the user to reconnect the BRAIN drive and try again. \
-             Do not attempt to recreate or guess at the missing data.",
-            vault.display()
-        ));
+        return Err(vault_disconnected_message(vault));
     }
 
     match name {
         "brain_search" => {
+            let format = format_arg(&args)?;
+            let limit = optional_usize(&args, "limit")?
+                .unwrap_or(SEARCH_DEFAULT_LIMIT)
+                .clamp(1, SEARCH_MAX_LIMIT);
             let q = args.get("query").and_then(Value::as_str).unwrap_or("");
             if q.trim().is_empty() {
-                return Ok(serde_json::to_string_pretty(&Vec::<search::SearchHit>::new())
-                    .unwrap_or_default());
+                return Ok(json!({ "hits": [] }).to_string());
             }
             // Run the hybrid (FTS5 + vector) path through db_op so it is
             // timeout-bounded and self-heals on a stale connection. On
@@ -1069,31 +1998,68 @@ fn call_tool(
                 search::search_hybrid_on_conn(conn, embedder.as_ref(), &query_owned)
                     .map_err(crate::db::DbError::from)
             });
-            let hits = match hybrid {
+            let mut hits = match hybrid {
                 Ok(hits) if !hits.is_empty() => hits,
                 // Empty hybrid result or any DB error → brute-force walk.
                 _ => search::search_brute_force(vault, q).map_err(|e| e.to_string())?,
             };
+            hits.truncate(limit);
             record_search_hits(
                 db,
                 vault,
-                hits.iter().take(SALIENCE_SEARCH_TOP).map(|h| h.id.clone()).collect(),
+                hits.iter()
+                    .take(SALIENCE_SEARCH_TOP)
+                    .map(|h| h.id.clone())
+                    .collect(),
             );
-            Ok(serde_json::to_string_pretty(&hits).unwrap_or_default())
-        }
-        "brain_get_page" => {
-            let id = args.get("id").and_then(Value::as_str).unwrap_or("");
-            check_page_id(id)?;
-            let page = tree::read_page(vault, id).map_err(|e| e.to_string())?;
-            record_reads(db, vault, vec![id.to_string()]);
-            let (payload, _) = page_payload(page);
-            Ok(serde_json::to_string_pretty(&payload).unwrap_or_default())
+            let hits: Vec<Value> = match format {
+                Format::Detailed => hits
+                    .iter()
+                    .map(|h| serde_json::to_value(h).unwrap_or_default())
+                    .collect(),
+                Format::Concise => {
+                    let summaries =
+                        summaries_of(db, vault, hits.iter().map(|h| h.id.clone()).collect());
+                    let mut concise: Vec<Value> = hits
+                        .iter()
+                        .map(|h| {
+                            let source = summaries
+                                .get(&h.id)
+                                .map(String::as_str)
+                                .unwrap_or(h.snippet.as_str());
+                            json!({
+                                "id": h.id,
+                                "title": h.title,
+                                "score": (f64::from(h.score) * 10_000.0).round() / 10_000.0,
+                                "snippet": plain_snippet(source, CONCISE_SNIPPET_CHARS),
+                            })
+                        })
+                        .collect();
+                    // Budget: the snippet matters more to the agent than the
+                    // score, so the score goes first when the hits get long.
+                    if json!({ "hits": concise }).to_string().len() > CONCISE_SEARCH_BUDGET {
+                        for hit in &mut concise {
+                            if let Value::Object(fields) = hit {
+                                fields.remove("score");
+                            }
+                        }
+                    }
+                    concise
+                }
+            };
+            Ok(json!({ "hits": hits }).to_string())
         }
         "brain_get_pages" => {
+            let format = format_arg(&args)?;
+            let include_context = match args.get("include_context") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(b)) => *b,
+                Some(_) => return Err("'include_context' must be a boolean".to_string()),
+            };
             let ids = args
                 .get("ids")
                 .and_then(Value::as_array)
-                .ok_or_else(|| "missing 'ids' array".to_string())?;
+                .ok_or_else(|| "missing 'ids' array (one page: [\"<id>\"])".to_string())?;
             if ids.is_empty() {
                 return Err("'ids' must contain at least one entry".to_string());
             }
@@ -1120,11 +2086,34 @@ fn call_tool(
                     match tree::read_page(vault, id) {
                         Ok(page) => {
                             read_ids.push(id.to_string());
-                            json!({
+                            // `tree::read_page` already strips the YAML
+                            // frontmatter, so the links come straight from
+                            // the body (re-parsing it would fail with
+                            // "missing frontmatter delimiter").
+                            let outbound =
+                                include_context.then(|| page::extract_wiki_links(&page.body));
+                            let mut entry = json!({
                                 "id": id,
                                 "found": true,
-                                "page": page_payload(page).0,
-                            })
+                                "page": page_payload(page, format).0,
+                            });
+                            if let Some(outbound) = outbound {
+                                entry["outbound"] = json!(outbound);
+                                match search::backlinks(vault, id) {
+                                    Ok(backlinks) => {
+                                        entry["backlinks"] = match format {
+                                            Format::Detailed => {
+                                                serde_json::to_value(&backlinks).unwrap_or_default()
+                                            }
+                                            Format::Concise => json!(
+                                                backlinks.iter().map(|b| &b.id).collect::<Vec<_>>()
+                                            ),
+                                        };
+                                    }
+                                    Err(e) => entry["context_error"] = json!(e.to_string()),
+                                }
+                            }
+                            entry
                         }
                         Err(e) => json!({
                             "id": id,
@@ -1140,71 +2129,7 @@ fn call_tool(
             record_reads(db, vault, read_ids);
             Ok(serde_json::to_string_pretty(&json!({ "pages": pages })).unwrap_or_default())
         }
-        "brain_page_exists" => {
-            // Cheap yes/no check the user-feedback called out: an LLM
-            // wanting to know "does entities/foo already exist?" would
-            // otherwise call brain_get_page (which loads + parses the
-            // whole markdown body) just to throw away the result. This
-            // tool is one Path::is_file() — sub-millisecond — so the
-            // create-vs-update decision costs almost nothing.
-            let id = args
-                .get("id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "missing 'id'".to_string())?;
-            if id.is_empty() {
-                return Err("'id' must not be empty".to_string());
-            }
-            // Defend against path escapes smuggled into the id
-            // (`../../etc/passwd`, `C:/Users/x`). Reject before joining onto
-            // the wiki dir so the Path::is_file() check can never escape the
-            // vault root.
-            check_page_id(id)?;
-            let target = crate::wiki::encryption::page_path(vault, id).map_err(|e| e.to_string())?;
-            let exists = target.is_file();
-            // A2: other pages that are probably the same thing (alias,
-            // normalised slug, near-identical slug). From the index, best
-            // effort and never building it: without a usable index there
-            // are no matches and `matches_checked` is false. Matches whose
-            // file is gone (stale index rows) are dropped.
-            let entries = load_name_entries(db, vault);
-            let matches_checked = entries.is_some();
-            let matches = live_matches(
-                vault,
-                duplicates::find_matches(id, &entries.unwrap_or_default()),
-                &std::collections::HashSet::new(),
-            );
-            Ok(serde_json::to_string(&json!({
-                "id": id,
-                "exists": exists,
-                "matches": matches,
-                "matches_checked": matches_checked,
-            }))
-            .unwrap_or_default())
-        }
-        "brain_get_context" => {
-            let id = args.get("id").and_then(Value::as_str).unwrap_or("");
-            check_page_id(id)?;
-            let page = tree::read_page(vault, id).map_err(|e| e.to_string())?;
-            // `tree::read_page` already strips the YAML frontmatter, so
-            // `page::parse` would refuse the body with "missing frontmatter
-            // delimiter" → surfaced as a `lint:` error to the LLM. Skip the
-            // re-parse and pull wiki links directly from the body.
-            let outbound = page::extract_wiki_links(&page.body);
-            let backlinks = search::backlinks(vault, id).map_err(|e| e.to_string())?;
-            record_reads(db, vault, vec![id.to_string()]);
-            let (page, superseded_by) = page_payload(page);
-            let mut payload = json!({
-                "page": page,
-                "outbound": outbound,
-                "backlinks": backlinks,
-            });
-            if let Some(successor) = superseded_by {
-                payload["notice"] = json!(superseded_notice(&successor));
-                payload["superseded_by"] = json!(successor);
-            }
-            Ok(serde_json::to_string_pretty(&payload).unwrap_or_default())
-        }
-        "brain_list_pages" => list_pages_dispatch(&args, vault, db),
+        "brain_lookup" => lookup(&args, vault, db),
         "brain_write_page" => {
             let id = args
                 .get("id")
@@ -1220,7 +2145,8 @@ fn call_tool(
             let confirm_summary = confirm_summary_arg(&args)?;
             // A2: refuse to CREATE a page that probably exists already
             // under another id. Overwriting an existing id is never blocked.
-            let target = crate::wiki::encryption::page_path(vault, id).map_err(|e| e.to_string())?;
+            let target =
+                crate::wiki::encryption::page_path(vault, id).map_err(|e| e.to_string())?;
             let mut matches_checked = true;
             if !allow_duplicate && !target.is_file() {
                 match load_name_entries(db, vault) {
@@ -1294,8 +2220,8 @@ fn call_tool(
                 // structured array so it can repair in one round-trip.
                 // Same shape as before 0.2.17 so existing clients
                 // continue to parse the response identically.
-                let detail = serde_json::to_string(&page_errors)
-                    .unwrap_or_else(|_| "[]".to_string());
+                let detail =
+                    serde_json::to_string(&page_errors).unwrap_or_else(|_| "[]".to_string());
                 return Err(format!(
                     "page written but lint failed: {} error(s) on this page\n{detail}",
                     page_errors.len()
@@ -1341,7 +2267,8 @@ fn call_tool(
                 .and_then(Value::as_str)
                 .ok_or_else(|| "missing 'content'".to_string())?;
             // The page must already exist — patch edits one section of it.
-            let target = crate::wiki::encryption::page_path(vault, id).map_err(|e| e.to_string())?;
+            let target =
+                crate::wiki::encryption::page_path(vault, id).map_err(|e| e.to_string())?;
             let original = std::fs::read_to_string(&target)
                 .map_err(|_| format!("page not found: {id} (use brain_write_page to create it)"))?;
             let parsed = page::parse(&original)
@@ -1358,251 +2285,51 @@ fn call_tool(
                 return Ok(response);
             }
             let mut response: Value = serde_json::from_str(&response).unwrap_or_else(|_| json!({}));
-            response["summary_confirmed"] = json!(confirm_summary_in_index(db, vault, id, &new_content));
+            response["summary_confirmed"] =
+                json!(confirm_summary_in_index(db, vault, id, &new_content));
             Ok(serde_json::to_string(&response).unwrap_or_default())
         }
-        "brain_get_page_history" => {
-            let id = args
-                .get("id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "missing 'id'".to_string())?;
-            if id.is_empty() {
-                return Err("'id' must not be empty".to_string());
-            }
-            check_page_id(id.strip_suffix(".md").unwrap_or(id))?;
-            let limit = args
-                .get("limit")
-                .and_then(Value::as_u64)
-                .map(|n| n as usize)
-                .unwrap_or(20);
-            // Normalise page-id (entities/alice) to the on-disk path
-            // (entities/alice.md) that git stores. Accepts either form
-            // — agents in the wild send both depending on whether
-            // they've stripped extensions or not.
-            // Accept both `entities/alice` and `entities/alice.md`;
-            // route through the resolver so the repo-relative path stays
-            // consistent with how pages are actually stored on disk.
-            let page_path = crate::wiki::encryption::page_relpath(vault, id.strip_suffix(".md").unwrap_or(id))
-                .map_err(|e| e.to_string())?;
-            let history = wiki_history::history_for_page(
-                &wiki_dir(vault),
-                &page_path,
-                limit,
-            )
-            .map_err(|e| e.to_string())?;
-            Ok(serde_json::to_string_pretty(&json!({ "commits": history }))
-                .unwrap_or_default())
-        }
-        "brain_restore_page" => {
-            let id = args
-                .get("id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "missing 'id'".to_string())?;
-            let sha = args
-                .get("sha")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "missing 'sha'".to_string())?;
-            if id.is_empty() {
-                return Err("'id' must not be empty".to_string());
-            }
-            check_page_id(id.strip_suffix(".md").unwrap_or(id))?;
-            if sha.is_empty() {
-                return Err("'sha' must not be empty".to_string());
-            }
-            // Same id normalisation as brain_get_page_history — route
-            // through the resolver for the repo-relative path.
-            let page_path = crate::wiki::encryption::page_relpath(vault, id.strip_suffix(".md").unwrap_or(id))
-                .map_err(|e| e.to_string())?;
-            wiki_history::restore_page(&wiki_dir(vault), sha, &page_path)
-                .map_err(|e| e.to_string())?;
-            // Report the new revert-commit sha so the agent can quote
-            // it back to the user ("restored — new commit a1b2c3d4").
-            // The watcher's debounce window might not have produced
-            // it yet, so we just confirm the restore wrote the file
-            // and return the source sha for the audit trail.
-            Ok(serde_json::to_string(&json!({
-                "restored": id,
-                "from_sha": sha,
-            }))
-            .unwrap_or_default())
-        }
-        "brain_rename_page" => {
-            let id = required_str(&args, "id")?;
-            let new_id = required_str(&args, "new_id")?;
-            let outcome = refactor::rename_page(vault, id, new_id).map_err(|e| e.to_string())?;
-            forget_in_index(db, vault, &outcome.old_id, Some(&outcome.new_id));
-            Ok(serde_json::to_string(&outcome).unwrap_or_default())
-        }
-        "brain_merge_pages" => {
-            let from_id = required_str(&args, "from_id")?;
-            let into_id = required_str(&args, "into_id")?;
-            let outcome =
-                refactor::merge_pages(vault, from_id, into_id).map_err(|e| e.to_string())?;
-            forget_in_index(db, vault, &outcome.from_id, Some(&outcome.into_id));
-            Ok(serde_json::to_string(&outcome).unwrap_or_default())
-        }
-        "brain_delete_page" => {
-            let id = required_str(&args, "id")?;
-            let force = match args.get("force") {
-                None | Some(Value::Null) => false,
-                Some(Value::Bool(b)) => *b,
-                Some(_) => return Err("force must be a boolean (true or false)".to_string()),
+        "brain_history" => match tools::resolve_action(name, args.get("action"))? {
+            Some("restore") => history_restore(&args, vault),
+            _ => history_list(&args, vault),
+        },
+        "brain_refactor" => {
+            let action = tools::resolve_action(name, args.get("action"))?.unwrap_or_default();
+            let outcome = match action {
+                "rename" => {
+                    let id = required_str(&args, "id")?;
+                    let new_id = required_str(&args, "new_id")?;
+                    let outcome =
+                        refactor::rename_page(vault, id, new_id).map_err(|e| e.to_string())?;
+                    forget_in_index(db, vault, &outcome.old_id, Some(&outcome.new_id));
+                    serde_json::to_value(&outcome)
+                }
+                "merge" => {
+                    let from_id = required_str(&args, "from_id")?;
+                    let into_id = required_str(&args, "into_id")?;
+                    let outcome = refactor::merge_pages(vault, from_id, into_id)
+                        .map_err(|e| e.to_string())?;
+                    forget_in_index(db, vault, &outcome.from_id, Some(&outcome.into_id));
+                    serde_json::to_value(&outcome)
+                }
+                _ => {
+                    let id = required_str(&args, "id")?;
+                    let force = match args.get("force") {
+                        None | Some(Value::Null) => false,
+                        Some(Value::Bool(b)) => *b,
+                        Some(_) => {
+                            return Err("force must be a boolean (true or false)".to_string());
+                        }
+                    };
+                    let outcome =
+                        refactor::delete_page(vault, id, force).map_err(|e| e.to_string())?;
+                    forget_in_index(db, vault, &outcome.deleted, None);
+                    serde_json::to_value(&outcome)
+                }
             };
-            let outcome = refactor::delete_page(vault, id, force).map_err(|e| e.to_string())?;
-            forget_in_index(db, vault, &outcome.deleted, None);
-            Ok(serde_json::to_string(&outcome).unwrap_or_default())
+            Ok(action_payload(action, outcome.unwrap_or_default()).to_string())
         }
-        "brain_write_batch" => {
-            // Three phases — see the tool descriptor for the user-
-            // facing rationale. Code-side rationale: parsing all
-            // pages up front turns multi-page write into an all-or-
-            // nothing operation against malformed input. Lint runs
-            // once at the end with the full batch already on disk,
-            // so intra-batch references resolve (the cascade is
-            // gone).
-            let pages = args
-                .get("pages")
-                .and_then(Value::as_array)
-                .ok_or_else(|| "missing 'pages' array".to_string())?;
-            if pages.is_empty() {
-                return Err("'pages' must contain at least one entry".to_string());
-            }
-
-            // Phase 1 — validate + buffer.
-            struct Prepared {
-                id: String,
-                target: std::path::PathBuf,
-                normalized_content: String,
-                previous_size_bytes: i64,
-            }
-            let mut prepared: Vec<Prepared> = Vec::with_capacity(pages.len());
-            let allow_all = allow_duplicate_arg(&args)?;
-            // A2 duplicate check: index entries (loaded once, only if some
-            // entry needs the check) plus the batch's earlier entries.
-            let mut index_names: Option<Option<Vec<duplicates::NameEntry>>> = None;
-            let mut batch_names: Vec<duplicates::NameEntry> = Vec::new();
-            let mut batch_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let mut matches_checked = true;
-            for (idx, entry) in pages.iter().enumerate() {
-                let id = entry
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| format!("pages[{idx}]: missing 'id'"))?;
-                check_page_id(id).map_err(|e| format!("pages[{idx}]: {e}"))?;
-                let content = entry
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| format!("pages[{idx}]: missing 'content'"))?;
-                let parsed = page::parse(content)
-                    .map_err(|e| format!("pages[{idx}] ({id}): invalid content: {e}"))?;
-                let allow_duplicate =
-                    allow_all || allow_duplicate_arg(entry).map_err(|e| format!("pages[{idx}]: {e}"))?;
-                let target = crate::wiki::encryption::page_path(vault, id).map_err(|e| e.to_string())?;
-                if !allow_duplicate && !target.is_file() {
-                    let index = index_names.get_or_insert_with(|| load_name_entries(db, vault));
-                    if index.is_none() {
-                        matches_checked = false;
-                    }
-                    let candidates: Vec<duplicates::NameEntry> = index
-                        .iter()
-                        .flatten()
-                        .chain(&batch_names)
-                        .cloned()
-                        .collect();
-                    if let Some(refusal) = creation_refusal(vault, id, &candidates, &batch_ids) {
-                        return Err(format!("pages[{idx}] ({id}): {refusal}"));
-                    }
-                }
-                batch_names.push(duplicates::NameEntry {
-                    id: id.to_string(),
-                    title: parsed.frontmatter.title.clone(),
-                    aliases: parsed.frontmatter.aliases.clone(),
-                    distinct_from: parsed.frontmatter.distinct_from.clone(),
-                });
-                batch_ids.insert(id.to_string());
-                let normalized_body =
-                    page::normalize_internal_links(strip_superseded_notice(&parsed.body));
-                let normalized_content = if normalized_body == parsed.body {
-                    content.to_string()
-                } else {
-                    rebuild_page_file(content, &normalized_body)
-                };
-                let previous_size_bytes = std::fs::metadata(&target)
-                    .map(|m| m.len() as i64)
-                    .unwrap_or(0);
-                prepared.push(Prepared {
-                    id: id.to_string(),
-                    target,
-                    normalized_content,
-                    previous_size_bytes,
-                });
-            }
-
-            // Phase 2 — write all files. If an IO error hits mid-
-            // batch the error names the failing page; the partial
-            // state is consciously left as-is so the user can
-            // inspect (we deliberately do not rollback the pages
-            // that already wrote, which would itself be an IO
-            // sequence that can fail).
-            for w in &prepared {
-                if let Some(parent) = w.target.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| format!("create dir for {}: {e}", w.id))?;
-                }
-                std::fs::write(&w.target, &w.normalized_content)
-                    .map_err(|e| format!("write {}: {e}", w.id))?;
-            }
-
-            // Phase 3 — single lint pass, scoped to the union of
-            // touched paths.
-            let full_report = lint::lint(vault).map_err(|e| e.to_string())?;
-            let target_set: std::collections::HashSet<String> = prepared
-                .iter()
-                .map(|w| w.target.to_string_lossy().replace('\\', "/"))
-                .collect();
-            let scoped_errors: Vec<&lint::LintError> = full_report
-                .errors
-                .iter()
-                .filter(|e| target_set.contains(&e.path.replace('\\', "/")))
-                .collect();
-            let scoped_warnings: Vec<&lint::LintWarning> = full_report
-                .warnings
-                .iter()
-                .filter(|w| target_set.contains(&w.path.replace('\\', "/")))
-                .collect();
-            if !scoped_errors.is_empty() {
-                let detail = serde_json::to_string(&scoped_errors)
-                    .unwrap_or_else(|_| "[]".to_string());
-                return Err(format!(
-                    "batch written ({} pages) but lint failed: {} error(s) across the batch\n{detail}",
-                    prepared.len(),
-                    scoped_errors.len()
-                ));
-            }
-            // Per-page summary including page-scoped warnings.
-            let results: Vec<Value> = prepared
-                .iter()
-                .map(|w| {
-                    let new_size_bytes = w.normalized_content.len() as i64;
-                    let page_warnings: Vec<&lint::LintWarning> = scoped_warnings
-                        .iter()
-                        .copied()
-                        .filter(|wn| paths_equal(&wn.path, &w.target))
-                        .collect();
-                    json!({
-                        "id": w.id,
-                        "previous_size_bytes": w.previous_size_bytes,
-                        "new_size_bytes": new_size_bytes,
-                        "warnings": page_warnings,
-                    })
-                })
-                .collect();
-            let mut response = json!({ "wrote": results });
-            if !matches_checked {
-                response["matches_checked"] = json!(false);
-            }
-            Ok(serde_json::to_string_pretty(&response).unwrap_or_default())
-        }
+        "brain_write_batch" => write_batch(&args, vault, db),
         "brain_write_raw_file" => {
             let connector = args
                 .get("connector")
@@ -1626,99 +2353,45 @@ fn call_tool(
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
             std::fs::write(&target, content).map_err(|e| e.to_string())?;
-            Ok(format!("wrote 01_raw/{connector}/{rel}"))
+            Ok(json!({ "wrote": format!("01_raw/{connector}/{rel}") }).to_string())
         }
         "brain_graph" => {
-            let types = args
-                .get("types")
-                .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect()
-                });
+            let format = format_arg(&args)?;
+            let types = args.get("types").and_then(Value::as_array).map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            });
             let filters = graph::GraphFilters {
                 types,
                 tags: None,
                 updated_after: None,
             };
             let g = graph::build_graph(vault, &filters).map_err(|e| e.to_string())?;
-            Ok(serde_json::to_string_pretty(&g).unwrap_or_default())
-        }
-        "brain_query" => {
-            let query = args
-                .get("query")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let hits = db_op(db, vault, "brain_query", move |conn| {
-                crate::viewer::query::executor::run_on_conn(conn, &query).map_err(|e| match e {
-                    crate::viewer::query::executor::ExecError::Db(r) => crate::db::DbError::from(r),
-                    // Parse errors are not DB errors — surface them as an
-                    // Io-wrapped string so db_op returns them verbatim
-                    // (and never reopen-loops on a bad query).
-                    other => crate::db::DbError::Io(std::io::Error::other(other.to_string())),
-                })
-            })?;
-            Ok(serde_json::to_string_pretty(&hits).unwrap_or_default())
-        }
-        "brain_embedding_status" => {
-            // Read which embedder `cached_for_vault` serves for this
-            // vault right now — same code path as the indexer and
-            // search, so the status reflects what's actually generating
-            // chunk vectors. Cheap when the files are absent or the
-            // model is already cached; otherwise this call pays the
-            // one-time load that later searches then reuse.
-            // TODO(S06): report from a cache peek (loaded / failed / not yet loaded) instead of forcing a load here.
-            let embedder = crate::embedding::cached_for_vault(vault);
-            let model_dir = crate::vault::layout::models_dir(vault).join("bge-m3");
-            let semantic = embedder.name() == "bge-m3";
-            // Chunk count via db_op (timeout-bounded, self-healing).
-            // Reported as a number on success, or an explicit
-            // `{ "error": "<msg>" }` object on failure — never a silent
-            // `null` (which the bug report flagged as indistinguishable
-            // from "index genuinely empty").
-            let chunk_count_indexed = match db_op(db, vault, "brain_embedding_status", |conn| {
-                Ok(conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get::<_, i64>(0))?)
-            }) {
-                Ok(n) => json!(n),
-                Err(msg) => json!({ "error": msg }),
+            let payload = match format {
+                Format::Detailed => json!({
+                    "node_count": g.nodes.len(),
+                    "edge_count": g.edges.len(),
+                    "nodes": g.nodes,
+                    "edges": g.edges,
+                }),
+                Format::Concise => json!({
+                    "node_count": g.nodes.len(),
+                    "edge_count": g.edges.len(),
+                    "nodes": g.nodes.iter().map(|n| &n.id).collect::<Vec<_>>(),
+                    "edges": g.edges.iter().map(|e| [&e.source, &e.target]).collect::<Vec<_>>(),
+                }),
             };
-            Ok(serde_json::to_string_pretty(&json!({
-                "embedder": embedder.name(),
-                "semantic": semantic,
-                "model_dir": display_path(&model_dir),
-                "dim": embedder.dim(),
-                "chunk_count_indexed": chunk_count_indexed,
-            }))
-            .unwrap_or_default())
+            Ok(payload.to_string())
         }
-        "brain_list_tags" => {
-            let rows = db_op(db, vault, "brain_list_tags", |conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT tag, COUNT(*) AS count FROM page_tags \
-                     GROUP BY tag ORDER BY count DESC, tag ASC",
-                )?;
-                let mapped: Result<Vec<(String, i64)>, _> = stmt
-                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
-                    .collect();
-                Ok(mapped?)
-            })?;
-            let tags: Vec<Value> = rows
-                .into_iter()
-                .map(|(tag, count)| json!({ "tag": tag, "count": count }))
-                .collect();
-            Ok(serde_json::to_string_pretty(&json!({ "tags": tags })).unwrap_or_default())
-        }
+        "brain_query" => query(&args, vault, db),
         "brain_lint_report" => {
+            let format = format_arg(&args)?;
+            let kind = optional_str(&args, "kind")?;
             // Read-only view of the same lint pass that drives the
-            // auto-commit watcher and the Tauri toast bridge. Errors
-            // block commits in the watcher; warnings don't. Surfacing
-            // both here lets an agent triage which to fix first — and
-            // closes the loop where the user could see a `wiki-lint-
-            // error` toast but the LLM had no MCP path to inspect it.
-            // Plus the hygiene warnings (orphan, duplicate-candidate) and
-            // info `notes`; the watcher's pre-commit gate keeps the fast
+            // auto-commit watcher and the Tauri toast bridge, plus the
+            // hygiene warnings (orphan, duplicate-candidate) and info
+            // `notes`; the watcher's pre-commit gate keeps the fast
             // filesystem-only lint. The index reads go through db_op
             // (lazy open, timeout, reopen); if they fail, a
             // `hygiene-skipped` note says why instead of the hygiene
@@ -1731,238 +2404,626 @@ fn call_tool(
                 crate::wiki::hygiene::load_rows,
             );
             lint::add_hygiene(&mut report, vault, rows);
-            Ok(serde_json::to_string_pretty(&report).unwrap_or_default())
-        }
-        "brain_eval" => {
-            use crate::viewer::eval;
-            let set = eval::load_eval_set(vault).map_err(|e| e.to_string())?;
-            if set.is_empty() {
-                return Err(format!(
-                    "the eval set is empty — add test questions with brain_eval_add \
-                     (stored in 00_meta/{})",
-                    eval::EVAL_SET_FILENAME
-                ));
+            if let Some(kind) = kind {
+                report.errors.retain(|e| e.kind == kind);
+                report.warnings.retain(|w| w.kind == kind);
             }
-            // Embed the queries BEFORE db_op (like brain_search): the first
-            // call may load the model, and N query embeddings must not
-            // count against the index timeout.
-            let embedder = crate::embedding::cached_for_vault(vault);
-            let vectors = eval::embed_queries(embedder.as_ref(), &set);
-            // One bounded db_op per query: a large set on a large vault
-            // must not hold the lock (and risk the timeout) as one block.
-            let facts = db_op(db, vault, "brain_eval", eval::index_facts)?;
-            let mut results = Vec::with_capacity(set.len());
-            for (entry, vector) in set.iter().zip(vectors) {
-                if entry.expected.is_empty() {
-                    results.push(None);
-                    continue;
-                }
-                let entry = entry.clone();
-                let result = db_op(db, vault, "brain_eval", move |conn| {
-                    eval::eval_query_on_conn(conn, &entry, &vector)
-                })?;
-                results.push(Some(result));
+            Ok(lint_payload(&report, format).to_string())
+        }
+        "brain_eval" => match tools::resolve_action(name, args.get("action"))? {
+            Some("add") => eval_add(&args, vault),
+            _ => eval_run(vault, db),
+        },
+        "brain_dream" => match tools::resolve_action(name, args.get("action"))? {
+            Some("queue") => {
+                let refresh = match args.get("refresh") {
+                    None | Some(Value::Null) => false,
+                    Some(Value::Bool(b)) => *b,
+                    Some(_) => return Err("'refresh' must be a boolean".to_string()),
+                };
+                let queue = dream_queue(vault, db, refresh)?;
+                Ok(serde_json::to_string_pretty(&queue).unwrap_or_default())
             }
-            let report = eval::assemble_report(&set, results, &facts, embedder.name());
-            if let Err(err) = eval::append_history(vault, &report, chrono::Local::now()) {
-                tracing::warn!(?err, "could not append to the eval history");
+            _ => {
+                let entry = required_str(&args, "entry")?;
+                let line = crate::wiki::dream::append_dream_log(vault, entry, chrono::Local::now())
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::to_string(&json!({ "logged": line })).unwrap_or_default())
             }
-            Ok(serde_json::to_string_pretty(&report).unwrap_or_default())
-        }
-        "brain_eval_add" => {
-            use crate::viewer::eval;
-            let query = required_str(&args, "query")?.to_string();
-            let expected: Vec<String> = args
-                .get("expected")
-                .and_then(Value::as_array)
-                .ok_or_else(|| "missing 'expected' (array of page ids)".to_string())?
-                .iter()
-                .map(|v| {
-                    v.as_str()
-                        .map(str::to_string)
-                        .ok_or_else(|| "'expected' must contain page id strings".to_string())
-                })
-                .collect::<Result<_, _>>()?;
-            let optional = |key: &str| -> Result<Option<String>, String> {
-                match args.get(key) {
-                    None | Some(Value::Null) => Ok(None),
-                    Some(Value::String(s)) => Ok(Some(s.clone())),
-                    Some(_) => Err(format!("'{key}' must be a string")),
-                }
-            };
-            let entry = eval::add_eval_query(
-                vault,
-                eval::NewEvalQuery {
-                    id: optional("id")?,
-                    query,
-                    expected,
-                    note: optional("note")?,
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            Ok(serde_json::to_string_pretty(&json!({ "added": entry })).unwrap_or_default())
-        }
-        "brain_dream_queue" => {
-            use crate::wiki::dream;
-            let refresh = match args.get("refresh") {
-                None | Some(Value::Null) => false,
-                Some(Value::Bool(b)) => *b,
-                Some(_) => return Err("'refresh' must be a boolean".to_string()),
-            };
-            let now = chrono::Utc::now();
-            let cached = if refresh { None } else { dream::cached_queue(vault, now) };
-            let queue = match cached {
-                Some(queue) => queue,
-                None => {
-                    let rows = db_op(db, vault, "brain_dream_queue", dream::load_dream_rows)?;
-                    let queue = dream::build_queue(&rows, now);
-                    if let Err(err) = dream::write_dream_queue(vault, &queue) {
-                        tracing::warn!(?err, "could not write the dream queue");
-                    }
-                    queue
-                }
-            };
-            Ok(serde_json::to_string_pretty(&queue).unwrap_or_default())
-        }
-        "brain_dream_log" => {
-            let entry = required_str(&args, "entry")?;
-            let line = crate::wiki::dream::append_dream_log(vault, entry, chrono::Local::now())
-                .map_err(|e| e.to_string())?;
-            Ok(serde_json::to_string(&json!({ "logged": line })).unwrap_or_default())
-        }
+        },
         other => Err(format!("unknown tool: {other}")),
     }
 }
 
-/// `brain_list_pages` dispatch with optional filters and pagination.
-/// Two acceleration strategies:
-///   1. **DB fastpath** (`db: Some`) — `SELECT id FROM pages` against
-///      the SQLite index. Sub-millisecond on any vault size, completely
-///      independent of disk speed. This is the fix for the user-reported
-///      4-minute timeout on slow storage.
-///   2. **Filesystem fallback** — current `tree::list_tree` walk, which
-///      does *not* read file contents. Only used when no DB handle is
-///      available (e.g. an unindexed vault).
-///
-/// Optional arguments (all backward-compatible — no args = same shape
-/// as pre-0.2.4):
-///   - `type`: `"entities" | "concepts" | "sources" | "topics"` —
-///     restrict to one bucket; the others are returned empty.
-///   - `prefix`: id-prefix substring filter, e.g. `"entities/dextra"`.
-///   - `limit`: cap each bucket's result count.
-///   - `offset`: skip the first N results per bucket (after sort).
-fn list_pages_dispatch(
+/// A multi-action tool's result: `action` first, then the outcome's
+/// fields with every `null` left out — an absent optional field is
+/// omitted, never `null`, so it cannot clash with its `outputSchema` type.
+fn action_payload(action: &str, outcome: Value) -> Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert("action".into(), json!(action));
+    if let Value::Object(fields) = outcome {
+        payload.extend(fields.into_iter().filter(|(_, v)| !v.is_null()));
+    }
+    Value::Object(payload)
+}
+
+/// `brain_history` action `list`: the commits that touched one page.
+fn history_list(args: &Value, vault: &std::path::Path) -> Result<String, String> {
+    let id = history_page_id(args)?;
+    let limit = optional_usize(args, "limit")?.unwrap_or(20).max(1);
+    // Accept both `entities/alice` and `entities/alice.md`; route through
+    // the resolver so the repo-relative path matches how pages are stored
+    // on disk (opaque on an encrypted vault).
+    let page_path = crate::wiki::encryption::page_relpath(vault, id).map_err(|e| e.to_string())?;
+    let history = wiki_history::history_for_page(&wiki_dir(vault), &page_path, limit)
+        .map_err(|e| e.to_string())?;
+    Ok(json!({ "action": "list", "commits": history }).to_string())
+}
+
+/// `brain_history` action `restore`: the page as it was at `sha`, recorded
+/// as a `revert:` commit (append-only history). The watcher's debounce
+/// window may not have produced that commit yet, so the source sha is
+/// reported for the audit trail.
+fn history_restore(args: &Value, vault: &std::path::Path) -> Result<String, String> {
+    let id = history_page_id(args)?;
+    let sha = required_str(args, "sha")?;
+    if sha.is_empty() {
+        return Err("'sha' must not be empty".to_string());
+    }
+    let page_path = crate::wiki::encryption::page_relpath(vault, id).map_err(|e| e.to_string())?;
+    wiki_history::restore_page(&wiki_dir(vault), sha, &page_path).map_err(|e| e.to_string())?;
+    Ok(json!({ "action": "restore", "restored": id, "from_sha": sha }).to_string())
+}
+
+/// The page id of a `brain_history` call, without an optional `.md`,
+/// checked by the shared page-id guard.
+fn history_page_id(args: &Value) -> Result<&str, String> {
+    let id = required_str(args, "id")?;
+    if id.is_empty() {
+        return Err("'id' must not be empty".to_string());
+    }
+    let id = id.strip_suffix(".md").unwrap_or(id);
+    check_page_id(id)?;
+    Ok(id)
+}
+
+/// Longest snippet of a concise `brain_search` hit, in characters.
+const CONCISE_SNIPPET_CHARS: usize = 80;
+/// Character budget of a concise `brain_search` answer (roadmap D2: ten
+/// hits under 1,500 characters); over it, the scores are dropped.
+const CONCISE_SEARCH_BUDGET: usize = 1500;
+
+/// Plain text for a concise hit: no FTS5 `«»` highlight markers, runs of
+/// whitespace collapsed, cut at a word boundary so the result (with a
+/// trailing `…`) has at most `max` characters.
+fn plain_snippet(text: &str, max: usize) -> String {
+    let plain: String = text
+        .replace(['«', '»'], "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if plain.chars().count() <= max {
+        return plain;
+    }
+    let head: String = plain.chars().take(max - 1).collect();
+    let cut = match head.rfind(' ') {
+        Some(i) if i > 0 => &head[..i],
+        _ => head.as_str(),
+    };
+    format!(
+        "{}…",
+        cut.trim_end_matches([' ', ',', ';', ':', '.', '-', '…'])
+    )
+}
+
+/// The indexed `summary` of each id that has one. Best effort, through
+/// the non-building side-job path: empty when the index is unavailable.
+fn summaries_of(
+    db: &Option<crate::db::DbHandle>,
+    vault: &std::path::Path,
+    ids: Vec<String>,
+) -> std::collections::HashMap<String, String> {
+    if ids.is_empty() {
+        return Default::default();
+    }
+    db_op_if_indexed(db, vault, COUNTER_DB_TIMEOUT, move |conn| {
+        let mut stmt = conn.prepare("SELECT summary FROM pages WHERE id = ?1")?;
+        let mut out = std::collections::HashMap::new();
+        for id in ids {
+            let summary: Option<String> = stmt.query_row([&id], |r| r.get(0)).ok().flatten();
+            if let Some(summary) = summary.filter(|s| !s.trim().is_empty()) {
+                out.insert(id, summary);
+            }
+        }
+        Ok(out)
+    })
+    .unwrap_or_default()
+}
+
+/// `brain_search` default and maximum hit counts (the hybrid search
+/// itself returns at most 20).
+const SEARCH_DEFAULT_LIMIT: usize = 10;
+const SEARCH_MAX_LIMIT: usize = 20;
+
+/// `brain_query` default page size.
+const QUERY_DEFAULT_LIMIT: usize = 100;
+
+/// `brain_lookup`: existence + probable duplicates, never page bodies.
+/// An argument with `/` is a page id (checks that id and its type); a bare
+/// name is checked against all four types, with `exact` entries for ids
+/// that exist under that very slug.
+fn lookup(
     args: &Value,
     vault: &std::path::Path,
     db: &mut Option<crate::db::DbHandle>,
 ) -> Result<String, String> {
-    const BUCKETS: [&str; 4] = ["entities", "concepts", "sources", "topics"];
-
-    let type_filter = args.get("type").and_then(Value::as_str).map(String::from);
-    let prefix = args
-        .get("prefix")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let limit = args
-        .get("limit")
-        .and_then(Value::as_u64)
-        .map(|n| n as usize);
-    let offset = args
-        .get("offset")
-        .and_then(Value::as_u64)
-        .map(|n| n as usize)
-        .unwrap_or(0);
-
-    if let Some(ref t) = type_filter {
-        if !BUCKETS.contains(&t.as_str()) {
-            return Err(format!(
-                "invalid type '{t}': expected one of entities|concepts|sources|topics"
-            ));
-        }
+    let query = required_str(args, "query_or_id")?.trim();
+    if query.is_empty() {
+        return Err("'query_or_id' must not be empty".to_string());
     }
-
-    // Collect (bucket, id) pairs. Prefer the DB fastpath (timeout-
-    // bounded + self-healing via db_op); on ANY DB failure (timeout,
-    // IOERR-after-reopen, unindexed vault) fall back to the filesystem
-    // walk so the listing still works while the index is unavailable.
-    let pairs: Vec<(String, String)> =
-        match db_op(db, vault, "brain_list_pages", list_page_ids_on_conn) {
-            Ok(pairs) => pairs,
-            Err(_) => list_page_ids_via_filesystem(vault).map_err(|e| e.to_string())?,
-        };
-
-    // Server-side filtering — saves both bytes on the wire and tokens
-    // for the LLM.
-    let filtered: Vec<(String, String)> = pairs
-        .into_iter()
-        .filter(|(bucket, id)| {
-            if let Some(ref t) = type_filter {
-                if bucket != t {
-                    return false;
-                }
-            }
-            if !prefix.is_empty() && !id.starts_with(&prefix) {
-                return false;
-            }
-            true
+    let no_pending = std::collections::HashSet::new();
+    if query.contains('/') {
+        // Defend against path escapes smuggled into the id
+        // (`../../etc/passwd`, `C:/Users/x`) before any path is built.
+        check_page_id(query)?;
+        let exists = page_file_exists(vault, query);
+        // A2: other pages that are probably the same thing, from the
+        // index, best effort and never building it: without a usable
+        // index there are no matches and `matches_checked` is false.
+        // Matches whose file is gone (stale index rows) are dropped.
+        let entries = load_name_entries(db, vault);
+        let matches_checked = entries.is_some();
+        let matches = live_matches(
+            vault,
+            duplicates::find_matches(query, &entries.unwrap_or_default()),
+            &no_pending,
+        );
+        return Ok(json!({
+            "query_or_id": query,
+            "id": query,
+            "exists": exists,
+            "matches": matches,
+            "matches_checked": matches_checked,
         })
-        .collect();
-
-    // Group into the four canonical buckets and sort each one for
-    // deterministic ordering (filesystem walk order is platform-dep).
-    let mut grouped: std::collections::HashMap<&str, Vec<String>> =
-        BUCKETS.iter().map(|b| (*b, Vec::new())).collect();
-    for (bucket, id) in filtered {
-        if let Some(slot) = grouped.get_mut(bucket.as_str()) {
-            slot.push(id);
+        .to_string());
+    }
+    let entries = load_name_entries(db, vault);
+    let matches_checked = entries.is_some();
+    let entries = entries.unwrap_or_default();
+    let mut exact: Vec<Value> = Vec::new();
+    let mut matches: Vec<Value> = Vec::new();
+    for dir in crate::vault::layout::WIKI_SUBDIRS {
+        let candidate = format!("{dir}/{query}");
+        if check_page_id(&candidate).is_ok() && page_file_exists(vault, &candidate) {
+            let title = entries
+                .iter()
+                .find(|e| e.id == candidate)
+                .and_then(|e| e.title.clone());
+            exact.push(json!({ "id": candidate, "title": title, "reason": "exact" }));
         }
+        let found = live_matches(
+            vault,
+            duplicates::find_matches(&candidate, &entries),
+            &no_pending,
+        );
+        matches.extend(
+            found
+                .iter()
+                .map(|m| serde_json::to_value(m).unwrap_or_default()),
+        );
     }
-    for ids in grouped.values_mut() {
-        ids.sort();
-    }
-
-    // Apply offset+limit per bucket, then assemble the response in the
-    // canonical four-key order so the JSON shape stays stable.
-    let mut out = serde_json::Map::new();
-    for bucket in BUCKETS {
-        let ids = grouped.remove(bucket).unwrap_or_default();
-        let sliced: Vec<Value> = ids
-            .into_iter()
-            .skip(offset)
-            .take(limit.unwrap_or(usize::MAX))
-            .map(Value::String)
-            .collect();
-        out.insert(bucket.to_string(), Value::Array(sliced));
-    }
-
-    Ok(
-        serde_json::to_string_pretty(&Value::Object(out))
-            .unwrap_or_default(),
-    )
+    let exists = !exact.is_empty();
+    exact.extend(matches);
+    Ok(json!({
+        "query_or_id": query,
+        "exists": exists,
+        "matches": exact,
+        "matches_checked": matches_checked,
+    })
+    .to_string())
 }
 
-/// DB fastpath: `SELECT id FROM pages` and derive bucket from the
-/// id prefix (`entities/alice` → `entities`). Matches the layout
-/// already used by `tree::list_tree`. Unknown buckets are silently
-/// dropped — they shouldn't occur unless the index drifts from the
-/// filesystem schema.
-fn list_page_ids_on_conn(
-    conn: &rusqlite::Connection,
-) -> crate::db::DbResult<Vec<(String, String)>> {
-    let mut stmt = conn.prepare("SELECT id FROM pages")?;
-    let rows = stmt.query_map([], |row| {
-        let id: String = row.get(0)?;
-        Ok(id)
-    })?;
-    let mut out = Vec::new();
-    for r in rows {
-        let id = r?;
-        if let Some((bucket, _)) = id.split_once('/') {
-            out.push((bucket.to_string(), id));
+/// `brain_query` (absorbs the former page-listing and tag-listing
+/// tools): hits for a filter expression, or tag counts with
+/// `facet: "tags"`. Empty / `*` lists every current page; then, and only
+/// then, an unavailable index falls back to a file-system listing.
+fn query(
+    args: &Value,
+    vault: &std::path::Path,
+    db: &mut Option<crate::db::DbHandle>,
+) -> Result<String, String> {
+    let format = format_arg(args)?;
+    let raw = optional_str(args, "query")?.unwrap_or("").trim();
+    if raw.starts_with("facet:") {
+        return Err(
+            "facets are an argument, not query syntax: pass {\"facet\": \"tags\"}".to_string(),
+        );
+    }
+    let prefix = optional_str(args, "prefix")?.unwrap_or("");
+    let limit = optional_usize(args, "limit")?
+        .unwrap_or(QUERY_DEFAULT_LIMIT)
+        .max(1);
+    let offset = optional_usize(args, "offset")?.unwrap_or(0);
+    let facet = optional_str(args, "facet")?;
+    if let Some(other) = facet.filter(|f| *f != "tags") {
+        return Err(format!("unknown facet '{other}' (one of: tags)"));
+    }
+    let list_all = raw.is_empty() || raw == "*";
+
+    if facet.is_some() && list_all && prefix.is_empty() {
+        // Every tag of every indexed page (the former tag listing).
+        let rows = db_op(db, vault, "brain_query", |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT tag, COUNT(*) AS count FROM page_tags \
+                 GROUP BY tag ORDER BY count DESC, tag ASC",
+            )?;
+            let mapped: Result<Vec<(String, i64)>, _> = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+                .collect();
+            Ok(mapped?)
+        })?;
+        return Ok(tags_payload(rows).to_string());
+    }
+
+    // "*" is not query syntax: the listing is every current page.
+    let expression = if list_all {
+        "valid:now".to_string()
+    } else {
+        raw.to_string()
+    };
+    let mut note: Option<&str> = None;
+    let mut hits = match db_op(db, vault, "brain_query", move |conn| {
+        crate::viewer::query::executor::run_on_conn(conn, &expression).map_err(|e| match e {
+            crate::viewer::query::executor::ExecError::Db(r) => crate::db::DbError::from(r),
+            // Parse errors are not DB errors — surface them as an
+            // Io-wrapped string so db_op returns them verbatim
+            // (and never reopen-loops on a bad query).
+            other => crate::db::DbError::Io(std::io::Error::other(other.to_string())),
+        })
+    }) {
+        Ok(hits) => hits,
+        Err(_) if list_all && facet.is_none() => {
+            note =
+                Some("the index is unavailable — listed from the file system (ids and types only)");
+            filesystem_hits(vault).map_err(|e| e.to_string())?
+        }
+        Err(err) => return Err(err),
+    };
+    if !prefix.is_empty() {
+        hits.retain(|h| h.id.starts_with(prefix));
+    }
+
+    if facet.is_some() {
+        let ids: std::collections::HashSet<String> = hits.into_iter().map(|h| h.id).collect();
+        let rows = db_op(db, vault, "brain_query", move |conn| {
+            let mut stmt = conn.prepare("SELECT page_id, tag FROM page_tags")?;
+            let mut counts: std::collections::BTreeMap<String, i64> = Default::default();
+            for row in
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            {
+                let (page_id, tag) = row?;
+                if ids.contains(&page_id) {
+                    *counts.entry(tag).or_default() += 1;
+                }
+            }
+            let mut rows: Vec<(String, i64)> = counts.into_iter().collect();
+            rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            Ok(rows)
+        })?;
+        return Ok(tags_payload(rows).to_string());
+    }
+
+    let total = hits.len();
+    let page: Vec<Value> = hits
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(|h| match format {
+            Format::Detailed => serde_json::to_value(h).unwrap_or_default(),
+            Format::Concise => json!({ "id": h.id, "type": h.r#type, "title": h.title }),
+        })
+        .collect();
+    let mut payload = json!({
+        "total": total,
+        "offset": offset,
+        "returned": page.len(),
+        "hits": page,
+    });
+    let next = offset + payload["returned"].as_u64().unwrap_or(0) as usize;
+    if next < total {
+        payload["next_offset"] = json!(next);
+    }
+    if let Some(note) = note {
+        payload["note"] = json!(note);
+    }
+    Ok(payload.to_string())
+}
+
+fn tags_payload(rows: Vec<(String, i64)>) -> Value {
+    let tags: Vec<Value> = rows
+        .into_iter()
+        .map(|(tag, count)| json!({ "tag": tag, "count": count }))
+        .collect();
+    json!({ "facet": "tags", "tags": tags })
+}
+
+/// File-system fallback for `brain_query *` while the index is
+/// unavailable: ids and types only, sorted by id.
+fn filesystem_hits(
+    vault: &std::path::Path,
+) -> Result<Vec<crate::viewer::query::executor::QueryHit>, ViewerErrAdapter> {
+    let mut pairs = list_page_ids_via_filesystem(vault)?;
+    pairs.sort_by(|a, b| a.1.cmp(&b.1));
+    Ok(pairs
+        .into_iter()
+        .map(|(bucket, id)| crate::viewer::query::executor::QueryHit {
+            r#type: match bucket.as_str() {
+                "entities" => "entity",
+                "concepts" => "concept",
+                "sources" => "source",
+                _ => "topic",
+            }
+            .to_string(),
+            path: String::new(),
+            title: String::new(),
+            updated_at: None,
+            reads: 0,
+            search_hits: 0,
+            last_read_at: None,
+            valid_from: None,
+            valid_to: None,
+            superseded_by: None,
+            id,
+        })
+        .collect())
+}
+
+/// `brain_lint_report` payload. Concise: every error (they block
+/// commits; usually few), warning counts per kind, notes and a hint how
+/// to get one kind's warnings. Detailed: the full report.
+fn lint_payload(report: &lint::LintReport, format: Format) -> Value {
+    let mut payload = json!({
+        "error_count": report.errors.len(),
+        "warning_count": report.warnings.len(),
+        "errors": report.errors,
+    });
+    match format {
+        Format::Detailed => payload["warnings"] = json!(report.warnings),
+        Format::Concise => {
+            let mut kinds: std::collections::BTreeMap<&str, usize> = Default::default();
+            for w in &report.warnings {
+                *kinds.entry(w.kind.as_str()).or_default() += 1;
+            }
+            payload["warning_kinds"] = json!(kinds);
+            if !report.warnings.is_empty() {
+                payload["hint"] = json!(
+                    "warnings of one kind: brain_lint_report with response_format \"detailed\" and kind \"<kind>\""
+                );
+            }
         }
     }
-    Ok(out)
+    if !report.notes.is_empty() {
+        payload["notes"] = json!(report.notes);
+    }
+    payload
+}
+
+/// `brain_eval` action `run`.
+fn eval_run(
+    vault: &std::path::Path,
+    db: &mut Option<crate::db::DbHandle>,
+) -> Result<String, String> {
+    use crate::viewer::eval;
+    let set = eval::load_eval_set(vault).map_err(|e| e.to_string())?;
+    if set.is_empty() {
+        return Err(format!(
+            "the eval set is empty — add test questions with brain_eval (action \"add\") \
+             (stored in 00_meta/{})",
+            eval::EVAL_SET_FILENAME
+        ));
+    }
+    // Embed the queries BEFORE db_op (like brain_search): the first
+    // call may load the model, and N query embeddings must not
+    // count against the index timeout.
+    let embedder = crate::embedding::cached_for_vault(vault);
+    let vectors = eval::embed_queries(embedder.as_ref(), &set);
+    // One bounded db_op per query: a large set on a large vault
+    // must not hold the lock (and risk the timeout) as one block.
+    let facts = db_op(db, vault, "brain_eval", eval::index_facts)?;
+    let mut results = Vec::with_capacity(set.len());
+    for (entry, vector) in set.iter().zip(vectors) {
+        if entry.expected.is_empty() {
+            results.push(None);
+            continue;
+        }
+        let entry = entry.clone();
+        let result = db_op(db, vault, "brain_eval", move |conn| {
+            eval::eval_query_on_conn(conn, &entry, &vector)
+        })?;
+        results.push(Some(result));
+    }
+    let report = eval::assemble_report(&set, results, &facts, embedder.name());
+    if let Err(err) = eval::append_history(vault, &report, chrono::Local::now()) {
+        tracing::warn!(?err, "could not append to the eval history");
+    }
+    Ok(serde_json::to_string_pretty(&report).unwrap_or_default())
+}
+
+/// `brain_eval` action `add`.
+fn eval_add(args: &Value, vault: &std::path::Path) -> Result<String, String> {
+    use crate::viewer::eval;
+    let query = required_str(args, "query")?.to_string();
+    let expected: Vec<String> = args
+        .get("expected")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "missing 'expected' (array of page ids)".to_string())?
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| "'expected' must contain page id strings".to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    let entry = eval::add_eval_query(
+        vault,
+        eval::NewEvalQuery {
+            id: optional_str(args, "id")?.map(str::to_string),
+            query,
+            expected,
+            note: optional_str(args, "note")?.map(str::to_string),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(serde_json::to_string_pretty(&json!({ "added": entry })).unwrap_or_default())
+}
+
+/// `brain_write_batch`: three phases — see the tool descriptor for the
+/// user-facing rationale. Code-side rationale: parsing all pages up front
+/// turns a multi-page write into an all-or-nothing operation against
+/// malformed input. Lint runs once at the end with the full batch already
+/// on disk, so intra-batch references resolve (the cascade is gone).
+fn write_batch(
+    args: &Value,
+    vault: &std::path::Path,
+    db: &mut Option<crate::db::DbHandle>,
+) -> Result<String, String> {
+    let pages = args
+        .get("pages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "missing 'pages' array".to_string())?;
+    if pages.is_empty() {
+        return Err("'pages' must contain at least one entry".to_string());
+    }
+
+    // Phase 1 — validate + buffer.
+    struct Prepared {
+        id: String,
+        target: std::path::PathBuf,
+        normalized_content: String,
+        previous_size_bytes: i64,
+    }
+    let mut prepared: Vec<Prepared> = Vec::with_capacity(pages.len());
+    let allow_all = allow_duplicate_arg(args)?;
+    // A2 duplicate check: index entries (loaded once, only if some
+    // entry needs the check) plus the batch's earlier entries.
+    let mut index_names: Option<Option<Vec<duplicates::NameEntry>>> = None;
+    let mut batch_names: Vec<duplicates::NameEntry> = Vec::new();
+    let mut batch_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut matches_checked = true;
+    for (idx, entry) in pages.iter().enumerate() {
+        let id = entry
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("pages[{idx}]: missing 'id'"))?;
+        check_page_id(id).map_err(|e| format!("pages[{idx}]: {e}"))?;
+        let content = entry
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("pages[{idx}]: missing 'content'"))?;
+        let parsed = page::parse(content)
+            .map_err(|e| format!("pages[{idx}] ({id}): invalid content: {e}"))?;
+        let allow_duplicate =
+            allow_all || allow_duplicate_arg(entry).map_err(|e| format!("pages[{idx}]: {e}"))?;
+        let target = crate::wiki::encryption::page_path(vault, id).map_err(|e| e.to_string())?;
+        if !allow_duplicate && !target.is_file() {
+            let index = index_names.get_or_insert_with(|| load_name_entries(db, vault));
+            if index.is_none() {
+                matches_checked = false;
+            }
+            let candidates: Vec<duplicates::NameEntry> = index
+                .iter()
+                .flatten()
+                .chain(&batch_names)
+                .cloned()
+                .collect();
+            if let Some(refusal) = creation_refusal(vault, id, &candidates, &batch_ids) {
+                return Err(format!("pages[{idx}] ({id}): {refusal}"));
+            }
+        }
+        batch_names.push(duplicates::NameEntry {
+            id: id.to_string(),
+            title: parsed.frontmatter.title.clone(),
+            aliases: parsed.frontmatter.aliases.clone(),
+            distinct_from: parsed.frontmatter.distinct_from.clone(),
+        });
+        batch_ids.insert(id.to_string());
+        let normalized_body = page::normalize_internal_links(strip_superseded_notice(&parsed.body));
+        let normalized_content = if normalized_body == parsed.body {
+            content.to_string()
+        } else {
+            rebuild_page_file(content, &normalized_body)
+        };
+        let previous_size_bytes = std::fs::metadata(&target)
+            .map(|m| m.len() as i64)
+            .unwrap_or(0);
+        prepared.push(Prepared {
+            id: id.to_string(),
+            target,
+            normalized_content,
+            previous_size_bytes,
+        });
+    }
+
+    // Phase 2 — write all files. If an IO error hits mid-batch the error
+    // names the failing page; the partial state is consciously left as-is
+    // so the user can inspect (we deliberately do not rollback the pages
+    // that already wrote, which would itself be an IO sequence that can
+    // fail).
+    for w in &prepared {
+        if let Some(parent) = w.target.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("create dir for {}: {e}", w.id))?;
+        }
+        std::fs::write(&w.target, &w.normalized_content)
+            .map_err(|e| format!("write {}: {e}", w.id))?;
+    }
+
+    // Phase 3 — single lint pass, scoped to the union of touched paths.
+    let full_report = lint::lint(vault).map_err(|e| e.to_string())?;
+    let target_set: std::collections::HashSet<String> = prepared
+        .iter()
+        .map(|w| w.target.to_string_lossy().replace('\\', "/"))
+        .collect();
+    let scoped_errors: Vec<&lint::LintError> = full_report
+        .errors
+        .iter()
+        .filter(|e| target_set.contains(&e.path.replace('\\', "/")))
+        .collect();
+    let scoped_warnings: Vec<&lint::LintWarning> = full_report
+        .warnings
+        .iter()
+        .filter(|w| target_set.contains(&w.path.replace('\\', "/")))
+        .collect();
+    if !scoped_errors.is_empty() {
+        let detail = serde_json::to_string(&scoped_errors).unwrap_or_else(|_| "[]".to_string());
+        return Err(format!(
+            "batch written ({} pages) but lint failed: {} error(s) across the batch\n{detail}",
+            prepared.len(),
+            scoped_errors.len()
+        ));
+    }
+    // Per-page summary including page-scoped warnings.
+    let results: Vec<Value> = prepared
+        .iter()
+        .map(|w| {
+            let new_size_bytes = w.normalized_content.len() as i64;
+            let page_warnings: Vec<&lint::LintWarning> = scoped_warnings
+                .iter()
+                .copied()
+                .filter(|wn| paths_equal(&wn.path, &w.target))
+                .collect();
+            json!({
+                "id": w.id,
+                "previous_size_bytes": w.previous_size_bytes,
+                "new_size_bytes": new_size_bytes,
+                "warnings": page_warnings,
+            })
+        })
+        .collect();
+    let mut response = json!({ "wrote": results });
+    if !matches_checked {
+        response["matches_checked"] = json!(false);
+    }
+    Ok(serde_json::to_string_pretty(&response).unwrap_or_default())
 }
 
 /// Filesystem fallback for vaults that haven't been DB-indexed yet.
@@ -1973,9 +3034,8 @@ fn list_page_ids_via_filesystem(
     vault: &std::path::Path,
 ) -> Result<Vec<(String, String)>, ViewerErrAdapter> {
     let t = tree::list_tree(vault).map_err(ViewerErrAdapter)?;
-    let mut out = Vec::with_capacity(
-        t.entities.len() + t.concepts.len() + t.sources.len() + t.topics.len(),
-    );
+    let mut out =
+        Vec::with_capacity(t.entities.len() + t.concepts.len() + t.sources.len() + t.topics.len());
     for id in t.entities {
         out.push(("entities".to_string(), id));
     }
@@ -1994,6 +3054,7 @@ fn list_page_ids_via_filesystem(
 /// Adapter so `?`-propagation from `tree::list_tree` (returns
 /// `ViewerError`) lands as a `String` cleanly through the
 /// `Result<…, String>` boundary used by `call_tool`.
+#[derive(Debug)]
 struct ViewerErrAdapter(crate::viewer::ViewerError);
 
 impl std::fmt::Display for ViewerErrAdapter {
@@ -2035,7 +3096,11 @@ fn patch_section(body: &str, heading: &str, new_content: &str) -> String {
                 .iter()
                 .enumerate()
                 .skip(start + 1)
-                .find_map(|(j, l)| heading_level(l).filter(|lvl| *lvl <= target_level).map(|_| j))
+                .find_map(|(j, l)| {
+                    heading_level(l)
+                        .filter(|lvl| *lvl <= target_level)
+                        .map(|_| j)
+                })
                 .unwrap_or(lines.len());
             let mut out = String::new();
             for l in &lines[..start] {
@@ -2070,7 +3135,9 @@ fn patch_section(body: &str, heading: &str, new_content: &str) -> String {
 fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
     match args.get(key) {
         None | Some(Value::Null) => Err(format!("missing '{key}'")),
-        Some(v) => v.as_str().ok_or_else(|| format!("'{key}' must be a string")),
+        Some(v) => v
+            .as_str()
+            .ok_or_else(|| format!("'{key}' must be a string")),
     }
 }
 
@@ -2204,16 +3271,32 @@ fn record_search_hits(db: &Option<crate::db::DbHandle>, vault: &std::path::Path,
     });
 }
 
-/// The MCP payload of a page read: the page view verbatim, plus — when
-/// its frontmatter has `superseded_by` (Slice C) — the fields
-/// `superseded_by: <id>` and `notice: "Superseded by <id>"`. The body is
-/// never changed (an agent would write an injected line back). Also
-/// returns the successor id.
-fn page_payload(page: tree::PageView) -> (Value, Option<String>) {
-    let successor = serde_json::from_str::<Value>(&page.frontmatter)
-        .ok()
-        .and_then(|fm| fm.get("superseded_by").and_then(Value::as_str).map(str::to_string));
-    let mut payload = serde_json::to_value(&page).unwrap_or_else(|_| json!({}));
+/// The MCP payload of a page read, plus — when its frontmatter has
+/// `superseded_by` (Slice C) — the fields `superseded_by: <id>` and
+/// `notice: "Superseded by <id>"`. Detailed: the page view verbatim (id,
+/// title, frontmatter as a JSON string, body). Concise: id, title, the
+/// frontmatter `summary` (when set) and body. The body is never changed
+/// (an agent would write an injected line back). Also returns the
+/// successor id.
+fn page_payload(page: tree::PageView, format: Format) -> (Value, Option<String>) {
+    let frontmatter = serde_json::from_str::<Value>(&page.frontmatter).ok();
+    let field = |key: &str| {
+        frontmatter
+            .as_ref()
+            .and_then(|fm| fm.get(key).and_then(Value::as_str).map(str::to_string))
+    };
+    let successor = field("superseded_by");
+    let mut payload = match format {
+        Format::Detailed => serde_json::to_value(&page).unwrap_or_else(|_| json!({})),
+        Format::Concise => {
+            let mut concise = json!({ "id": page.id, "title": page.title });
+            if let Some(summary) = field("summary") {
+                concise["summary"] = json!(summary);
+            }
+            concise["body"] = json!(page.body);
+            concise
+        }
+    };
     if let Some(s) = &successor {
         payload["superseded_by"] = json!(s);
         payload["notice"] = json!(superseded_notice(s));
@@ -2243,10 +3326,10 @@ fn strip_superseded_notice(body: &str) -> &str {
 /// The shared page-id guard ([`refactor::validate_page_id`]) for every
 /// tool that turns an id into a path: relative `<type>/<slug>` under the
 /// wiki, no drive letters, `..`, backslashes or control characters.
-/// Guarded arms: get_page, get_pages (per id), get_context, page_exists,
-/// write_page, write_batch (per page), patch_page, get_page_history,
-/// restore_page, rename_page, merge_pages, delete_page (the last three
-/// inside `wiki::refactor`). Any new arm that resolves a page id must call
+/// Guarded arms: get_pages (per id, with or without context), lookup (id
+/// form; the name form validates each candidate id), write_page,
+/// write_batch (per page), patch_page, history (list and restore) and
+/// refactor (rename, merge, delete — inside `wiki::refactor`). Any new arm that resolves a page id must call
 /// this first. `brain_write_raw_file` uses [`check_relative_path`].
 fn check_page_id(id: &str) -> Result<(), String> {
     refactor::validate_page_id(id).map_err(|e| e.to_string())
@@ -2287,7 +3370,7 @@ fn forget_in_index(
 ) {
     // The stored dream queue names pages by id; after a rename, merge or
     // delete it is out of date, so drop the cache — the next
-    // brain_dream_queue recomputes it.
+    // brain_dream queue recomputes it.
     match std::fs::remove_file(crate::wiki::dream::dream_queue_path(vault)) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -2353,7 +3436,9 @@ fn write_normalized_page(
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let previous_size_bytes = std::fs::metadata(&target).map(|m| m.len() as i64).unwrap_or(0);
+    let previous_size_bytes = std::fs::metadata(&target)
+        .map(|m| m.len() as i64)
+        .unwrap_or(0);
     std::fs::write(&target, normalized_content).map_err(|e| e.to_string())?;
     let new_size_bytes = normalized_content.len() as i64;
 
@@ -2439,8 +3524,14 @@ mod rebuild_page_tests {
         let out = patch_section(body, "## Kontakt", "neu");
         assert!(out.contains("## Kontakt\n\nneu"), "section replaced: {out}");
         assert!(!out.contains("alt"), "old section body gone: {out}");
-        assert!(out.contains("Intro."), "content before the section preserved");
-        assert!(out.contains("## Andere\n\nbleibt"), "later section untouched: {out}");
+        assert!(
+            out.contains("Intro."),
+            "content before the section preserved"
+        );
+        assert!(
+            out.contains("## Andere\n\nbleibt"),
+            "later section untouched: {out}"
+        );
     }
 
     #[test]
@@ -2448,7 +3539,10 @@ mod rebuild_page_tests {
         let body = "# Title\n\nIntro.\n";
         let out = patch_section(body, "## Neu", "inhalt");
         assert!(out.contains("Intro."), "existing content kept");
-        assert!(out.trim_end().ends_with("## Neu\n\ninhalt"), "new section appended: {out}");
+        assert!(
+            out.trim_end().ends_with("## Neu\n\ninhalt"),
+            "new section appended: {out}"
+        );
     }
 
     #[test]
@@ -2457,9 +3551,15 @@ mod rebuild_page_tests {
         let body = "## X\n\nold\n\n### sub\n\nsubtext\n\n## Y\n\nyeahs\n";
         let out = patch_section(body, "## X", "replaced");
         assert!(out.contains("## X\n\nreplaced"), "X replaced");
-        assert!(!out.contains("### sub"), "deeper subsection was part of X and is gone: {out}");
+        assert!(
+            !out.contains("### sub"),
+            "deeper subsection was part of X and is gone: {out}"
+        );
         assert!(!out.contains("subtext"), "sub content gone");
-        assert!(out.contains("## Y\n\nyeahs"), "sibling section Y preserved: {out}");
+        assert!(
+            out.contains("## Y\n\nyeahs"),
+            "sibling section Y preserved: {out}"
+        );
     }
 }
 
@@ -2477,88 +3577,67 @@ mod tests {
         crate::vault::marker::write_marker(vault, &marker).unwrap();
     }
 
-    #[test]
-    fn initialize_response_includes_protocol_and_server_metadata() {
-        let req = RpcRequest {
+    fn request(id: i64, method: &str, params: Value) -> RpcRequest {
+        RpcRequest {
             jsonrpc: "2.0".into(),
-            id: Some(json!(1)),
-            method: "initialize".into(),
-            params: json!({}),
-        };
-        let resp = handle_request(&req, None, &mut None);
-        assert!(resp.contains(PROTOCOL_VERSION));
-        assert!(resp.contains(&format!("\"name\":\"{SERVER_NAME}\"")));
+            id: Some(json!(id)),
+            method: method.into(),
+            params,
+        }
+    }
+
+    /// One request against a fresh process (no vault, no index, no
+    /// handshake yet).
+    fn handle(req: &RpcRequest) -> String {
+        handle_request(req, None, &mut None, &mut Session::default())
     }
 
     #[test]
-    fn tools_list_advertises_every_tool_handler_we_implement() {
-        // Discovery test — `tools/list` is what every MCP client calls
-        // to learn what BRAIN can do. If a handler exists in `call_tool`
-        // but its descriptor was forgotten, no LLM ever finds it. Spot
-        // check covers the two 0.2.4 additions plus a few load-bearing
-        // older tools so a future deletion gets caught here.
-        let req = RpcRequest {
-            jsonrpc: "2.0".into(),
-            id: Some(json!(2)),
-            method: "tools/list".into(),
-            params: json!({}),
-        };
-        let resp = handle_request(&req, None, &mut None);
-        for name in [
-            "brain_ping",
-            "brain_search",
-            "brain_get_page",
-            "brain_get_pages",
-            "brain_page_exists",
-            "brain_get_context",
-            "brain_list_pages",
-            "brain_write_page",
-            "brain_patch_page",
-            "brain_write_batch",
-            "brain_write_raw_file",
-            "brain_get_page_history",
-            "brain_restore_page",
-            "brain_rename_page",
-            "brain_merge_pages",
-            "brain_delete_page",
-            "brain_graph",
-            "brain_query",
-            "brain_list_tags",
-            "brain_embedding_status",
-            "brain_lint_report",
-            "brain_eval",
-            "brain_eval_add",
-            "brain_dream_queue",
-            "brain_dream_log",
-        ] {
-            assert!(
-                resp.contains(name),
-                "tools/list response is missing {name}: {resp}"
-            );
-        }
+    fn initialize_response_names_the_server() {
+        let resp = handle(&request(1, "initialize", json!({})));
+        assert!(
+            resp.contains(&format!("\"name\":\"{SERVER_NAME}\"")),
+            "{resp}"
+        );
+    }
+
+    #[test]
+    fn tools_list_advertises_exactly_the_catalogue_in_order() {
+        let resp: Value =
+            serde_json::from_str(&handle(&request(2, "tools/list", json!({})))).unwrap();
+        let names: Vec<&str> = resp["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, tools::TOOL_NAMES);
     }
 
     #[test]
     fn tools_call_without_vault_returns_a_descriptive_error() {
-        let req = RpcRequest {
-            jsonrpc: "2.0".into(),
-            id: Some(json!(3)),
-            method: "tools/call".into(),
-            params: json!({"name": "brain_list_pages", "arguments": {}}),
-        };
-        let resp = handle_request(&req, None, &mut None);
+        let resp = handle(&request(
+            3,
+            "tools/call",
+            json!({"name": "brain_query", "arguments": {}}),
+        ));
         assert!(resp.contains("no Brain vault is mounted"));
     }
 
     #[test]
+    fn tools_call_without_vault_is_a_tool_error_not_a_protocol_error() {
+        let resp: Value = serde_json::from_str(&handle(&request(
+            3,
+            "tools/call",
+            json!({"name": "brain_query", "arguments": {}}),
+        )))
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], json!(true));
+    }
+
+    #[test]
     fn unknown_method_returns_method_not_found_error() {
-        let req = RpcRequest {
-            jsonrpc: "2.0".into(),
-            id: Some(json!(4)),
-            method: "does_not_exist".into(),
-            params: json!({}),
-        };
-        let resp = handle_request(&req, None, &mut None);
+        let resp = handle(&request(4, "does_not_exist", json!({})));
         assert!(resp.contains("method not found"));
         assert!(
             !resp.contains("server/discover"),
@@ -2567,25 +3646,21 @@ mod tests {
     }
 
     #[test]
-    fn server_discover_gets_a_specific_method_not_found_naming_our_protocol_version() {
-        let req = RpcRequest {
-            jsonrpc: "2.0".into(),
-            id: Some(json!("discover-1")),
-            method: "server/discover".into(),
-            params: json!({ "_meta": {
-                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                "io.modelcontextprotocol/clientCapabilities": {}
-            }}),
-        };
-        let resp: Value = serde_json::from_str(&handle_request(&req, None, &mut None)).unwrap();
+    fn server_discover_without_modern_meta_keeps_the_legacy_method_not_found() {
+        let resp: Value =
+            serde_json::from_str(&handle(&request(5, "server/discover", json!({})))).unwrap();
         // -32601 (not a modern code such as -32022): a dual-era client must
         // read this as "legacy server" and fall back to `initialize`.
-        assert_eq!(resp["error"]["code"], -32601);
-        assert_eq!(resp["id"], "discover-1");
-        let msg = resp["error"]["message"].as_str().unwrap();
-        assert!(msg.contains("server/discover (MCP 2026-07-28) not yet supported"), "{msg}");
-        assert!(msg.contains(PROTOCOL_VERSION), "{msg}");
-        assert!(msg.contains("initialize handshake"), "{msg}");
+        assert_eq!(
+            (
+                resp["error"]["code"].clone(),
+                resp["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("initialize handshake")
+            ),
+            (json!(-32601), true)
+        );
     }
 
     #[test]
@@ -2653,7 +3728,7 @@ mod tests {
             method: "notifications/initialized".into(),
             params: json!({}),
         };
-        let resp = handle_request(&req, None, &mut None);
+        let resp = handle(&req);
         assert!(
             resp.is_empty(),
             "notifications must yield zero bytes, got: '{resp}'"
@@ -2668,8 +3743,11 @@ mod tests {
             method: "notifications/cancelled".into(),
             params: json!({}),
         };
-        let resp = handle_request(&req, None, &mut None);
-        assert!(resp.is_empty(), "unknown notifications must not get a response");
+        let resp = handle(&req);
+        assert!(
+            resp.is_empty(),
+            "unknown notifications must not get a response"
+        );
     }
 
     #[test]
@@ -2683,18 +3761,18 @@ mod tests {
             method: "notifications/something".into(),
             params: json!({}),
         };
-        let resp = handle_request(&req, None, &mut None);
+        let resp = handle(&req);
         assert!(resp.is_empty());
     }
 
     #[test]
-    fn brain_get_context_does_not_emit_lint_error_after_frontmatter_strip() {
+    fn get_pages_with_context_does_not_emit_lint_error_after_frontmatter_strip() {
         // Regression: read_page strips the YAML frontmatter from the body,
         // so re-parsing it would fail with "missing frontmatter delimiter"
         // → surfaced as a `lint:` error to the calling LLM. The fix uses
         // extract_wiki_links directly on the body.
-        use tempfile::TempDir;
         use crate::vault::layout::{ensure_skeleton, wiki_dir};
+        use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
         seed_marker(tmp.path());
@@ -2707,18 +3785,21 @@ mod tests {
         .unwrap();
         let result = call_tool(
             &json!({
-                "name": "brain_get_context",
-                "arguments": { "id": "entities/alice" }
+                "name": "brain_get_pages",
+                "arguments": { "ids": ["entities/alice"], "include_context": true }
             }),
             tmp.path(),
             &mut None,
         )
-        .expect("brain_get_context should succeed");
+        .expect("brain_get_pages with include_context should succeed");
         // Sanity: outbound list must contain the two wiki links.
         assert!(result.contains("entities/bob"));
         assert!(result.contains("concepts/nlspec"));
         // Must not surface any lint chatter.
-        assert!(!result.contains("lint:"), "result leaks lint-error: {result}");
+        assert!(
+            !result.contains("lint:"),
+            "result leaks lint-error: {result}"
+        );
     }
 
     #[test]
@@ -2730,8 +3811,8 @@ mod tests {
         // — pluralised `type:` slipped in by an earlier write — so we
         // assert it surfaces with the offending value and path the
         // agent will need to write back via brain_write_page.
-        use tempfile::TempDir;
         use crate::vault::layout::{ensure_skeleton, wiki_dir};
+        use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
         seed_marker(tmp.path());
@@ -2752,7 +3833,7 @@ mod tests {
         let result = call_tool(
             &json!({
                 "name": "brain_lint_report",
-                "arguments": {}
+                "arguments": { "response_format": "detailed" }
             }),
             tmp.path(),
             &mut None,
@@ -2783,8 +3864,8 @@ mod tests {
         // development" did not return the page id "spec-driven-development".
         // With the FTS5 path enabled, the unicode61 tokeniser splits
         // hyphenated words and the query hits.
-        use tempfile::TempDir;
         use crate::vault::layout::{ensure_skeleton, wiki_dir};
+        use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
         seed_marker(tmp.path());
@@ -2879,8 +3960,8 @@ mod tests {
     }
 
     /// Helper: build a small but realistic vault with two entities, one
-    /// concept and one source. Used by the `brain_list_pages`
-    /// performance-improvement tests so each test starts from a known
+    /// concept and one source. Used by the `brain_query` listing
+    /// tests so each test starts from a known
     /// shape without re-typing the boilerplate.
     fn build_sample_vault() -> tempfile::TempDir {
         use crate::vault::layout::{ensure_skeleton, wiki_dir};
@@ -2912,147 +3993,153 @@ mod tests {
         tmp
     }
 
-    fn list_pages_call(
-        vault: &std::path::Path,
-        args: Value,
-        db: Option<crate::db::DbHandle>,
-    ) -> Value {
+    fn query_call(vault: &std::path::Path, args: Value, db: Option<crate::db::DbHandle>) -> Value {
         let mut db = db;
         let result = call_tool(
-            &json!({ "name": "brain_list_pages", "arguments": args }),
+            &json!({ "name": "brain_query", "arguments": args }),
             vault,
             &mut db,
         )
-        .expect("brain_list_pages should succeed");
+        .expect("brain_query should succeed");
         serde_json::from_str(&result).expect("result must be valid JSON")
     }
 
-    #[test]
-    fn list_pages_db_fastpath_returns_same_ids_as_filesystem_fallback() {
-        // Without a DB handle we walk the filesystem; with one we should
-        // hit a much faster `SELECT id, type FROM pages` path. Both must
-        // surface the same set of IDs, otherwise we have a divergence
-        // bug that would silently mislead the LLM.
-        let tmp = build_sample_vault();
-        let db = crate::db::DbHandle::open(tmp.path()).unwrap();
-        crate::db::pages_index::rebuild(&db, tmp.path()).unwrap();
-
-        let fs_result = list_pages_call(tmp.path(), json!({}), None);
-        let db_result = list_pages_call(tmp.path(), json!({}), Some(db));
-
-        // Set-equality per bucket so ordering doesn't matter.
-        for bucket in ["entities", "concepts", "sources", "topics"] {
-            let fs_set: std::collections::HashSet<&str> = fs_result[bucket]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(|v| v.as_str())
-                .collect();
-            let db_set: std::collections::HashSet<&str> = db_result[bucket]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(|v| v.as_str())
-                .collect();
-            assert_eq!(
-                fs_set, db_set,
-                "DB and filesystem paths disagree on bucket '{bucket}'"
-            );
-        }
-    }
-
-    #[test]
-    fn list_pages_with_type_filter_only_populates_that_bucket() {
-        // Reduces response size for callers who only need one type — the
-        // primary fix for the user-reported timeout on big vaults.
-        let tmp = build_sample_vault();
-        let result = list_pages_call(tmp.path(), json!({ "type": "entities" }), None);
-        assert!(!result["entities"].as_array().unwrap().is_empty());
-        assert!(result["concepts"].as_array().unwrap().is_empty());
-        assert!(result["sources"].as_array().unwrap().is_empty());
-        assert!(result["topics"].as_array().unwrap().is_empty());
-    }
-
-    #[test]
-    fn list_pages_with_prefix_filter_returns_only_matching_ids() {
-        // Lets callers narrow down to e.g. `entities/dextra-*` instead
-        // of pulling every entity ID and filtering client-side.
-        let tmp = build_sample_vault();
-        let result = list_pages_call(
-            tmp.path(),
-            json!({ "prefix": "entities/dextra" }),
-            None,
-        );
-        let ents: Vec<&str> = result["entities"]
+    fn hit_ids(result: &Value) -> Vec<String> {
+        result["hits"]
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|v| v.as_str())
+            .map(|h| h["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn indexed_sample_vault() -> (tempfile::TempDir, crate::db::DbHandle) {
+        let tmp = build_sample_vault();
+        let db = crate::db::DbHandle::open(tmp.path()).unwrap();
+        crate::db::pages_index::rebuild(&db, tmp.path()).unwrap();
+        (tmp, db)
+    }
+
+    #[test]
+    fn query_star_lists_the_same_ids_as_the_filesystem_fallback() {
+        // The index-backed listing and the file-system fallback (used when
+        // the index is unavailable) must agree, or the LLM gets misled.
+        let (tmp, db) = indexed_sample_vault();
+        let mut from_index = hit_ids(&query_call(tmp.path(), json!({ "query": "*" }), Some(db)));
+        from_index.sort();
+        let from_fs: Vec<String> = filesystem_hits(tmp.path())
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id)
             .collect();
-        assert_eq!(ents, vec!["entities/dextra-acme"]);
-        assert!(
-            result["concepts"].as_array().unwrap().is_empty(),
-            "prefix on entities must not leak into other buckets"
-        );
+        assert_eq!(from_index, from_fs);
     }
 
     #[test]
-    fn list_pages_with_limit_caps_each_bucket() {
-        // Pagination affordance — caller can request a bounded page size.
-        let tmp = build_sample_vault();
-        let result = list_pages_call(tmp.path(), json!({ "limit": 1 }), None);
-        for bucket in ["entities", "concepts", "sources", "topics"] {
-            let len = result[bucket].as_array().unwrap().len();
-            assert!(
-                len <= 1,
-                "bucket {bucket} should be capped at limit=1 but has {len}"
-            );
-        }
+    fn query_without_arguments_lists_every_current_page() {
+        let (tmp, db) = indexed_sample_vault();
+        let result = query_call(tmp.path(), json!({}), Some(db));
+        assert_eq!(result["total"], json!(4));
     }
 
     #[test]
-    fn list_pages_with_offset_skips_leading_entries_per_bucket() {
-        // Offset only makes sense paired with sort order — IDs are
-        // already returned sorted ascending. With two entities and
-        // offset=1 we expect exactly one entity returned.
-        let tmp = build_sample_vault();
-        let result = list_pages_call(
+    fn query_with_a_type_filter_lists_only_that_type() {
+        let (tmp, db) = indexed_sample_vault();
+        let mut ids = hit_ids(&query_call(
             tmp.path(),
-            json!({ "type": "entities", "offset": 1 }),
-            None,
+            json!({ "query": "type:entity" }),
+            Some(db),
+        ));
+        ids.sort();
+        assert_eq!(ids, vec!["entities/alice", "entities/dextra-acme"]);
+    }
+
+    #[test]
+    fn query_with_a_prefix_returns_only_matching_ids() {
+        let (tmp, db) = indexed_sample_vault();
+        let result = query_call(
+            tmp.path(),
+            json!({ "query": "*", "prefix": "entities/dextra" }),
+            Some(db),
         );
-        let ents = result["entities"].as_array().unwrap();
+        assert_eq!(hit_ids(&result), vec!["entities/dextra-acme"]);
+    }
+
+    #[test]
+    fn query_with_a_limit_returns_at_most_that_many_hits_and_the_next_offset() {
+        let (tmp, db) = indexed_sample_vault();
+        let result = query_call(tmp.path(), json!({ "query": "*", "limit": 1 }), Some(db));
         assert_eq!(
-            ents.len(),
-            1,
-            "offset=1 on 2-entity vault should leave exactly 1 entry"
+            (result["returned"].clone(), result["next_offset"].clone()),
+            (json!(1), json!(1))
         );
     }
 
     #[test]
-    fn list_pages_with_no_args_returns_full_grouped_shape_for_backward_compat() {
-        // Defensive: existing callers (LLMs that have been pointing at
-        // older BRAIN releases) must keep working — no args = same
-        // four-bucket shape with all IDs populated.
-        let tmp = build_sample_vault();
-        let result = list_pages_call(tmp.path(), json!({}), None);
-        assert!(result.get("entities").is_some());
-        assert!(result.get("concepts").is_some());
-        assert!(result.get("sources").is_some());
-        assert!(result.get("topics").is_some());
-        assert_eq!(result["entities"].as_array().unwrap().len(), 2);
-        assert_eq!(result["concepts"].as_array().unwrap().len(), 1);
-        assert_eq!(result["sources"].as_array().unwrap().len(), 1);
+    fn query_with_an_offset_skips_leading_hits() {
+        let (tmp, db) = indexed_sample_vault();
+        let result = query_call(
+            tmp.path(),
+            json!({ "query": "type:entity", "offset": 1 }),
+            Some(db),
+        );
+        assert_eq!(result["returned"], json!(1));
     }
 
     #[test]
-    fn page_exists_returns_true_for_a_page_that_is_on_disk() {
+    fn query_star_falls_back_to_the_filesystem_when_the_index_cannot_open() {
+        // A vault whose 03_db is a file: the index cannot be opened, the
+        // listing still works and says why it is thin.
+        let tmp = build_sample_vault();
+        let db_dir = tmp.path().join(crate::vault::layout::DB_DIR);
+        let _ = std::fs::remove_dir_all(&db_dir);
+        std::fs::write(&db_dir, b"not a directory").unwrap();
+        let result = query_call(tmp.path(), json!({ "query": "*" }), None);
+        assert_eq!(
+            (result["total"].clone(), result["note"].is_string()),
+            (json!(4), true)
+        );
+    }
+
+    #[test]
+    fn query_concise_hits_carry_only_id_type_and_title() {
+        let (tmp, db) = indexed_sample_vault();
+        let result = query_call(tmp.path(), json!({ "query": "type:concept" }), Some(db));
+        let keys: Vec<&String> = result["hits"][0].as_object().unwrap().keys().collect();
+        assert_eq!(keys, vec!["id", "title", "type"]);
+    }
+
+    #[test]
+    fn query_detailed_hits_carry_the_salience_counters() {
+        let (tmp, db) = indexed_sample_vault();
+        let result = query_call(
+            tmp.path(),
+            json!({ "query": "type:concept", "response_format": "detailed" }),
+            Some(db),
+        );
+        assert!(result["hits"][0]["reads"].is_number(), "{result}");
+    }
+
+    #[test]
+    fn query_rejects_facet_written_as_query_syntax_with_a_pointer_to_the_argument() {
+        let tmp = build_sample_vault();
+        let err = call_tool(
+            &json!({ "name": "brain_query", "arguments": { "query": "facet:tags" } }),
+            tmp.path(),
+            &mut None,
+        )
+        .unwrap_err();
+        assert!(err.contains("{\"facet\": \"tags\"}"), "{err}");
+    }
+
+    #[test]
+    fn lookup_returns_true_for_a_page_that_is_on_disk() {
         // The lightweight "does this id exist?"-check the user feedback
-        // asked for. brain_get_page returns the whole markdown body
+        // asked for. Reading the page returns the whole markdown body
         // for this question, which is wasted bandwidth and tokens; this
         // tool only does a single Path::exists() under 02_wiki/<id>.md.
-        use tempfile::TempDir;
         use crate::vault::layout::{ensure_skeleton, wiki_dir};
+        use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
         seed_marker(tmp.path());
@@ -3065,53 +4152,53 @@ mod tests {
         .unwrap();
         let result = call_tool(
             &json!({
-                "name": "brain_page_exists",
-                "arguments": { "id": "entities/alice" }
+                "name": "brain_lookup",
+                "arguments": { "query_or_id": "entities/alice" }
             }),
             tmp.path(),
             &mut None,
         )
-        .expect("brain_page_exists should succeed");
+        .expect("brain_lookup should succeed");
         let parsed: Value = serde_json::from_str(&result).expect("must be valid JSON");
         assert_eq!(parsed["exists"], json!(true));
         assert_eq!(parsed["id"], json!("entities/alice"));
     }
 
     #[test]
-    fn page_exists_returns_false_for_a_page_that_is_not_on_disk() {
-        use tempfile::TempDir;
+    fn lookup_returns_false_for_a_page_that_is_not_on_disk() {
         use crate::vault::layout::ensure_skeleton;
+        use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
         seed_marker(tmp.path());
         let result = call_tool(
             &json!({
-                "name": "brain_page_exists",
-                "arguments": { "id": "entities/never-created" }
+                "name": "brain_lookup",
+                "arguments": { "query_or_id": "entities/never-created" }
             }),
             tmp.path(),
             &mut None,
         )
-        .expect("brain_page_exists must succeed even for missing pages — the missing case is data, not error");
+        .expect("brain_lookup must succeed even for missing pages — the missing case is data, not error");
         let parsed: Value = serde_json::from_str(&result).expect("must be valid JSON");
         assert_eq!(parsed["exists"], json!(false));
         assert_eq!(parsed["id"], json!("entities/never-created"));
     }
 
     #[test]
-    fn page_exists_rejects_id_with_path_traversal_components() {
+    fn lookup_rejects_id_with_path_traversal_components() {
         // Defensive: an id like "../../../etc/passwd" must be rejected
         // before it gets joined onto the wiki dir. Same hardening the
         // existing brain_write_raw_file does for connector paths.
-        use tempfile::TempDir;
         use crate::vault::layout::ensure_skeleton;
+        use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
         seed_marker(tmp.path());
         let err = call_tool(
             &json!({
-                "name": "brain_page_exists",
-                "arguments": { "id": "../../etc/passwd" }
+                "name": "brain_lookup",
+                "arguments": { "query_or_id": "../../etc/passwd" }
             }),
             tmp.path(),
             &mut None,
@@ -3121,18 +4208,18 @@ mod tests {
     }
 
     #[test]
-    fn page_exists_rejects_empty_or_missing_id() {
+    fn lookup_rejects_empty_or_missing_id() {
         // Hardening: the LLM might forget the `id` arg entirely or
         // pass an empty string. Either way the tool must return a
         // crisp error rather than walking the vault root.
-        use tempfile::TempDir;
         use crate::vault::layout::ensure_skeleton;
+        use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
         seed_marker(tmp.path());
         let err = call_tool(
             &json!({
-                "name": "brain_page_exists",
+                "name": "brain_lookup",
                 "arguments": {}
             }),
             tmp.path(),
@@ -3143,7 +4230,7 @@ mod tests {
     }
 
     #[test]
-    fn page_exists_propagates_vault_disconnect_with_canonical_prefix() {
+    fn lookup_propagates_vault_disconnect_with_canonical_prefix() {
         // The same fast-fail guard call_tool already does for every
         // other tool — when the vault disappeared mid-session, we
         // return the BRAIN_VAULT_DISCONNECTED-prefixed message the
@@ -3153,8 +4240,8 @@ mod tests {
         // No ensure_skeleton, no marker — looks like a torn-off vault.
         let err = call_tool(
             &json!({
-                "name": "brain_page_exists",
-                "arguments": { "id": "entities/alice" }
+                "name": "brain_lookup",
+                "arguments": { "query_or_id": "entities/alice" }
             }),
             tmp.path(),
             &mut None,
@@ -3172,8 +4259,8 @@ mod tests {
         // for what's already known server-side. Now the response
         // embeds the actual error array as JSON so the LLM can act on
         // it in one shot.
-        use tempfile::TempDir;
         use crate::vault::layout::ensure_skeleton;
+        use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
         seed_marker(tmp.path());
@@ -3214,14 +4301,14 @@ mod tests {
     }
 
     #[test]
-    fn brain_get_page_history_returns_only_commits_that_touched_the_named_page() {
-        // The roll-back workflow: agent calls brain_get_page_history,
-        // sees the candidate revisions, then brain_restore_page picks
+    fn history_list_returns_only_commits_that_touched_the_named_page() {
+        // The roll-back workflow: agent calls brain_history (list),
+        // sees the candidate revisions, then brain_history (restore) picks
         // one. The MCP path normalizes the page-id (`entities/alice`)
         // into the on-disk path (`entities/alice.md`) before handing
         // off to the backend.
-        use tempfile::TempDir;
         use crate::vault::layout::{ensure_skeleton, wiki_dir};
+        use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
         seed_marker(tmp.path());
@@ -3240,16 +4327,23 @@ mod tests {
 
         let ok = call_tool(
             &json!({
-                "name": "brain_get_page_history",
-                "arguments": { "id": "entities/alice" }
+                "name": "brain_history",
+                "arguments": { "action": "list", "id": "entities/alice" }
             }),
             tmp.path(),
             &mut None,
         )
-        .expect("brain_get_page_history must succeed");
+        .expect("brain_history list must succeed");
         let parsed: serde_json::Value = serde_json::from_str(&ok).expect("JSON");
-        let commits = parsed.get("commits").and_then(|v| v.as_array()).expect("commits");
-        assert_eq!(commits.len(), 2, "two alice-only commits expected, got {commits:?}");
+        let commits = parsed
+            .get("commits")
+            .and_then(|v| v.as_array())
+            .expect("commits");
+        assert_eq!(
+            commits.len(),
+            2,
+            "two alice-only commits expected, got {commits:?}"
+        );
         for c in commits {
             let msg = c.get("message").and_then(|v| v.as_str()).unwrap_or("");
             assert!(msg.contains("alice"), "non-alice commit leaked: {msg}");
@@ -3262,13 +4356,13 @@ mod tests {
     }
 
     #[test]
-    fn brain_restore_page_replaces_current_content_with_the_old_revision() {
+    fn history_restore_replaces_current_content_with_the_old_revision() {
         // End-to-end of the rollback: write v1, write v2 over it,
-        // call brain_restore_page with v1's sha, assert the file on
+        // call brain_history restore with v1's sha, assert the file on
         // disk matches v1 again. The new revert commit records the
         // action so the history stays append-only.
-        use tempfile::TempDir;
         use crate::vault::layout::{ensure_skeleton, wiki_dir};
+        use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
         seed_marker(tmp.path());
@@ -3285,16 +4379,19 @@ mod tests {
 
         let ok = call_tool(
             &json!({
-                "name": "brain_restore_page",
-                "arguments": { "id": "entities/alice", "sha": v1_sha }
+                "name": "brain_history",
+                "arguments": { "action": "restore", "id": "entities/alice", "sha": v1_sha }
             }),
             tmp.path(),
             &mut None,
         )
-        .expect("brain_restore_page must succeed");
+        .expect("brain_history restore must succeed");
         // The response surfaces the source sha so the agent can quote
         // it back to the user.
-        assert!(ok.contains(&v1_sha), "response should mention source sha: {ok}");
+        assert!(
+            ok.contains(&v1_sha),
+            "response should mention source sha: {ok}"
+        );
         // The file on disk is now v1's content again.
         let after = std::fs::read_to_string(entities.join("alice.md")).unwrap();
         assert_eq!(after, "alice v1");
@@ -3324,7 +4421,11 @@ mod tests {
     }
 
     fn call(tmp: &tempfile::TempDir, name: &str, arguments: Value) -> Result<String, String> {
-        call_tool(&json!({ "name": name, "arguments": arguments }), tmp.path(), &mut None)
+        call_tool(
+            &json!({ "name": name, "arguments": arguments }),
+            tmp.path(),
+            &mut None,
+        )
     }
 
     #[test]
@@ -3345,11 +4446,16 @@ mod tests {
     }
 
     #[test]
-    fn brain_eval_add_then_brain_eval_reports_metrics_for_the_three_modes() {
+    fn eval_add_then_run_reports_metrics_for_the_three_modes() {
         let tmp = refactor_vault();
-        call(&tmp, "brain_eval_add", json!({ "query": "Knows", "expected": ["entities/alice"] }))
-            .expect("brain_eval_add must succeed");
-        let out = call(&tmp, "brain_eval", json!({})).expect("brain_eval must succeed");
+        call(
+            &tmp,
+            "brain_eval",
+            json!({ "action": "add", "query": "Knows", "expected": ["entities/alice"] }),
+        )
+        .expect("brain_eval add must succeed");
+        let out = call(&tmp, "brain_eval", json!({ "action": "run" }))
+            .expect("brain_eval run must succeed");
         let parsed: Value = serde_json::from_str(&out).expect("JSON");
         assert_eq!(parsed["modes"].as_array().map(Vec::len), Some(3));
     }
@@ -3357,46 +4463,59 @@ mod tests {
     #[test]
     fn brain_eval_appends_its_run_to_the_eval_history() {
         let tmp = refactor_vault();
-        call(&tmp, "brain_eval_add", json!({ "query": "Knows", "expected": ["entities/alice"] }))
-            .unwrap();
-        call(&tmp, "brain_eval", json!({})).unwrap();
+        call(
+            &tmp,
+            "brain_eval",
+            json!({ "action": "add", "query": "Knows", "expected": ["entities/alice"] }),
+        )
+        .unwrap();
+        call(&tmp, "brain_eval", json!({ "action": "run" })).unwrap();
         assert!(crate::viewer::eval::eval_history_path(tmp.path()).is_file());
     }
 
     #[test]
-    fn brain_eval_on_an_empty_eval_set_points_at_brain_eval_add() {
+    fn brain_eval_run_on_an_empty_eval_set_points_at_the_add_action() {
         let tmp = refactor_vault();
-        let err = call(&tmp, "brain_eval", json!({})).unwrap_err();
-        assert!(err.contains("brain_eval_add"), "{err}");
+        let err = call(&tmp, "brain_eval", json!({ "action": "run" })).unwrap_err();
+        assert!(err.contains("brain_eval (action \"add\")"), "{err}");
     }
 
     #[test]
-    fn brain_eval_add_refuses_an_expected_page_that_does_not_exist() {
+    fn eval_add_action_refuses_an_expected_page_that_does_not_exist() {
         let tmp = refactor_vault();
-        let err = call(&tmp, "brain_eval_add", json!({ "query": "q", "expected": ["entities/nobody"] }))
-            .unwrap_err();
+        let err = call(
+            &tmp,
+            "brain_eval",
+            json!({ "action": "add", "query": "q", "expected": ["entities/nobody"] }),
+        )
+        .unwrap_err();
         assert!(err.contains("entities/nobody"), "{err}");
     }
 
     #[test]
-    fn brain_eval_add_rejects_a_non_string_note() {
+    fn eval_add_action_rejects_a_non_string_note() {
         let tmp = refactor_vault();
         let err = call(
             &tmp,
-            "brain_eval_add",
-            json!({ "query": "q", "expected": ["entities/alice"], "note": 3 }),
+            "brain_eval",
+            json!({ "action": "add", "query": "q", "expected": ["entities/alice"], "note": 3 }),
         )
         .unwrap_err();
         assert!(err.contains("'note' must be a string"), "{err}");
     }
 
     #[test]
-    fn brain_dream_queue_writes_and_returns_the_queue() {
+    fn dream_queue_action_writes_and_returns_the_queue() {
         let tmp = refactor_vault();
-        let out = call(&tmp, "brain_dream_queue", json!({ "refresh": true }))
-            .expect("brain_dream_queue must succeed");
+        let out = call(
+            &tmp,
+            "brain_dream",
+            json!({ "action": "queue", "refresh": true }),
+        )
+        .expect("brain_dream queue must succeed");
         let parsed: Value = serde_json::from_str(&out).expect("JSON");
-        let on_disk = crate::wiki::dream::read_queue_file(&crate::wiki::dream::dream_queue_path(tmp.path()));
+        let on_disk =
+            crate::wiki::dream::read_queue_file(&crate::wiki::dream::dream_queue_path(tmp.path()));
         assert_eq!(
             on_disk.map(|q| q.generated_at),
             parsed["generated_at"].as_str().map(str::to_string)
@@ -3404,7 +4523,7 @@ mod tests {
     }
 
     #[test]
-    fn brain_dream_queue_serves_a_fresh_stored_queue_without_recomputing() {
+    fn dream_queue_action_serves_a_fresh_stored_queue_without_recomputing() {
         let tmp = refactor_vault();
         let stored = crate::wiki::dream::DreamQueue {
             generated_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -3413,13 +4532,13 @@ mod tests {
             notes: Vec::new(),
         };
         crate::wiki::dream::write_dream_queue(tmp.path(), &stored).unwrap();
-        let out = call(&tmp, "brain_dream_queue", json!({})).unwrap();
+        let out = call(&tmp, "brain_dream", json!({ "action": "queue" })).unwrap();
         let parsed: Value = serde_json::from_str(&out).expect("JSON");
         assert_eq!(parsed["omitted"], json!(7));
     }
 
     #[test]
-    fn brain_dream_queue_with_refresh_recomputes_a_fresh_stored_queue() {
+    fn dream_queue_action_with_refresh_recomputes_a_fresh_stored_queue() {
         let tmp = refactor_vault();
         let stored = crate::wiki::dream::DreamQueue {
             generated_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -3428,7 +4547,12 @@ mod tests {
             notes: Vec::new(),
         };
         crate::wiki::dream::write_dream_queue(tmp.path(), &stored).unwrap();
-        let out = call(&tmp, "brain_dream_queue", json!({ "refresh": true })).unwrap();
+        let out = call(
+            &tmp,
+            "brain_dream",
+            json!({ "action": "queue", "refresh": true }),
+        )
+        .unwrap();
         let parsed: Value = serde_json::from_str(&out).expect("JSON");
         assert_eq!(parsed["omitted"], json!(0));
     }
@@ -3481,13 +4605,22 @@ mod tests {
         crate::db::pages_index::rebuild_with(&handle, tmp.path(), &PizzaModel).unwrap();
         let mut db = Some(handle);
         let mut tool = |name: &str, arguments: Value| {
-            call_tool(&json!({ "name": name, "arguments": arguments }), tmp.path(), &mut db)
+            call_tool(
+                &json!({ "name": name, "arguments": arguments }),
+                tmp.path(),
+                &mut db,
+            )
         };
 
-        let before = dream_items(&tool("brain_dream_queue", json!({ "refresh": true })).unwrap());
-        tool("brain_merge_pages", json!({ "from_id": "entities/b", "into_id": "entities/a" }))
-            .expect("merge must succeed");
-        let after = dream_items(&tool("brain_dream_queue", json!({})).unwrap());
+        let before = dream_items(
+            &tool("brain_dream", json!({ "action": "queue", "refresh": true })).unwrap(),
+        );
+        tool(
+            "brain_refactor",
+            json!({ "action": "merge", "from_id": "entities/b", "into_id": "entities/a" }),
+        )
+        .expect("merge must succeed");
+        let after = dream_items(&tool("brain_dream", json!({ "action": "queue" })).unwrap());
 
         let before_len = before.len();
         let expected: Vec<Value> = before
@@ -3500,9 +4633,18 @@ mod tests {
     #[test]
     fn a_rename_drops_the_stored_dream_queue() {
         let tmp = refactor_vault();
-        call(&tmp, "brain_dream_queue", json!({ "refresh": true })).unwrap();
-        call(&tmp, "brain_rename_page", json!({ "id": "entities/old", "new_id": "entities/new" }))
-            .unwrap();
+        call(
+            &tmp,
+            "brain_dream",
+            json!({ "action": "queue", "refresh": true }),
+        )
+        .unwrap();
+        call(
+            &tmp,
+            "brain_refactor",
+            json!({ "action": "rename", "id": "entities/old", "new_id": "entities/new" }),
+        )
+        .unwrap();
         assert!(!crate::wiki::dream::dream_queue_path(tmp.path()).exists());
     }
 
@@ -3510,10 +4652,16 @@ mod tests {
     fn brain_write_page_with_confirm_summary_marks_the_indexed_summary_as_current() {
         let tmp = refactor_vault();
         let page = |body: &str| {
-            format!("---\nid: entities/bob\ntype: entity\ntitle: Bob\nsummary: Bob runs ops.\n---\n\n{body}\n")
+            format!(
+                "---\nid: entities/bob\ntype: entity\ntitle: Bob\nsummary: Bob runs ops.\n---\n\n{body}\n"
+            )
         };
-        call(&tmp, "brain_write_page", json!({ "id": "entities/bob", "content": page("One.") }))
-            .unwrap();
+        call(
+            &tmp,
+            "brain_write_page",
+            json!({ "id": "entities/bob", "content": page("One.") }),
+        )
+        .unwrap();
         let handle = crate::db::DbHandle::open(tmp.path()).unwrap();
         crate::db::pages_index::rebuild(&handle, tmp.path()).unwrap();
         let mut db = Some(handle.clone());
@@ -3552,42 +4700,46 @@ mod tests {
     }
 
     #[test]
-    fn brain_dream_log_appends_the_entry_to_the_dream_log() {
+    fn dream_log_action_appends_the_entry_to_the_dream_log() {
         let tmp = refactor_vault();
-        call(&tmp, "brain_dream_log", json!({ "entry": "merged a into b" })).unwrap();
-        let text =
-            std::fs::read_to_string(crate::wiki::dream::dream_log_path(tmp.path())).unwrap();
+        call(
+            &tmp,
+            "brain_dream",
+            json!({ "action": "log", "entry": "merged a into b" }),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(crate::wiki::dream::dream_log_path(tmp.path())).unwrap();
         assert!(text.trim_end().ends_with("merged a into b"), "{text}");
     }
 
     #[test]
-    fn brain_rename_page_returns_the_rewritten_pages_as_json() {
+    fn refactor_rename_returns_the_rewritten_pages_as_json() {
         let tmp = refactor_vault();
         let ok = call_tool(
             &json!({
-                "name": "brain_rename_page",
-                "arguments": { "id": "entities/old", "new_id": "entities/new" }
+                "name": "brain_refactor",
+                "arguments": { "action": "rename", "id": "entities/old", "new_id": "entities/new" }
             }),
             tmp.path(),
             &mut None,
         )
-        .expect("brain_rename_page must succeed");
+        .expect("brain_refactor rename must succeed");
         let parsed: Value = serde_json::from_str(&ok).expect("JSON");
         assert_eq!(parsed["rewritten_pages"], json!(["entities/alice"]));
     }
 
     #[test]
-    fn brain_merge_pages_reports_the_ids_under_the_input_key_names() {
+    fn refactor_merge_reports_the_ids_under_the_input_key_names() {
         let tmp = refactor_vault();
         let ok = call_tool(
             &json!({
-                "name": "brain_merge_pages",
-                "arguments": { "from_id": "entities/old", "into_id": "entities/alice" }
+                "name": "brain_refactor",
+                "arguments": { "action": "merge", "from_id": "entities/old", "into_id": "entities/alice" }
             }),
             tmp.path(),
             &mut None,
         )
-        .expect("brain_merge_pages must succeed");
+        .expect("brain_refactor merge must succeed");
         let parsed: Value = serde_json::from_str(&ok).expect("JSON");
         assert_eq!(
             (&parsed["from_id"], &parsed["into_id"]),
@@ -3596,27 +4748,30 @@ mod tests {
     }
 
     #[test]
-    fn brain_delete_page_refusal_names_the_referring_pages() {
+    fn refactor_delete_refusal_names_the_referring_pages() {
         let tmp = refactor_vault();
         let err = call_tool(
             &json!({
-                "name": "brain_delete_page",
-                "arguments": { "id": "entities/old" }
+                "name": "brain_refactor",
+                "arguments": { "action": "delete", "id": "entities/old" }
             }),
             tmp.path(),
             &mut None,
         )
         .expect_err("a linked page must not be deleted without force");
-        assert!(err.contains("entities/alice"), "referrer missing from: {err}");
+        assert!(
+            err.contains("entities/alice"),
+            "referrer missing from: {err}"
+        );
     }
 
     #[test]
-    fn brain_delete_page_rejects_a_non_boolean_force() {
+    fn refactor_delete_rejects_a_non_boolean_force() {
         let tmp = refactor_vault();
         let err = call_tool(
             &json!({
-                "name": "brain_delete_page",
-                "arguments": { "id": "entities/old", "force": "yes" }
+                "name": "brain_refactor",
+                "arguments": { "action": "delete", "id": "entities/old", "force": "yes" }
             }),
             tmp.path(),
             &mut None,
@@ -3626,12 +4781,12 @@ mod tests {
     }
 
     #[test]
-    fn brain_rename_page_rejects_a_non_string_new_id() {
+    fn refactor_rename_rejects_a_non_string_new_id() {
         let tmp = refactor_vault();
         let err = call_tool(
             &json!({
-                "name": "brain_rename_page",
-                "arguments": { "id": "entities/old", "new_id": 42 }
+                "name": "brain_refactor",
+                "arguments": { "action": "rename", "id": "entities/old", "new_id": 42 }
             }),
             tmp.path(),
             &mut None,
@@ -3648,18 +4803,27 @@ mod tests {
         let outside = tempfile::TempDir::new().unwrap();
         let target = outside.path().join("notes.md");
         std::fs::write(&target, "---\nid: entities/x\ntype: entity\n---\nkeep\n").unwrap();
-        let id = target.with_extension("").to_string_lossy().replace('\\', "/");
+        let id = target
+            .with_extension("")
+            .to_string_lossy()
+            .replace('\\', "/");
         let page = "---\nid: entities/x\ntype: entity\n---\npwned\n";
         let calls = [
-            ("brain_page_exists", json!({ "id": id })),
+            ("brain_lookup", json!({ "query_or_id": id })),
             (
                 "brain_patch_page",
                 json!({ "id": id, "heading": "## X", "content": "pwned" }),
             ),
-            ("brain_get_page_history", json!({ "id": id })),
-            ("brain_restore_page", json!({ "id": id, "sha": "deadbeef" })),
+            ("brain_history", json!({ "action": "list", "id": id })),
+            (
+                "brain_history",
+                json!({ "action": "restore", "id": id, "sha": "deadbeef" }),
+            ),
             ("brain_write_page", json!({ "id": id, "content": page })),
-            ("brain_delete_page", json!({ "id": id, "force": true })),
+            (
+                "brain_refactor",
+                json!({ "action": "delete", "id": id, "force": true }),
+            ),
         ];
         let accepted: Vec<&str> = calls
             .iter()
@@ -3683,7 +4847,7 @@ mod tests {
     #[test]
     fn read_tools_reject_drive_letter_ids_and_never_return_the_outside_file() {
         // Information-disclosure twin of the write-side guard: a drive-letter
-        // id must not let get_page / get_pages / get_context read an
+        // id must not let get_pages (with or without context) read an
         // arbitrary `.md` file elsewhere on the machine.
         let tmp = refactor_vault();
         let outside = tempfile::TempDir::new().unwrap();
@@ -3693,16 +4857,11 @@ mod tests {
             "---\nid: entities/x\ntype: entity\ntitle: T\n---\nOUTSIDE-SECRET-4711\n",
         )
         .unwrap();
-        let id = target.with_extension("").to_string_lossy().replace('\\', "/");
+        let id = target
+            .with_extension("")
+            .to_string_lossy()
+            .replace('\\', "/");
         let results: Vec<(&str, Result<String, String>)> = vec![
-            (
-                "brain_get_page",
-                call_tool(
-                    &json!({ "name": "brain_get_page", "arguments": { "id": id } }),
-                    tmp.path(),
-                    &mut None,
-                ),
-            ),
             (
                 "brain_get_pages",
                 call_tool(
@@ -3712,9 +4871,9 @@ mod tests {
                 ),
             ),
             (
-                "brain_get_context",
+                "brain_get_pages",
                 call_tool(
-                    &json!({ "name": "brain_get_context", "arguments": { "id": id } }),
+                    &json!({ "name": "brain_get_pages", "arguments": { "ids": [id], "include_context": true } }),
                     tmp.path(),
                     &mut None,
                 ),
@@ -3759,19 +4918,19 @@ mod tests {
     }
 
     #[test]
-    fn brain_restore_page_rejects_path_traversal_in_id() {
-        // Same hardening as brain_page_exists / brain_write_raw_file:
+    fn history_restore_rejects_path_traversal_in_id() {
+        // Same hardening as brain_lookup / brain_write_raw_file:
         // an id with `..` could resolve outside the wiki root once
         // joined onto wiki_dir(vault). Reject before reaching git.
-        use tempfile::TempDir;
         use crate::vault::layout::ensure_skeleton;
+        use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
         seed_marker(tmp.path());
         let err = call_tool(
             &json!({
-                "name": "brain_restore_page",
-                "arguments": { "id": "../../../etc/passwd", "sha": "deadbeef" }
+                "name": "brain_history",
+                "arguments": { "action": "restore", "id": "../../../etc/passwd", "sha": "deadbeef" }
             }),
             tmp.path(),
             &mut None,
@@ -3791,8 +4950,8 @@ mod tests {
         // all pages, phase 2 writes them all, phase 3 runs lint once
         // over the union of touched paths. If every reference resolves
         // *within the batch*, no broken-link errors surface.
-        use tempfile::TempDir;
         use crate::vault::layout::ensure_skeleton;
+        use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
         seed_marker(tmp.path());
@@ -3826,14 +4985,27 @@ mod tests {
         .expect("batch with self-resolving links must succeed");
 
         let parsed: serde_json::Value = serde_json::from_str(&ok).expect("response is JSON");
-        let wrote = parsed.get("wrote").and_then(|v| v.as_array()).expect("wrote array");
+        let wrote = parsed
+            .get("wrote")
+            .and_then(|v| v.as_array())
+            .expect("wrote array");
         assert_eq!(wrote.len(), 3, "one summary per page in the batch");
         // Each entry carries the new/previous size so the agent can
         // self-check for accidental shrink even in batch context.
         for entry in wrote {
             assert!(entry.get("id").and_then(|v| v.as_str()).is_some());
-            assert!(entry.get("new_size_bytes").and_then(|v| v.as_i64()).is_some());
-            assert!(entry.get("previous_size_bytes").and_then(|v| v.as_i64()).is_some());
+            assert!(
+                entry
+                    .get("new_size_bytes")
+                    .and_then(|v| v.as_i64())
+                    .is_some()
+            );
+            assert!(
+                entry
+                    .get("previous_size_bytes")
+                    .and_then(|v| v.as_i64())
+                    .is_some()
+            );
         }
     }
 
@@ -3843,8 +5015,8 @@ mod tests {
         // the batch has invalid frontmatter, nothing gets written.
         // Otherwise the user would end up with a half-written batch
         // and would need a partial-rollback heuristic to recover.
-        use tempfile::TempDir;
         use crate::vault::layout::{ensure_skeleton, wiki_dir};
+        use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
         seed_marker(tmp.path());
@@ -3869,7 +5041,10 @@ mod tests {
             &mut None,
         )
         .expect_err("malformed page must abort the whole batch");
-        assert!(err.contains("entities/bad"), "error should name the offending id: {err}");
+        assert!(
+            err.contains("entities/bad"),
+            "error should name the offending id: {err}"
+        );
         // Neither file may have been written to disk — phase 1
         // validation runs entirely in memory before phase 2 writes.
         assert!(
@@ -3878,85 +5053,111 @@ mod tests {
         );
     }
 
-    #[test]
-    fn brain_embedding_status_distinguishes_hashed_fallback_from_real_bge_m3() {
-        // The user couldn't tell whether the hybrid search was
-        // running on real bge-m3 semantic vectors or on the
-        // deterministic HashedEmbedder fallback — the latter gives
-        // mathematically-valid KNN scores but no semantic meaning,
-        // so the agent's "this query should have matched semantically"
-        // intuition silently breaks. The fresh-vault test path here
-        // exercises the no-model-files case where the fallback is
-        // expected, and asserts the response makes that visible.
-        use tempfile::TempDir;
-        use crate::vault::layout::ensure_skeleton;
-        let tmp = TempDir::new().unwrap();
-        ensure_skeleton(tmp.path()).unwrap();
-        seed_marker(tmp.path());
-
-        let ok = call_tool(
-            &json!({ "name": "brain_embedding_status", "arguments": {} }),
-            tmp.path(),
+    /// `brain_ping` with `detail: true` against a fresh vault (no model
+    /// files, no index), through the full request path.
+    fn ping_detail(vault: &std::path::Path) -> Value {
+        let req = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(8)),
+            method: "tools/call".into(),
+            params: json!({ "name": "brain_ping", "arguments": { "detail": true } }),
+        };
+        let env: Value = serde_json::from_str(&handle_request(
+            &req,
+            Some(vault),
             &mut None,
-        )
-        .expect("brain_embedding_status must succeed regardless of model presence");
-        let parsed: serde_json::Value = serde_json::from_str(&ok).expect("response is JSON");
-        // No model files on a fresh vault → embedder name reports
-        // the hashed fallback.
+            &mut Session::default(),
+        ))
+        .unwrap();
+        serde_json::from_str(env["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    fn fresh_vault() -> tempfile::TempDir {
+        let tmp = tempfile::TempDir::new().unwrap();
+        crate::vault::layout::ensure_skeleton(tmp.path()).unwrap();
+        seed_marker(tmp.path());
+        tmp
+    }
+
+    #[test]
+    fn ping_detail_reports_the_hashed_fallback_on_a_vault_without_model_files() {
+        // The user could not tell whether hybrid search ran on real bge-m3
+        // vectors or on the deterministic hashed fallback (valid numbers,
+        // no semantic meaning). Formerly a separate status tool.
+        let tmp = fresh_vault();
+        let embedder = ping_detail(tmp.path())["embedder"].clone();
         assert_eq!(
-            parsed.get("embedder").and_then(|v| v.as_str()),
-            Some("hashed-fh-1024"),
-            "fresh vault must report the hashed fallback (no bge-m3 files yet)"
-        );
-        // The `semantic` flag is the human-readable summary the
-        // agent (and the Settings UI later) keys off: true means
-        // bge-m3 is loaded, false means the response above is just
-        // a deterministic hash and `brain_search` semantic-pass
-        // scores carry no meaning.
-        assert_eq!(
-            parsed.get("semantic").and_then(|v| v.as_bool()),
-            Some(false),
-            "hashed fallback must report semantic: false"
-        );
-        // Model path is reported so the user can find where to drop
-        // the weights if they want real semantic search.
-        let model_dir = parsed
-            .get("model_dir")
-            .and_then(|v| v.as_str())
-            .expect("model_dir must be present");
-        assert!(
-            model_dir.contains("bge-m3"),
-            "model_dir should point at the bge-m3 subfolder, got: {model_dir}"
-        );
-        // Embedding dimension stays at 1024 across both embedders so
-        // the vector index doesn't need re-shape on model swap.
-        assert_eq!(
-            parsed.get("dim").and_then(|v| v.as_i64()),
-            Some(1024),
-            "dim is 1024 across both embedders"
-        );
-        // chunk_count_indexed must NEVER be a silent null — on a fresh
-        // (but openable) vault db_op opens lazily and the count is a
-        // number (0). The bug report flagged null as indistinguishable
-        // from "index genuinely empty"; we now always give a number or
-        // an explicit {error} object.
-        let ci = parsed.get("chunk_count_indexed").expect("field present");
-        assert!(
-            ci.is_number() || ci.get("error").is_some(),
-            "chunk_count_indexed must be a number or an error object, never null: {ci}"
+            (embedder["active"].clone(), embedder["semantic"].clone()),
+            (json!("hashed-fh-1024"), json!(false))
         );
     }
 
     #[test]
-    fn brain_list_tags_returns_distinct_tags_with_counts_sorted_by_frequency() {
+    fn ping_detail_points_at_the_bge_m3_model_directory() {
+        let tmp = fresh_vault();
+        let model_dir = ping_detail(tmp.path())["embedder"]["model_dir"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(model_dir.ends_with("04_models/bge-m3"), "{model_dir}");
+    }
+
+    #[test]
+    fn ping_detail_reports_the_model_as_not_loaded_without_loading_it() {
+        let tmp = fresh_vault();
+        assert_eq!(
+            ping_detail(tmp.path())["embedder"]["model_state"],
+            json!("not-loaded")
+        );
+    }
+
+    #[test]
+    fn ping_detail_reports_an_unbuilt_index_as_unavailable() {
+        let tmp = fresh_vault();
+        assert_eq!(ping_detail(tmp.path())["index"]["available"], json!(false));
+    }
+
+    #[test]
+    fn ping_detail_never_builds_the_index() {
+        let tmp = build_sample_vault();
+        ping_detail(tmp.path());
+        let pages: i64 = crate::db::DbHandle::open(tmp.path())
+            .unwrap()
+            .with(|c| Ok(c.query_row("SELECT count(*) FROM pages", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(pages, 0);
+    }
+
+    #[test]
+    fn ping_detail_counts_the_pages_of_a_built_index() {
+        let (tmp, _db) = indexed_sample_vault();
+        assert_eq!(ping_detail(tmp.path())["index"]["pages"], json!(4));
+    }
+
+    #[test]
+    fn ping_detail_without_a_configured_vault_says_so() {
+        let req = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(9)),
+            method: "tools/call".into(),
+            params: json!({ "name": "brain_ping", "arguments": { "detail": true } }),
+        };
+        let env: Value = serde_json::from_str(&handle(&req)).unwrap();
+        let ping: Value =
+            serde_json::from_str(env["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(ping["vault"]["configured"], json!(false));
+    }
+
+    #[test]
+    fn query_tag_facet_returns_distinct_tags_with_counts_sorted_by_frequency() {
         // The user couldn't discover which tags exist in the vault.
         // `brain_query tag:foo` accepts an exact tag operator, but
         // there was no way to ask "what are the candidate values?".
         // This tool reads `page_tags` and returns each distinct tag
         // with how many pages carry it, sorted descending so the
         // agent sees the most-used tags first.
-        use tempfile::TempDir;
         use crate::vault::layout::{ensure_skeleton, wiki_dir};
+        use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
         seed_marker(tmp.path());
@@ -3990,13 +5191,16 @@ mod tests {
         let mut db = Some(db);
 
         let ok = call_tool(
-            &json!({ "name": "brain_list_tags", "arguments": {} }),
+            &json!({ "name": "brain_query", "arguments": { "facet": "tags" } }),
             tmp.path(),
             &mut db,
         )
-        .expect("brain_list_tags must succeed on a populated vault");
+        .expect("brain_query facet:tags must succeed on a populated vault");
         let parsed: serde_json::Value = serde_json::from_str(&ok).expect("response is JSON");
-        let tags = parsed.get("tags").and_then(|v| v.as_array()).expect("tags array");
+        let tags = parsed
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .expect("tags array");
         // We tagged: customer (2), partner (1), dax (1). Order by
         // count desc, then alphabetic for tie-breaking — that means
         // `customer` first, then `dax` or `partner` next (the
@@ -4008,7 +5212,10 @@ mod tests {
             tags.len(),
             tags
         );
-        assert_eq!(tags[0].get("tag").and_then(|v| v.as_str()), Some("customer"));
+        assert_eq!(
+            tags[0].get("tag").and_then(|v| v.as_str()),
+            Some("customer")
+        );
         assert_eq!(tags[0].get("count").and_then(|v| v.as_i64()), Some(2));
         // The two singletons follow, in alphabetic order on ties.
         let next_names: Vec<&str> = tags
@@ -4017,22 +5224,26 @@ mod tests {
             .take(2)
             .filter_map(|v| v.get("tag").and_then(|t| t.as_str()))
             .collect();
-        assert_eq!(next_names, vec!["dax", "partner"], "alphabetic tie-break on count == 1");
+        assert_eq!(
+            next_names,
+            vec!["dax", "partner"],
+            "alphabetic tie-break on count == 1"
+        );
     }
 
     #[test]
     fn brain_get_pages_returns_results_for_existing_ids_and_marks_missing_ones() {
         // Bulk-read use case: refactor sweeps where the agent wants to
         // inspect 10–20 related pages at once. Pre-0.2.17 the only
-        // option was N sequential `brain_get_page` calls, which
+        // option was N sequential single-page reads, which
         // serialised wall-clock time on the MCP transport. Now one
         // call returns an array of `{id, found, page?, error?}` so the
         // agent can branch on each entry without round-trips.
         // Missing ids must NOT abort the whole call — return them
         // marked `found: false` so the agent can decide per-id
         // whether to create-or-skip.
-        use tempfile::TempDir;
         use crate::vault::layout::{ensure_skeleton, wiki_dir};
+        use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
         seed_marker(tmp.path());
@@ -4061,15 +5272,37 @@ mod tests {
         )
         .expect("brain_get_pages must succeed even with mixed found/missing");
         let parsed: serde_json::Value = serde_json::from_str(&ok).expect("response is JSON");
-        let pages = parsed.get("pages").and_then(|v| v.as_array()).expect("pages array");
-        assert_eq!(pages.len(), 3, "one entry per requested id, in request order");
-        assert_eq!(pages[0].get("id").and_then(|v| v.as_str()), Some("entities/alice"));
+        let pages = parsed
+            .get("pages")
+            .and_then(|v| v.as_array())
+            .expect("pages array");
+        assert_eq!(
+            pages.len(),
+            3,
+            "one entry per requested id, in request order"
+        );
+        assert_eq!(
+            pages[0].get("id").and_then(|v| v.as_str()),
+            Some("entities/alice")
+        );
         assert_eq!(pages[0].get("found").and_then(|v| v.as_bool()), Some(true));
-        assert!(pages[0].get("page").is_some(), "found entries carry the page payload");
-        assert_eq!(pages[1].get("id").and_then(|v| v.as_str()), Some("entities/missing"));
+        assert!(
+            pages[0].get("page").is_some(),
+            "found entries carry the page payload"
+        );
+        assert_eq!(
+            pages[1].get("id").and_then(|v| v.as_str()),
+            Some("entities/missing")
+        );
         assert_eq!(pages[1].get("found").and_then(|v| v.as_bool()), Some(false));
-        assert!(pages[1].get("page").is_none(), "missing entries omit the page payload");
-        assert_eq!(pages[2].get("id").and_then(|v| v.as_str()), Some("entities/bob"));
+        assert!(
+            pages[1].get("page").is_none(),
+            "missing entries omit the page payload"
+        );
+        assert_eq!(
+            pages[2].get("id").and_then(|v| v.as_str()),
+            Some("entities/bob")
+        );
         assert_eq!(pages[2].get("found").and_then(|v| v.as_bool()), Some(true));
     }
 
@@ -4077,8 +5310,8 @@ mod tests {
     fn db_op_opens_a_handle_lazily_when_none_is_held() {
         // Cold start / first DB call: db starts None, vault present →
         // db_op opens the handle, runs the op, leaves the handle cached.
-        use tempfile::TempDir;
         use crate::vault::layout::ensure_skeleton;
+        use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
         seed_marker(tmp.path());
@@ -4097,8 +5330,8 @@ mod tests {
         // must surface as an error WITHOUT dropping/reopening the
         // handle (otherwise a bad query would trigger an endless
         // reopen loop).
-        use tempfile::TempDir;
         use crate::vault::layout::ensure_skeleton;
+        use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
         seed_marker(tmp.path());
@@ -4134,6 +5367,7 @@ mod tests {
             &req,
             Some(std::path::Path::new("/path/that/is/not/a/vault")),
             &mut None,
+            &mut Session::default(),
         );
         assert!(
             !resp.contains("BRAIN_VAULT_DISCONNECTED"),
@@ -4161,8 +5395,8 @@ mod tests {
         // on the page itself), the agent gets a structured success
         // response with `warnings` scoped to the current page only.
         // Global state stays accessible via `brain_lint_report`.
-        use tempfile::TempDir;
         use crate::vault::layout::{ensure_skeleton, wiki_dir};
+        use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
         seed_marker(tmp.path());
@@ -4208,16 +5442,15 @@ mod tests {
         // notice "I just overwrote a 4 KB rich page with 200 B of
         // sparse content". Carrying both sizes in the success payload
         // lets the agent self-check without an extra round-trip.
-        use tempfile::TempDir;
         use crate::vault::layout::{ensure_skeleton, wiki_dir};
+        use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
         seed_marker(tmp.path());
         // Seed an existing rich page.
         let entities = wiki_dir(tmp.path()).join("entities");
         std::fs::create_dir_all(&entities).unwrap();
-        let rich =
-            "---\nid: entities/alice\ntype: entity\ntitle: Alice\ncreated: 2026-04-30\nupdated: 2026-04-30\n---\n\n";
+        let rich = "---\nid: entities/alice\ntype: entity\ntitle: Alice\ncreated: 2026-04-30\nupdated: 2026-04-30\n---\n\n";
         let body = "Body line that repeats for a while. ".repeat(50);
         std::fs::write(entities.join("alice.md"), format!("{rich}{body}\n")).unwrap();
 
@@ -4236,17 +5469,26 @@ mod tests {
         .expect("write succeeds");
 
         let parsed: serde_json::Value = serde_json::from_str(&ok).expect("response is JSON");
-        let prev = parsed.get("previous_size_bytes").and_then(|v| v.as_i64()).expect("previous_size_bytes");
-        let new = parsed.get("new_size_bytes").and_then(|v| v.as_i64()).expect("new_size_bytes");
-        assert!(prev > new, "previous ({prev}) must exceed new ({new}) for this shrink test");
+        let prev = parsed
+            .get("previous_size_bytes")
+            .and_then(|v| v.as_i64())
+            .expect("previous_size_bytes");
+        let new = parsed
+            .get("new_size_bytes")
+            .and_then(|v| v.as_i64())
+            .expect("new_size_bytes");
+        assert!(
+            prev > new,
+            "previous ({prev}) must exceed new ({new}) for this shrink test"
+        );
         assert!(prev > 1000, "previous size sanity (got {prev})");
         assert!(new < 200, "new size sanity (got {new})");
     }
 
     #[test]
     fn patch_page_replaces_one_section_and_preserves_the_rest() {
-        use tempfile::TempDir;
         use crate::vault::layout::{ensure_skeleton, wiki_dir};
+        use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
         seed_marker(tmp.path());
@@ -4268,20 +5510,32 @@ mod tests {
             &mut None,
         )
         .expect("patch succeeds");
-        assert!(ok.contains("entities/alice"), "response names the page: {ok}");
+        assert!(
+            ok.contains("entities/alice"),
+            "response names the page: {ok}"
+        );
 
         let after = std::fs::read_to_string(entities.join("alice.md")).unwrap();
-        assert!(after.starts_with("---\nid: entities/alice"), "frontmatter preserved: {after}");
-        assert!(after.contains("## Kontakt\n\nneue Nummer +49 201 0"), "section replaced: {after}");
+        assert!(
+            after.starts_with("---\nid: entities/alice"),
+            "frontmatter preserved: {after}"
+        );
+        assert!(
+            after.contains("## Kontakt\n\nneue Nummer +49 201 0"),
+            "section replaced: {after}"
+        );
         assert!(!after.contains("alte Nummer"), "old section gone: {after}");
         assert!(after.contains("Intro."), "intro preserved: {after}");
-        assert!(after.contains("## Notizen\n\nbleibt"), "sibling section preserved: {after}");
+        assert!(
+            after.contains("## Notizen\n\nbleibt"),
+            "sibling section preserved: {after}"
+        );
     }
 
     #[test]
     fn patch_page_errors_when_the_page_does_not_exist() {
-        use tempfile::TempDir;
         use crate::vault::layout::ensure_skeleton;
+        use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
         seed_marker(tmp.path());
@@ -4294,7 +5548,10 @@ mod tests {
             &mut None,
         )
         .unwrap_err();
-        assert!(err.contains("page not found"), "patch on a missing page must fail clearly: {err}");
+        assert!(
+            err.contains("page not found"),
+            "patch on a missing page must fail clearly: {err}"
+        );
     }
 
     #[test]
@@ -4304,8 +5561,8 @@ mod tests {
         // agent can self-correct on the next round-trip without an
         // extra brain_lint_report call. The page itself still
         // writes successfully — warnings do not block.
-        use tempfile::TempDir;
         use crate::vault::layout::ensure_skeleton;
+        use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
         seed_marker(tmp.path());
@@ -4338,8 +5595,8 @@ mod tests {
         // The error string is the only signal the LLM gets, so it
         // must spell out both the offending value AND the four
         // valid singular forms.
-        use tempfile::TempDir;
         use crate::vault::layout::ensure_skeleton;
+        use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
         seed_marker(tmp.path());
@@ -4355,19 +5612,28 @@ mod tests {
             &mut None,
         )
         .expect_err("plural type must surface as a hard error, not a warning");
-        assert!(err.contains("unregistered-type"), "error must name the lint kind: {err}");
-        assert!(err.contains("entities"), "error must echo the offending value: {err}");
+        assert!(
+            err.contains("unregistered-type"),
+            "error must name the lint kind: {err}"
+        );
+        assert!(
+            err.contains("entities"),
+            "error must echo the offending value: {err}"
+        );
         // The four singular forms must be in the message so the
         // agent doesn't have to fetch them from a doc tool.
         for valid in &["entity", "concept", "source", "topic"] {
-            assert!(err.contains(valid), "valid type '{valid}' missing in error: {err}");
+            assert!(
+                err.contains(valid),
+                "valid type '{valid}' missing in error: {err}"
+            );
         }
     }
 
     #[test]
     fn write_raw_file_rejects_path_traversal_attempts() {
-        use tempfile::TempDir;
         use crate::vault::layout::ensure_skeleton;
+        use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
         seed_marker(tmp.path());
@@ -4468,13 +5734,12 @@ mod knowledge_tests {
         db.as_ref()
             .unwrap()
             .with(move |c| {
-                Ok(c
-                    .query_row(
-                        "SELECT reads, search_hits FROM page_access WHERE page_id = ?1",
-                        [&id],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
-                    .unwrap_or((0, 0)))
+                Ok(c.query_row(
+                    "SELECT reads, search_hits FROM page_access WHERE page_id = ?1",
+                    [&id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap_or((0, 0)))
             })
             .unwrap()
     }
@@ -4482,14 +5747,14 @@ mod knowledge_tests {
     // ---- A2 -------------------------------------------------------------
 
     #[test]
-    fn page_exists_reports_a_normalised_match_for_a_differently_spelled_new_id() {
+    fn lookup_reports_a_normalised_match_for_a_differently_spelled_new_id() {
         let tmp = vault();
         put(tmp.path(), "entities/mueller-gmbh", "", "Body.");
         let out = call_json(
             tmp.path(),
             &mut indexed(tmp.path()),
-            "brain_page_exists",
-            json!({ "id": "entities/Mueller_GmbH" }),
+            "brain_lookup",
+            json!({ "query_or_id": "entities/Mueller_GmbH" }),
         );
         assert_eq!(
             (out["exists"].clone(), out["matches"].clone()),
@@ -4501,27 +5766,32 @@ mod knowledge_tests {
     }
 
     #[test]
-    fn page_exists_reports_an_alias_match() {
+    fn lookup_reports_an_alias_match() {
         let tmp = vault();
-        put(tmp.path(), "entities/acme", "aliases: [ACME Corporation]\n", "Body.");
+        put(
+            tmp.path(),
+            "entities/acme",
+            "aliases: [ACME Corporation]\n",
+            "Body.",
+        );
         let out = call_json(
             tmp.path(),
             &mut indexed(tmp.path()),
-            "brain_page_exists",
-            json!({ "id": "entities/acme-corporation" }),
+            "brain_lookup",
+            json!({ "query_or_id": "entities/acme-corporation" }),
         );
         assert_eq!(out["matches"][0]["reason"], json!("alias"));
     }
 
     #[test]
-    fn page_exists_reports_a_similar_match() {
+    fn lookup_reports_a_similar_match() {
         let tmp = vault();
         put(tmp.path(), "entities/dan-shapiro", "", "Body.");
         let out = call_json(
             tmp.path(),
             &mut indexed(tmp.path()),
-            "brain_page_exists",
-            json!({ "id": "entities/dan-shapio" }),
+            "brain_lookup",
+            json!({ "query_or_id": "entities/dan-shapio" }),
         );
         assert_eq!(out["matches"][0]["reason"], json!("similar"));
     }
@@ -4538,7 +5808,9 @@ mod knowledge_tests {
         )
         .unwrap_err();
         assert!(
-            err.contains("probably exists already: entities/mueller-gmbh \"mueller-gmbh\" (normalised)"),
+            err.contains(
+                "probably exists already: entities/mueller-gmbh \"mueller-gmbh\" (normalised)"
+            ),
             "got: {err}"
         );
     }
@@ -4576,7 +5848,12 @@ mod knowledge_tests {
     #[test]
     fn write_page_refuses_to_create_a_page_named_like_an_alias() {
         let tmp = vault();
-        put(tmp.path(), "entities/acme", "aliases: [ACME Corporation]\n", "Body.");
+        put(
+            tmp.path(),
+            "entities/acme",
+            "aliases: [ACME Corporation]\n",
+            "Body.",
+        );
         let err = call(
             tmp.path(),
             &mut indexed(tmp.path()),
@@ -4627,7 +5904,10 @@ mod knowledge_tests {
             json!({ "id": "entities/x", "content": page_text("entities/x", "", "x"), "allow_duplicate": "yes" }),
         )
         .unwrap_err();
-        assert!(err.contains("allow_duplicate must be a boolean"), "got: {err}");
+        assert!(
+            err.contains("allow_duplicate must be a boolean"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -4681,7 +5961,10 @@ mod knowledge_tests {
             ] }),
         )
         .unwrap_err();
-        assert!(err.starts_with("pages[1] (entities/Mueller_GmbH)"), "got: {err}");
+        assert!(
+            err.starts_with("pages[1] (entities/Mueller_GmbH)"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -4711,30 +5994,56 @@ mod knowledge_tests {
             "valid_to: 2025-12-31\nsuperseded_by: entities/b\nsources: [sources/s]\n",
             "Old facts.",
         );
-        put(tmp.path(), "entities/b", "sources: [sources/s]\n", "New facts.");
+        put(
+            tmp.path(),
+            "entities/b",
+            "sources: [sources/s]\n",
+            "New facts.",
+        );
         put(tmp.path(), "sources/s", "", "Source.");
         tmp
     }
 
     #[test]
-    fn get_context_of_a_superseded_page_names_the_successor_at_the_top_level() {
+    fn get_pages_with_context_of_a_superseded_page_names_the_successor() {
         let tmp = superseded_vault();
-        let out = call_json(tmp.path(), &mut indexed(tmp.path()), "brain_get_context", json!({ "id": "entities/a" }));
-        assert_eq!(out["superseded_by"], json!("entities/b"));
+        let out = call_json(
+            tmp.path(),
+            &mut indexed(tmp.path()),
+            "brain_get_pages",
+            json!({ "ids": ["entities/a"], "include_context": true }),
+        );
+        assert_eq!(
+            out["pages"][0]["page"]["superseded_by"],
+            json!("entities/b")
+        );
     }
 
     #[test]
-    fn get_context_of_a_superseded_page_carries_a_notice_field() {
+    fn get_pages_of_a_superseded_page_carries_a_notice_field() {
         let tmp = superseded_vault();
-        let out = call_json(tmp.path(), &mut indexed(tmp.path()), "brain_get_context", json!({ "id": "entities/a" }));
-        assert_eq!(out["notice"], json!("Superseded by entities/b"));
+        let out = call_json(
+            tmp.path(),
+            &mut indexed(tmp.path()),
+            "brain_get_pages",
+            json!({ "ids": ["entities/a"], "include_context": true }),
+        );
+        assert_eq!(
+            out["pages"][0]["page"]["notice"],
+            json!("Superseded by entities/b")
+        );
     }
 
     #[test]
-    fn get_context_of_a_superseded_page_returns_the_body_verbatim() {
+    fn get_pages_of_a_superseded_page_returns_the_body_verbatim() {
         let tmp = superseded_vault();
-        let out = call_json(tmp.path(), &mut indexed(tmp.path()), "brain_get_context", json!({ "id": "entities/a" }));
-        assert_eq!(out["page"]["body"], json!("Old facts.\n"));
+        let out = call_json(
+            tmp.path(),
+            &mut indexed(tmp.path()),
+            "brain_get_pages",
+            json!({ "ids": ["entities/a"], "include_context": true }),
+        );
+        assert_eq!(out["pages"][0]["page"]["body"], json!("Old facts.\n"));
     }
 
     #[test]
@@ -4755,31 +6064,57 @@ mod knowledge_tests {
     }
 
     #[test]
-    fn get_context_of_a_current_page_has_no_superseded_field() {
+    fn get_pages_of_a_current_page_has_no_superseded_field() {
         let tmp = superseded_vault();
-        let out = call_json(tmp.path(), &mut indexed(tmp.path()), "brain_get_context", json!({ "id": "entities/b" }));
-        assert!(out.get("superseded_by").is_none(), "got: {out}");
+        let out = call_json(
+            tmp.path(),
+            &mut indexed(tmp.path()),
+            "brain_get_pages",
+            json!({ "ids": ["entities/b"], "include_context": true }),
+        );
+        assert!(
+            out["pages"][0]["page"].get("superseded_by").is_none(),
+            "got: {out}"
+        );
     }
 
     #[test]
-    fn get_context_does_not_list_the_superseded_line_as_an_outbound_link() {
+    fn get_pages_with_context_does_not_list_the_superseded_line_as_an_outbound_link() {
         let tmp = superseded_vault();
-        let out = call_json(tmp.path(), &mut indexed(tmp.path()), "brain_get_context", json!({ "id": "entities/a" }));
-        assert_eq!(out["outbound"], json!([]));
+        let out = call_json(
+            tmp.path(),
+            &mut indexed(tmp.path()),
+            "brain_get_pages",
+            json!({ "ids": ["entities/a"], "include_context": true }),
+        );
+        assert_eq!(out["pages"][0]["outbound"], json!([]));
     }
 
     #[test]
-    fn get_page_of_a_superseded_page_names_the_successor() {
+    fn get_pages_of_a_superseded_page_names_the_successor() {
         let tmp = superseded_vault();
-        let out = call_json(tmp.path(), &mut indexed(tmp.path()), "brain_get_page", json!({ "id": "entities/a" }));
-        assert_eq!(out["superseded_by"], json!("entities/b"));
+        let out = call_json(
+            tmp.path(),
+            &mut indexed(tmp.path()),
+            "brain_get_pages",
+            json!({ "ids": ["entities/a"] }),
+        );
+        assert_eq!(
+            out["pages"][0]["page"]["superseded_by"],
+            json!("entities/b")
+        );
     }
 
     #[test]
     fn reading_a_superseded_page_leaves_its_file_unchanged() {
         let tmp = superseded_vault();
         let before = std::fs::read_to_string(page_file(tmp.path(), "entities/a")).unwrap();
-        call_json(tmp.path(), &mut indexed(tmp.path()), "brain_get_page", json!({ "id": "entities/a" }));
+        call_json(
+            tmp.path(),
+            &mut indexed(tmp.path()),
+            "brain_get_pages",
+            json!({ "ids": ["entities/a"] }),
+        );
         let after = std::fs::read_to_string(page_file(tmp.path(), "entities/a")).unwrap();
         assert_eq!(before, after);
     }
@@ -4787,8 +6122,13 @@ mod knowledge_tests {
     #[test]
     fn brain_query_leaves_out_a_superseded_page_by_default() {
         let tmp = superseded_vault();
-        let out = call_json(tmp.path(), &mut indexed(tmp.path()), "brain_query", json!({ "query": "type:entity" }));
-        let ids: Vec<&str> = out
+        let out = call_json(
+            tmp.path(),
+            &mut indexed(tmp.path()),
+            "brain_query",
+            json!({ "query": "type:entity" }),
+        );
+        let ids: Vec<&str> = out["hits"]
             .as_array()
             .unwrap()
             .iter()
@@ -4800,12 +6140,17 @@ mod knowledge_tests {
     // ---- H3 ---------------------------------------------------------------
 
     #[test]
-    fn get_page_counts_one_read_per_call() {
+    fn get_pages_counts_one_read_per_call() {
         let tmp = vault();
         put(tmp.path(), "entities/alice", "", "Body.");
         let mut db = indexed(tmp.path());
         for _ in 0..3 {
-            call_json(tmp.path(), &mut db, "brain_get_page", json!({ "id": "entities/alice" }));
+            call_json(
+                tmp.path(),
+                &mut db,
+                "brain_get_pages",
+                json!({ "ids": ["entities/alice"] }),
+            );
         }
         assert_eq!(access(&db, "entities/alice").0, 3);
     }
@@ -4822,26 +6167,45 @@ mod knowledge_tests {
             json!({ "ids": ["entities/alice", "entities/missing"] }),
         );
         assert_eq!(
-            (access(&db, "entities/alice").0, access(&db, "entities/missing").0),
+            (
+                access(&db, "entities/alice").0,
+                access(&db, "entities/missing").0
+            ),
             (1, 0)
         );
     }
 
     #[test]
-    fn get_context_counts_a_read_of_the_page() {
+    fn get_pages_with_context_counts_a_read_of_the_page() {
         let tmp = vault();
         put(tmp.path(), "entities/alice", "", "Body.");
         let mut db = indexed(tmp.path());
-        call_json(tmp.path(), &mut db, "brain_get_context", json!({ "id": "entities/alice" }));
+        call_json(
+            tmp.path(),
+            &mut db,
+            "brain_get_pages",
+            json!({ "ids": ["entities/alice"], "include_context": true }),
+        );
         assert_eq!(access(&db, "entities/alice").0, 1);
     }
 
     #[test]
     fn search_counts_a_search_hit_for_a_returned_page() {
         let tmp = vault();
-        put(tmp.path(), "concepts/zebrafish", "", "The zebrafish genome.");
+        put(
+            tmp.path(),
+            "concepts/zebrafish",
+            "",
+            "The zebrafish genome.",
+        );
         let mut db = indexed(tmp.path());
-        call(tmp.path(), &mut db, "brain_search", json!({ "query": "zebrafish" })).unwrap();
+        call(
+            tmp.path(),
+            &mut db,
+            "brain_search",
+            json!({ "query": "zebrafish" }),
+        )
+        .unwrap();
         assert_eq!(access(&db, "concepts/zebrafish").1, 1);
     }
 
@@ -4853,12 +6217,17 @@ mod knowledge_tests {
         put(tmp.path(), "entities/old", "", "Body.");
         crate::wiki::git::commit_all(&wiki, "baseline").unwrap();
         let mut db = indexed(tmp.path());
-        call_json(tmp.path(), &mut db, "brain_get_page", json!({ "id": "entities/old" }));
+        call_json(
+            tmp.path(),
+            &mut db,
+            "brain_get_pages",
+            json!({ "ids": ["entities/old"] }),
+        );
         call(
             tmp.path(),
             &mut db,
-            "brain_rename_page",
-            json!({ "id": "entities/old", "new_id": "entities/new" }),
+            "brain_refactor",
+            json!({ "action": "rename", "id": "entities/old", "new_id": "entities/new" }),
         )
         .unwrap();
         assert_eq!(
@@ -4871,19 +6240,29 @@ mod knowledge_tests {
     // rows never block (S4), get_pages dedupe ------------------------------
 
     #[test]
-    fn get_page_on_an_unbuilt_index_does_not_build_it() {
+    fn get_pages_on_an_unbuilt_index_does_not_build_it() {
         let tmp = vault();
         put(tmp.path(), "entities/alice", "", "Body.");
         let mut db = None;
-        call_json(tmp.path(), &mut db, "brain_get_page", json!({ "id": "entities/alice" }));
+        call_json(
+            tmp.path(),
+            &mut db,
+            "brain_get_pages",
+            json!({ "ids": ["entities/alice"] }),
+        );
         assert_eq!((db.is_none(), indexed_page_count(tmp.path())), (true, 0));
     }
 
     #[test]
-    fn page_exists_on_an_unbuilt_index_says_matches_were_not_checked() {
+    fn lookup_on_an_unbuilt_index_says_matches_were_not_checked() {
         let tmp = vault();
         put(tmp.path(), "entities/mueller-gmbh", "", "Body.");
-        let out = call_json(tmp.path(), &mut None, "brain_page_exists", json!({ "id": "entities/muller-gmbh" }));
+        let out = call_json(
+            tmp.path(),
+            &mut None,
+            "brain_lookup",
+            json!({ "query_or_id": "entities/muller-gmbh" }),
+        );
         assert_eq!(out["matches_checked"], json!(false));
     }
 
@@ -4940,5 +6319,1416 @@ mod knowledge_tests {
             json!({ "ids": ["entities/alice", "entities/alice"] }),
         );
         assert_eq!(access(&db, "entities/alice").0, 1);
+    }
+}
+
+/// Slice 0.3 (dual-era protocol) — the behaviour matrix of
+/// `docs/research/2026-10-mcp-spec-2026-07-28-gap.md` §4, one assertion
+/// per test.
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    fn legacy(id: i64, method: &str, params: Value) -> RpcRequest {
+        RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(id)),
+            method: method.into(),
+            params,
+        }
+    }
+
+    /// A 2026-07-28 request: `params` plus the required `_meta`.
+    fn modern(id: i64, method: &str, mut params: Value) -> RpcRequest {
+        params["_meta"] = json!({
+            META_PROTOCOL_VERSION: "2026-07-28",
+            META_CLIENT_CAPABILITIES: {},
+            META_CLIENT_INFO: { "name": "test-client", "version": "1" }
+        });
+        legacy(id, method, params)
+    }
+
+    fn send(req: &RpcRequest, session: &mut Session) -> Value {
+        serde_json::from_str(&handle_request(req, None, &mut None, session)).unwrap()
+    }
+
+    fn once(req: &RpcRequest) -> Value {
+        send(req, &mut Session::default())
+    }
+
+    /// The protocol version `initialize` answers for `requested`.
+    fn negotiated(requested: Value) -> Value {
+        once(&legacy(
+            1,
+            "initialize",
+            json!({ "protocolVersion": requested }),
+        ))["result"]["protocolVersion"]
+            .clone()
+    }
+
+    /// `tools/list` after an `initialize` with `version`.
+    fn tools_after_initialize(version: &str) -> Vec<Value> {
+        let mut session = Session::default();
+        send(
+            &legacy(1, "initialize", json!({ "protocolVersion": version })),
+            &mut session,
+        );
+        send(&legacy(2, "tools/list", json!({})), &mut session)["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    fn ping_call_after_initialize(version: &str) -> Value {
+        let mut session = Session::default();
+        send(
+            &legacy(1, "initialize", json!({ "protocolVersion": version })),
+            &mut session,
+        );
+        send(
+            &legacy(
+                2,
+                "tools/call",
+                json!({ "name": "brain_ping", "arguments": {} }),
+            ),
+            &mut session,
+        )["result"]
+            .clone()
+    }
+
+    // ---- legacy handshake -------------------------------------------------
+
+    #[test]
+    fn initialize_echoes_protocol_version_2024_11_05() {
+        assert_eq!(negotiated(json!("2024-11-05")), json!("2024-11-05"));
+    }
+
+    #[test]
+    fn initialize_echoes_protocol_version_2025_03_26() {
+        assert_eq!(negotiated(json!("2025-03-26")), json!("2025-03-26"));
+    }
+
+    #[test]
+    fn initialize_echoes_protocol_version_2025_06_18() {
+        assert_eq!(negotiated(json!("2025-06-18")), json!("2025-06-18"));
+    }
+
+    #[test]
+    fn initialize_echoes_protocol_version_2025_11_25() {
+        assert_eq!(negotiated(json!("2025-11-25")), json!("2025-11-25"));
+    }
+
+    #[test]
+    fn initialize_answers_2025_11_25_for_an_unsupported_version() {
+        assert_eq!(negotiated(json!("1999-01-01")), json!("2025-11-25"));
+    }
+
+    #[test]
+    fn initialize_answers_2025_11_25_when_the_client_names_no_version() {
+        let resp = once(&legacy(1, "initialize", json!({})));
+        assert_eq!(resp["result"]["protocolVersion"], json!("2025-11-25"));
+    }
+
+    #[test]
+    fn initialize_with_the_2026_modern_version_falls_back_to_the_latest_legacy_version() {
+        assert_eq!(negotiated(json!("2026-07-28")), json!("2025-11-25"));
+    }
+
+    #[test]
+    fn initialize_advertises_tools_prompts_and_resources_without_list_changes() {
+        let resp = once(&legacy(
+            1,
+            "initialize",
+            json!({ "protocolVersion": "2024-11-05" }),
+        ));
+        assert_eq!(
+            resp["result"]["capabilities"],
+            json!({
+                "tools": { "listChanged": false },
+                "prompts": { "listChanged": false },
+                "resources": { "listChanged": false }
+            })
+        );
+    }
+
+    #[test]
+    fn a_legacy_initialize_result_has_exactly_the_three_legacy_fields() {
+        let resp = once(&legacy(
+            1,
+            "initialize",
+            json!({ "protocolVersion": "2024-11-05" }),
+        ));
+        let keys: Vec<&String> = resp["result"].as_object().unwrap().keys().collect();
+        assert_eq!(keys, vec!["capabilities", "protocolVersion", "serverInfo"]);
+    }
+
+    #[test]
+    fn legacy_ping_answers_an_empty_object() {
+        assert_eq!(once(&legacy(1, "ping", json!({})))["result"], json!({}));
+    }
+
+    #[test]
+    fn legacy_tools_list_carries_no_modern_fields() {
+        let result = once(&legacy(1, "tools/list", json!({})))["result"].clone();
+        let modern_fields: Vec<&str> = ["resultType", "ttlMs", "cacheScope", "_meta"]
+            .into_iter()
+            .filter(|k| result.get(*k).is_some())
+            .collect();
+        assert!(modern_fields.is_empty(), "{modern_fields:?}");
+    }
+
+    #[test]
+    fn tools_for_a_2024_11_05_client_have_only_name_description_and_input_schema() {
+        let stray: Vec<String> = tools_after_initialize("2024-11-05")
+            .iter()
+            .flat_map(|t| t.as_object().unwrap().keys().cloned().collect::<Vec<_>>())
+            .filter(|k| !["name", "description", "inputSchema"].contains(&k.as_str()))
+            .collect();
+        assert!(stray.is_empty(), "{stray:?}");
+    }
+
+    #[test]
+    fn tools_for_a_2025_03_26_client_carry_annotations_but_no_output_schema() {
+        let tools = tools_after_initialize("2025-03-26");
+        assert_eq!(
+            (
+                tools[0].get("annotations").is_some(),
+                tools[0].get("outputSchema").is_some()
+            ),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn tools_for_a_2025_06_18_client_carry_title_and_output_schema() {
+        let tools = tools_after_initialize("2025-06-18");
+        assert_eq!(
+            (
+                tools[0]["title"].clone(),
+                tools[0]["outputSchema"]["type"].clone()
+            ),
+            (json!("Ping BRAIN"), json!("object"))
+        );
+    }
+
+    #[test]
+    fn every_tool_declares_whether_it_is_read_only() {
+        let missing: Vec<String> = tools_after_initialize("2025-11-25")
+            .iter()
+            .filter(|t| !t["annotations"]["readOnlyHint"].is_boolean())
+            .map(|t| t["name"].to_string())
+            .collect();
+        assert!(missing.is_empty(), "{missing:?}");
+    }
+
+    #[test]
+    fn every_tool_description_names_a_sibling_to_use_instead() {
+        // "One sentence WHEN, one WHEN NOT (point to the sibling)".
+        let without_sibling: Vec<String> = tool_specs()
+            .iter()
+            .filter(|t| {
+                !tools::TOOL_NAMES
+                    .iter()
+                    .any(|other| *other != t.name && t.description.contains(other))
+            })
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(without_sibling.is_empty(), "{without_sibling:?}");
+    }
+
+    #[test]
+    fn a_2024_11_05_tool_result_carries_no_structured_content() {
+        assert!(
+            ping_call_after_initialize("2024-11-05")
+                .get("structuredContent")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_2025_06_18_tool_result_carries_structured_content() {
+        assert_eq!(
+            ping_call_after_initialize("2025-06-18")["structuredContent"]["status"],
+            json!("ok")
+        );
+    }
+
+    #[test]
+    fn the_text_content_of_a_json_tool_result_is_compact_json() {
+        let text = ping_call_after_initialize("2025-11-25")["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!text.contains('\n'), "{text}");
+    }
+
+    // ---- modern (2026-07-28) --------------------------------------------
+
+    #[test]
+    fn modern_tools_list_is_marked_complete() {
+        assert_eq!(
+            once(&modern(1, "tools/list", json!({})))["result"]["resultType"],
+            json!("complete")
+        );
+    }
+
+    #[test]
+    fn modern_tools_list_carries_a_one_hour_ttl() {
+        assert_eq!(
+            once(&modern(1, "tools/list", json!({})))["result"]["ttlMs"],
+            json!(3_600_000)
+        );
+    }
+
+    #[test]
+    fn modern_tools_list_is_publicly_cacheable() {
+        assert_eq!(
+            once(&modern(1, "tools/list", json!({})))["result"]["cacheScope"],
+            json!("public")
+        );
+    }
+
+    #[test]
+    fn modern_results_name_the_server_in_meta() {
+        let resp = once(&modern(1, "tools/list", json!({})));
+        assert_eq!(
+            resp["result"]["_meta"][META_SERVER_INFO]["name"],
+            json!("BRAIN")
+        );
+    }
+
+    #[test]
+    fn modern_tools_list_includes_output_schemas() {
+        let resp = once(&modern(1, "tools/list", json!({})));
+        assert!(resp["result"]["tools"][0]["outputSchema"].is_object());
+    }
+
+    #[test]
+    fn server_discover_lists_2026_07_28_as_supported() {
+        let resp = once(&modern(1, "server/discover", json!({})));
+        assert_eq!(resp["result"]["supportedVersions"], json!(["2026-07-28"]));
+    }
+
+    #[test]
+    fn server_discover_returns_the_capabilities() {
+        let resp = once(&modern(1, "server/discover", json!({})));
+        assert_eq!(resp["result"]["capabilities"], capabilities());
+    }
+
+    #[test]
+    fn server_discover_is_marked_complete() {
+        let resp = once(&modern(1, "server/discover", json!({})));
+        assert_eq!(resp["result"]["resultType"], json!("complete"));
+    }
+
+    #[test]
+    fn server_discover_carries_a_one_hour_ttl() {
+        let resp = once(&modern(1, "server/discover", json!({})));
+        assert_eq!(resp["result"]["ttlMs"], json!(3_600_000));
+    }
+
+    #[test]
+    fn a_modern_request_without_client_capabilities_is_invalid_params() {
+        let mut req = modern(1, "tools/list", json!({}));
+        req.params["_meta"]
+            .as_object_mut()
+            .unwrap()
+            .remove(META_CLIENT_CAPABILITIES);
+        assert_eq!(once(&req)["error"]["code"], json!(-32602));
+    }
+
+    #[test]
+    fn a_modern_request_with_an_unknown_version_gets_unsupported_protocol_version() {
+        let mut req = modern(1, "tools/list", json!({}));
+        req.params["_meta"][META_PROTOCOL_VERSION] = json!("1900-01-01");
+        let resp = once(&req);
+        assert_eq!(
+            (resp["error"]["code"].clone(), resp["error"]["data"].clone()),
+            (
+                json!(-32022),
+                json!({ "supported": ["2026-07-28"], "requested": "1900-01-01" })
+            )
+        );
+    }
+
+    #[test]
+    fn modern_ping_is_method_not_found() {
+        assert_eq!(
+            once(&modern(1, "ping", json!({})))["error"]["code"],
+            json!(-32601)
+        );
+    }
+
+    #[test]
+    fn modern_initialize_is_method_not_found() {
+        assert_eq!(
+            once(&modern(1, "initialize", json!({})))["error"]["code"],
+            json!(-32601)
+        );
+    }
+
+    #[test]
+    fn modern_brain_ping_answers_without_a_vault_and_is_marked_complete() {
+        let resp = once(&modern(
+            1,
+            "tools/call",
+            json!({ "name": "brain_ping", "arguments": {} }),
+        ));
+        assert_eq!(
+            (
+                resp["result"]["isError"].clone(),
+                resp["result"]["resultType"].clone()
+            ),
+            (json!(false), json!("complete"))
+        );
+    }
+
+    #[test]
+    fn an_initialize_and_a_modern_request_in_one_process_are_both_served() {
+        let mut session = Session::default();
+        send(
+            &legacy(1, "initialize", json!({ "protocolVersion": "2024-11-05" })),
+            &mut session,
+        );
+        let resp = send(&modern(2, "tools/list", json!({})), &mut session);
+        assert_eq!(resp["result"]["resultType"], json!("complete"));
+    }
+
+    #[test]
+    fn a_modern_request_after_a_2024_initialize_still_gets_every_tool_field() {
+        let mut session = Session::default();
+        send(
+            &legacy(1, "initialize", json!({ "protocolVersion": "2024-11-05" })),
+            &mut session,
+        );
+        let resp = send(&modern(2, "tools/list", json!({})), &mut session);
+        assert!(resp["result"]["tools"][0]["annotations"].is_object());
+    }
+
+    #[test]
+    fn a_modern_notifications_initialized_yields_no_reply() {
+        let mut req = modern(1, "notifications/initialized", json!({}));
+        req.id = None;
+        assert!(handle_request(&req, None, &mut None, &mut Session::default()).is_empty());
+    }
+
+    // ---- tool names ---------------------------------------------------------
+
+    #[test]
+    fn every_removed_tool_name_gets_invalid_params_naming_its_replacement() {
+        let wrong: Vec<String> = tools::REMOVED_TOOLS
+            .iter()
+            .filter_map(|r| {
+                let resp = once(&legacy(
+                    1,
+                    "tools/call",
+                    json!({ "name": r.old, "arguments": {} }),
+                ));
+                let ok = resp["error"]["code"] == json!(-32602)
+                    && resp["error"]["message"]
+                        .as_str()
+                        .is_some_and(|m| m.contains(&format!("replaced by '{}'", r.new)));
+                (!ok).then(|| format!("{}: {resp}", r.old))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    #[test]
+    fn a_removed_tool_name_is_refused_the_same_way_in_the_modern_era() {
+        let resp = once(&modern(
+            1,
+            "tools/call",
+            json!({ "name": tools::REMOVED_TOOLS[0].old }),
+        ));
+        assert_eq!(resp["error"]["code"], json!(-32602));
+    }
+
+    #[test]
+    fn an_unknown_tool_is_invalid_params_not_a_tool_error() {
+        let resp = once(&legacy(1, "tools/call", json!({ "name": "brain_nope" })));
+        assert_eq!(
+            (
+                resp["error"]["code"].clone(),
+                resp["error"]["message"].clone()
+            ),
+            (json!(-32602), json!("Unknown tool: brain_nope"))
+        );
+    }
+
+    // ---- prompts ------------------------------------------------------------
+
+    fn prompt_text(name: &str, arguments: Value) -> String {
+        let resp = once(&legacy(
+            1,
+            "prompts/get",
+            json!({ "name": name, "arguments": arguments }),
+        ));
+        resp["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no prompt text: {resp}"))
+            .to_string()
+    }
+
+    #[test]
+    fn prompts_list_names_ingest_lint_session_and_dream() {
+        let resp = once(&legacy(1, "prompts/list", json!({})));
+        let names: Vec<&str> = resp["result"]["prompts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["ingest", "lint-session", "dream"]);
+    }
+
+    #[test]
+    fn the_ingest_prompt_names_the_source_to_ingest() {
+        let text = prompt_text("ingest", json!({ "source": "01_raw/email/kickoff.eml" }));
+        assert!(text.contains("01_raw/email/kickoff.eml"), "{text}");
+    }
+
+    #[test]
+    fn the_ingest_prompt_writes_the_pages_with_one_write_batch() {
+        let text = prompt_text("ingest", json!({ "source": "x" }));
+        assert!(text.contains("ONE brain_write_batch"), "{text}");
+    }
+
+    #[test]
+    fn the_ingest_prompt_without_a_source_is_invalid_params() {
+        let resp = once(&legacy(1, "prompts/get", json!({ "name": "ingest" })));
+        assert_eq!(resp["error"]["code"], json!(-32602));
+    }
+
+    #[test]
+    fn the_lint_session_prompt_narrows_to_the_focus_kind() {
+        let text = prompt_text("lint-session", json!({ "focus": "orphan" }));
+        assert!(text.contains("only on findings of kind `orphan`"), "{text}");
+    }
+
+    #[test]
+    fn the_lint_session_prompt_starts_from_the_newest_audit() {
+        let text = prompt_text("lint-session", json!({}));
+        assert!(text.contains("brain://audit/latest"), "{text}");
+    }
+
+    #[test]
+    fn the_dream_prompt_caps_a_session_at_ten_changes_by_default() {
+        let text = prompt_text("dream", json!({}));
+        assert!(text.contains("At most 10 changes"), "{text}");
+    }
+
+    #[test]
+    fn the_dream_prompt_forbids_deleting_linked_pages() {
+        let text = prompt_text("dream", json!({}));
+        assert!(
+            text.contains("Never delete a page that other pages link to"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_dream_prompt_ends_with_a_dream_log_entry() {
+        let text = prompt_text("dream", json!({}));
+        assert!(text.contains("brain_dream action \"log\""), "{text}");
+    }
+
+    #[test]
+    fn the_dream_prompt_takes_a_custom_change_limit() {
+        let text = prompt_text("dream", json!({ "max_changes": "3" }));
+        assert!(text.contains("At most 3 changes"), "{text}");
+    }
+
+    #[test]
+    fn the_dream_prompt_rejects_a_non_numeric_change_limit() {
+        let resp = once(&legacy(
+            1,
+            "prompts/get",
+            json!({ "name": "dream", "arguments": { "max_changes": "many" } }),
+        ));
+        assert_eq!(resp["error"]["code"], json!(-32602));
+    }
+
+    #[test]
+    fn an_unknown_prompt_is_invalid_params() {
+        let resp = once(&legacy(1, "prompts/get", json!({ "name": "nope" })));
+        assert_eq!(resp["error"]["code"], json!(-32602));
+    }
+
+    #[test]
+    fn modern_prompts_list_carries_a_ttl() {
+        assert_eq!(
+            once(&modern(1, "prompts/list", json!({})))["result"]["ttlMs"],
+            json!(3_600_000)
+        );
+    }
+
+    // ---- resources ------------------------------------------------------------
+
+    fn vault_with_marker() -> tempfile::TempDir {
+        let tmp = tempfile::TempDir::new().unwrap();
+        crate::vault::layout::ensure_skeleton(tmp.path()).unwrap();
+        let marker = crate::vault::marker::VaultMarker::new("test");
+        crate::vault::marker::write_marker(tmp.path(), &marker).unwrap();
+        tmp
+    }
+
+    fn read_resource(uri: &str, vault: Option<&std::path::Path>) -> Value {
+        let req = legacy(1, "resources/read", json!({ "uri": uri }));
+        serde_json::from_str(&handle_request(
+            &req,
+            vault,
+            &mut None,
+            &mut Session::default(),
+        ))
+        .unwrap()
+    }
+
+    fn resource_text(resp: &Value) -> String {
+        resp["result"]["contents"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no resource text: {resp}"))
+            .to_string()
+    }
+
+    #[test]
+    fn resources_list_names_the_three_brain_resources() {
+        let resp = once(&legacy(1, "resources/list", json!({})));
+        let uris: Vec<&str> = resp["result"]["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["uri"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            uris,
+            vec![
+                "brain://agents-md",
+                "brain://audit/latest",
+                "brain://dream-queue"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_agents_md_resource_serves_the_vault_file() {
+        let tmp = vault_with_marker();
+        std::fs::write(
+            crate::vault::layout::meta_dir(tmp.path()).join("AGENTS.md"),
+            "# customised conventions",
+        )
+        .unwrap();
+        let text = resource_text(&read_resource("brain://agents-md", Some(tmp.path())));
+        assert_eq!(text, "# customised conventions");
+    }
+
+    #[test]
+    fn the_agents_md_resource_serves_the_bundled_template_without_a_vault() {
+        let text = resource_text(&read_resource("brain://agents-md", None));
+        assert_eq!(text, crate::onboarding::template::AGENTS_MD);
+    }
+
+    #[test]
+    fn the_audit_resource_serves_the_newest_audit_report() {
+        let tmp = vault_with_marker();
+        let dir = crate::wiki::audit::audit_dir(tmp.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("2026-10-01.md"), "old audit").unwrap();
+        std::fs::write(dir.join("2026-10-05.md"), "new audit").unwrap();
+        let text = resource_text(&read_resource("brain://audit/latest", Some(tmp.path())));
+        assert_eq!(text, "new audit");
+    }
+
+    #[test]
+    fn the_audit_resource_without_any_audit_is_resource_not_found() {
+        let tmp = vault_with_marker();
+        let resp = read_resource("brain://audit/latest", Some(tmp.path()));
+        assert_eq!(resp["error"]["code"], json!(-32002));
+    }
+
+    #[test]
+    fn the_dream_queue_resource_serves_the_queue_as_json() {
+        let tmp = vault_with_marker();
+        let queue: Value = serde_json::from_str(&resource_text(&read_resource(
+            "brain://dream-queue",
+            Some(tmp.path()),
+        )))
+        .unwrap();
+        assert!(queue["items"].is_array(), "{queue}");
+    }
+
+    #[test]
+    fn the_dream_queue_resource_without_a_vault_is_the_no_vault_error() {
+        let resp = read_resource("brain://dream-queue", None);
+        assert_eq!(resp["error"]["code"], json!(NO_VAULT));
+    }
+
+    #[test]
+    fn an_unknown_resource_is_resource_not_found() {
+        let resp = read_resource("brain://nope", None);
+        assert_eq!(resp["error"]["code"], json!(-32002));
+    }
+
+    #[test]
+    fn a_modern_resource_read_is_privately_cacheable() {
+        let resp = once(&modern(
+            1,
+            "resources/read",
+            json!({ "uri": "brain://agents-md" }),
+        ));
+        assert_eq!(resp["result"]["cacheScope"], json!("private"));
+    }
+
+    // ---- fix round: instructions, legacy _meta, actions, prompt args ------
+
+    #[test]
+    fn initialize_for_2025_03_26_carries_the_usage_instructions() {
+        let resp = once(&legacy(
+            1,
+            "initialize",
+            json!({ "protocolVersion": "2025-03-26" }),
+        ));
+        assert_eq!(resp["result"]["instructions"], json!(INSTRUCTIONS));
+    }
+
+    #[test]
+    fn initialize_for_2024_11_05_carries_no_instructions() {
+        let resp = once(&legacy(
+            1,
+            "initialize",
+            json!({ "protocolVersion": "2024-11-05" }),
+        ));
+        assert!(resp["result"].get("instructions").is_none(), "{resp}");
+    }
+
+    #[test]
+    fn server_discover_carries_the_usage_instructions() {
+        let resp = once(&modern(1, "server/discover", json!({})));
+        assert_eq!(resp["result"]["instructions"], json!(INSTRUCTIONS));
+    }
+
+    #[test]
+    fn a_legacy_version_in_meta_is_served_as_a_legacy_request() {
+        let mut req = modern(1, "tools/list", json!({}));
+        req.params["_meta"][META_PROTOCOL_VERSION] = json!("2025-06-18");
+        assert!(once(&req)["result"].get("resultType").is_none());
+    }
+
+    #[test]
+    fn refactor_without_an_action_is_invalid_params_listing_the_actions() {
+        let resp = once(&legacy(
+            1,
+            "tools/call",
+            json!({ "name": "brain_refactor", "arguments": { "id": "entities/x" } }),
+        ));
+        assert_eq!(
+            (
+                resp["error"]["code"].clone(),
+                resp["error"]["message"].clone()
+            ),
+            (
+                json!(-32602),
+                json!("brain_refactor: missing 'action' (one of: rename, merge, delete)")
+            )
+        );
+    }
+
+    #[test]
+    fn an_unknown_history_action_is_invalid_params() {
+        let resp = once(&legacy(
+            1,
+            "tools/call",
+            json!({ "name": "brain_history", "arguments": { "action": "undo", "id": "entities/x" } }),
+        ));
+        assert_eq!(resp["error"]["code"], json!(-32602));
+    }
+
+    #[test]
+    fn a_non_string_prompt_argument_is_invalid_params() {
+        let resp = once(&legacy(
+            1,
+            "prompts/get",
+            json!({ "name": "dream", "arguments": { "max_changes": 3 } }),
+        ));
+        assert_eq!(resp["error"]["code"], json!(-32602));
+    }
+
+    #[test]
+    fn the_dream_prompt_confirms_summaries_only_through_write_page() {
+        let text = prompt_text("dream", json!({}));
+        assert!(
+            !text.contains("brain_patch_page with unchanged content"),
+            "{text}"
+        );
+    }
+}
+
+/// Slice D — response_format, brain_lookup by name, action
+/// discriminators, through the tool dispatcher.
+#[cfg(test)]
+mod slice_d_tests {
+    use super::*;
+    use crate::vault::layout::{ensure_skeleton, wiki_dir};
+    use tempfile::TempDir;
+
+    fn vault() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        let marker = crate::vault::marker::VaultMarker::new("test");
+        crate::vault::marker::write_marker(tmp.path(), &marker).unwrap();
+        tmp
+    }
+
+    fn put(vault: &std::path::Path, id: &str, extra: &str, body: &str) {
+        let (sub, slug) = id.split_once('/').unwrap();
+        let kind = match sub {
+            "concepts" => "concept",
+            "sources" => "source",
+            "topics" => "topic",
+            _ => "entity",
+        };
+        let dir = wiki_dir(vault).join(sub);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{slug}.md")),
+            format!("---\nid: {id}\ntype: {kind}\ntitle: {slug}\n{extra}---\n\n{body}\n"),
+        )
+        .unwrap();
+    }
+
+    fn indexed(vault: &std::path::Path) -> Option<crate::db::DbHandle> {
+        let db = crate::db::DbHandle::open(vault).unwrap();
+        crate::db::pages_index::rebuild(&db, vault).unwrap();
+        Some(db)
+    }
+
+    fn call(
+        vault: &std::path::Path,
+        db: &mut Option<crate::db::DbHandle>,
+        name: &str,
+        args: Value,
+    ) -> String {
+        call_tool(&json!({ "name": name, "arguments": args }), vault, db)
+            .unwrap_or_else(|e| panic!("{name} failed: {e}"))
+    }
+
+    fn call_json(
+        vault: &std::path::Path,
+        db: &mut Option<crate::db::DbHandle>,
+        name: &str,
+        args: Value,
+    ) -> Value {
+        serde_json::from_str(&call(vault, db, name, args)).unwrap()
+    }
+
+    /// Twelve concept pages that all mention "zebrafish", indexed.
+    fn zebrafish_vault() -> (TempDir, Option<crate::db::DbHandle>) {
+        let tmp = vault();
+        for i in 0..12 {
+            put(
+                tmp.path(),
+                &format!("concepts/zebrafish-{i:02}"),
+                "summary: A zebrafish study.\n",
+                "The zebrafish genome and its regulation in developmental biology.",
+            );
+        }
+        let db = indexed(tmp.path());
+        (tmp, db)
+    }
+
+    #[test]
+    fn concise_search_for_ten_hits_stays_under_1500_characters() {
+        let (tmp, mut db) = zebrafish_vault();
+        let out = call(
+            tmp.path(),
+            &mut db,
+            "brain_search",
+            json!({ "query": "zebrafish" }),
+        );
+        assert!(out.len() < 1500, "{} chars: {out}", out.len());
+    }
+
+    #[test]
+    fn concise_search_returns_ten_hits_by_default() {
+        let (tmp, mut db) = zebrafish_vault();
+        let out = call_json(
+            tmp.path(),
+            &mut db,
+            "brain_search",
+            json!({ "query": "zebrafish" }),
+        );
+        assert_eq!(out["hits"].as_array().map(Vec::len), Some(10));
+    }
+
+    #[test]
+    fn detailed_search_carries_snippets() {
+        let (tmp, mut db) = zebrafish_vault();
+        let out = call_json(
+            tmp.path(),
+            &mut db,
+            "brain_search",
+            json!({ "query": "zebrafish", "response_format": "detailed" }),
+        );
+        assert!(out["hits"][0]["snippet"].is_string(), "{out}");
+    }
+
+    #[test]
+    fn concise_search_is_smaller_than_detailed_search() {
+        let (tmp, mut db) = zebrafish_vault();
+        let concise = call(
+            tmp.path(),
+            &mut db,
+            "brain_search",
+            json!({ "query": "zebrafish" }),
+        );
+        let detailed = call(
+            tmp.path(),
+            &mut db,
+            "brain_search",
+            json!({ "query": "zebrafish", "response_format": "detailed" }),
+        );
+        assert!(
+            concise.len() < detailed.len(),
+            "{} vs {}",
+            concise.len(),
+            detailed.len()
+        );
+    }
+
+    #[test]
+    fn search_honours_the_limit() {
+        let (tmp, mut db) = zebrafish_vault();
+        let out = call_json(
+            tmp.path(),
+            &mut db,
+            "brain_search",
+            json!({ "query": "zebrafish", "limit": 3 }),
+        );
+        assert_eq!(out["hits"].as_array().map(Vec::len), Some(3));
+    }
+
+    #[test]
+    fn search_rejects_an_unknown_response_format() {
+        let (tmp, mut db) = zebrafish_vault();
+        let err = call_tool(
+            &json!({ "name": "brain_search", "arguments": { "query": "x", "response_format": "full" } }),
+            tmp.path(),
+            &mut db,
+        )
+        .unwrap_err();
+        assert!(err.contains("'response_format' must be"), "{err}");
+    }
+
+    #[test]
+    fn concise_get_pages_carries_the_summary_but_no_frontmatter() {
+        let (tmp, mut db) = zebrafish_vault();
+        let out = call_json(
+            tmp.path(),
+            &mut db,
+            "brain_get_pages",
+            json!({ "ids": ["concepts/zebrafish-01"] }),
+        );
+        let page = &out["pages"][0]["page"];
+        assert_eq!(
+            (page["summary"].clone(), page.get("frontmatter").is_some()),
+            (json!("A zebrafish study."), false)
+        );
+    }
+
+    #[test]
+    fn detailed_get_pages_carries_the_frontmatter() {
+        let (tmp, mut db) = zebrafish_vault();
+        let out = call_json(
+            tmp.path(),
+            &mut db,
+            "brain_get_pages",
+            json!({ "ids": ["concepts/zebrafish-01"], "response_format": "detailed" }),
+        );
+        assert!(out["pages"][0]["page"]["frontmatter"].is_string(), "{out}");
+    }
+
+    #[test]
+    fn concise_get_pages_is_smaller_than_detailed_get_pages() {
+        let (tmp, mut db) = zebrafish_vault();
+        let ids = json!(["concepts/zebrafish-01", "concepts/zebrafish-02"]);
+        let concise = call(
+            tmp.path(),
+            &mut db,
+            "brain_get_pages",
+            json!({ "ids": ids }),
+        );
+        let detailed = call(
+            tmp.path(),
+            &mut db,
+            "brain_get_pages",
+            json!({ "ids": ids, "response_format": "detailed" }),
+        );
+        assert!(
+            concise.len() < detailed.len(),
+            "{} vs {}",
+            concise.len(),
+            detailed.len()
+        );
+    }
+
+    #[test]
+    fn concise_get_pages_with_context_lists_backlinks_as_ids() {
+        let tmp = vault();
+        put(tmp.path(), "entities/alice", "", "Body.");
+        put(tmp.path(), "entities/bob", "", "Knows [[entities/alice]].");
+        let out = call_json(
+            tmp.path(),
+            &mut None,
+            "brain_get_pages",
+            json!({ "ids": ["entities/alice"], "include_context": true }),
+        );
+        assert_eq!(out["pages"][0]["backlinks"], json!(["entities/bob"]));
+    }
+
+    #[test]
+    fn detailed_get_pages_with_context_lists_backlinks_with_titles() {
+        let tmp = vault();
+        put(tmp.path(), "entities/alice", "", "Body.");
+        put(tmp.path(), "entities/bob", "", "Knows [[entities/alice]].");
+        let out = call_json(
+            tmp.path(),
+            &mut None,
+            "brain_get_pages",
+            json!({ "ids": ["entities/alice"], "include_context": true, "response_format": "detailed" }),
+        );
+        assert_eq!(out["pages"][0]["backlinks"][0]["title"], json!("bob"));
+    }
+
+    #[test]
+    fn get_pages_without_include_context_carries_no_backlinks() {
+        let tmp = vault();
+        put(tmp.path(), "entities/alice", "", "Body.");
+        let out = call_json(
+            tmp.path(),
+            &mut None,
+            "brain_get_pages",
+            json!({ "ids": ["entities/alice"] }),
+        );
+        assert!(out["pages"][0].get("backlinks").is_none(), "{out}");
+    }
+
+    /// A vault with one broken link (error) and two pages without summary
+    /// (warnings).
+    fn lint_vault() -> TempDir {
+        let tmp = vault();
+        put(
+            tmp.path(),
+            "entities/alice",
+            "",
+            "Links [[entities/ghost]].",
+        );
+        put(tmp.path(), "entities/bob", "", "Body.");
+        tmp
+    }
+
+    #[test]
+    fn concise_lint_report_counts_warnings_per_kind_instead_of_listing_them() {
+        let tmp = lint_vault();
+        let out = call_json(tmp.path(), &mut None, "brain_lint_report", json!({}));
+        assert_eq!(
+            (
+                out.get("warnings").is_some(),
+                out["warning_kinds"]["missing-summary"].clone()
+            ),
+            (false, json!(2))
+        );
+    }
+
+    #[test]
+    fn concise_lint_report_still_lists_every_error() {
+        let tmp = lint_vault();
+        let out = call_json(tmp.path(), &mut None, "brain_lint_report", json!({}));
+        assert_eq!(out["errors"][0]["kind"], json!("broken-link"));
+    }
+
+    #[test]
+    fn detailed_lint_report_lists_the_warnings() {
+        let tmp = lint_vault();
+        let out = call_json(
+            tmp.path(),
+            &mut None,
+            "brain_lint_report",
+            json!({ "response_format": "detailed" }),
+        );
+        assert!(
+            out["warnings"].as_array().is_some_and(|w| !w.is_empty()),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn lint_report_with_a_kind_keeps_only_that_kind() {
+        let tmp = lint_vault();
+        let out = call_json(
+            tmp.path(),
+            &mut None,
+            "brain_lint_report",
+            json!({ "kind": "missing-summary", "response_format": "detailed" }),
+        );
+        let kinds: std::collections::BTreeSet<&str> = out["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(out["warnings"].as_array().unwrap())
+            .map(|f| f["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds.into_iter().collect::<Vec<_>>(),
+            vec!["missing-summary"]
+        );
+    }
+
+    #[test]
+    fn concise_graph_lists_edges_as_id_pairs() {
+        let tmp = vault();
+        put(tmp.path(), "entities/alice", "", "Knows [[entities/bob]].");
+        put(tmp.path(), "entities/bob", "", "Body.");
+        let out = call_json(tmp.path(), &mut None, "brain_graph", json!({}));
+        assert_eq!(out["edges"], json!([["entities/alice", "entities/bob"]]));
+    }
+
+    #[test]
+    fn detailed_graph_lists_nodes_with_their_type() {
+        let tmp = vault();
+        put(tmp.path(), "entities/alice", "", "Body.");
+        let out = call_json(
+            tmp.path(),
+            &mut None,
+            "brain_graph",
+            json!({ "response_format": "detailed" }),
+        );
+        assert_eq!(out["nodes"][0]["type"], json!("entity"));
+    }
+
+    #[test]
+    fn lookup_by_a_bare_name_finds_a_normalised_match_in_any_type() {
+        let tmp = vault();
+        put(tmp.path(), "concepts/mueller-gmbh", "", "Body.");
+        let out = call_json(
+            tmp.path(),
+            &mut indexed(tmp.path()),
+            "brain_lookup",
+            json!({ "query_or_id": "Müller GmbH" }),
+        );
+        assert_eq!(out["matches"][0]["id"], json!("concepts/mueller-gmbh"));
+    }
+
+    #[test]
+    fn lookup_by_a_bare_slug_reports_the_existing_page_as_exact() {
+        let tmp = vault();
+        put(tmp.path(), "entities/alice", "", "Body.");
+        let out = call_json(
+            tmp.path(),
+            &mut indexed(tmp.path()),
+            "brain_lookup",
+            json!({ "query_or_id": "alice" }),
+        );
+        assert_eq!(
+            (out["exists"].clone(), out["matches"][0]["reason"].clone()),
+            (json!(true), json!("exact"))
+        );
+    }
+
+    #[test]
+    fn lookup_never_returns_page_bodies() {
+        let tmp = vault();
+        put(tmp.path(), "entities/alice", "", "SECRET-BODY-TEXT");
+        let out = call(
+            tmp.path(),
+            &mut indexed(tmp.path()),
+            "brain_lookup",
+            json!({ "query_or_id": "alice" }),
+        );
+        assert!(!out.contains("SECRET-BODY-TEXT"), "{out}");
+    }
+
+    #[test]
+    fn brain_eval_without_an_action_runs_the_eval() {
+        let tmp = vault();
+        let err = call_tool(
+            &json!({ "name": "brain_eval", "arguments": {} }),
+            tmp.path(),
+            &mut None,
+        )
+        .unwrap_err();
+        assert!(err.contains("the eval set is empty"), "{err}");
+    }
+
+    #[test]
+    fn brain_history_without_an_action_lists_the_commits() {
+        let tmp = vault();
+        crate::wiki::git::init_repo(&wiki_dir(tmp.path())).unwrap();
+        put(tmp.path(), "entities/alice", "", "Body.");
+        crate::wiki::git::commit_all(&wiki_dir(tmp.path()), "alice").unwrap();
+        let out = call_json(
+            tmp.path(),
+            &mut None,
+            "brain_history",
+            json!({ "id": "entities/alice" }),
+        );
+        assert_eq!(out["commits"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn refactor_results_leave_out_absent_fields_instead_of_null() {
+        let tmp = vault();
+        put(tmp.path(), "entities/old", "", "Body.");
+        // No git repo: the rename lands on disk, the commit cannot be made.
+        let out = call(
+            tmp.path(),
+            &mut None,
+            "brain_refactor",
+            json!({ "action": "rename", "id": "entities/old", "new_id": "entities/new" }),
+        );
+        assert!(!out.contains("null"), "{out}");
+    }
+
+    #[test]
+    fn refactor_results_echo_the_action() {
+        let tmp = vault();
+        put(tmp.path(), "entities/junk", "", "Body.");
+        let out = call_json(
+            tmp.path(),
+            &mut None,
+            "brain_refactor",
+            json!({ "action": "delete", "id": "entities/junk" }),
+        );
+        assert_eq!(out["action"], json!("delete"));
+    }
+
+    #[test]
+    fn plain_snippets_drop_highlight_markers() {
+        assert_eq!(
+            plain_snippet("the «zebrafish» genome", 80),
+            "the zebrafish genome"
+        );
+    }
+
+    #[test]
+    fn plain_snippets_are_cut_at_a_word_boundary_within_the_limit() {
+        let snippet = plain_snippet(&"word ".repeat(40), 80);
+        assert_eq!(
+            (snippet.chars().count() <= 80, snippet.ends_with("word…")),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn concise_search_snippets_prefer_the_page_summary() {
+        let (tmp, mut db) = zebrafish_vault();
+        let out = call_json(
+            tmp.path(),
+            &mut db,
+            "brain_search",
+            json!({ "query": "zebrafish" }),
+        );
+        assert_eq!(out["hits"][0]["snippet"], json!("A zebrafish study."));
+    }
+
+    #[test]
+    fn brain_dream_with_an_unknown_action_is_refused() {
+        let tmp = vault();
+        let err = call_tool(
+            &json!({ "name": "brain_dream", "arguments": { "action": "sleep" } }),
+            tmp.path(),
+            &mut None,
+        )
+        .unwrap_err();
+        assert!(err.contains("unknown action 'sleep'"), "{err}");
+    }
+
+    #[test]
+    fn brain_write_raw_file_answers_with_the_written_path_as_json() {
+        let tmp = vault();
+        let out = call_json(
+            tmp.path(),
+            &mut None,
+            "brain_write_raw_file",
+            json!({ "connector": "notes", "relative_path": "a.txt", "content": "x" }),
+        );
+        assert_eq!(out["wrote"], json!("01_raw/notes/a.txt"));
+    }
+
+    #[test]
+    fn every_successful_json_tool_result_is_an_object_for_structured_content() {
+        // structuredContent must be an object (2025-06-18); every tool that
+        // declares an outputSchema must therefore answer with one.
+        let tmp = vault();
+        put(tmp.path(), "entities/alice", "", "Body.");
+        let mut db = indexed(tmp.path());
+        let calls = [
+            ("brain_search", json!({ "query": "Body" })),
+            ("brain_search", json!({ "query": "" })),
+            ("brain_lookup", json!({ "query_or_id": "alice" })),
+            ("brain_get_pages", json!({ "ids": ["entities/alice"] })),
+            (
+                "brain_get_pages",
+                json!({ "ids": ["entities/alice"], "include_context": true }),
+            ),
+            ("brain_query", json!({})),
+            ("brain_query", json!({ "facet": "tags" })),
+            ("brain_graph", json!({})),
+            ("brain_lint_report", json!({})),
+            ("brain_dream", json!({ "action": "queue" })),
+        ];
+        let not_objects: Vec<&str> = calls
+            .iter()
+            .filter(|(name, args)| {
+                !serde_json::from_str::<Value>(&call(tmp.path(), &mut db, name, args.clone()))
+                    .is_ok_and(|v| v.is_object())
+            })
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(not_objects.is_empty(), "{not_objects:?}");
+    }
+
+    /// Whether `value` has the JSON Schema `type` named by `ty`.
+    fn has_type(value: &Value, ty: &str) -> bool {
+        match ty {
+            "string" => value.is_string(),
+            "integer" => value.is_i64() || value.is_u64(),
+            "boolean" => value.is_boolean(),
+            "array" => value.is_array(),
+            "object" => value.is_object(),
+            _ => true,
+        }
+    }
+
+    #[test]
+    fn every_tool_result_matches_the_types_its_output_schema_declares() {
+        // A client validates structuredContent against outputSchema and
+        // rejects the call on a mismatch — so every declared field type
+        // must hold for real results (concise and detailed alike).
+        let tmp = vault();
+        let wiki = wiki_dir(tmp.path());
+        crate::wiki::git::init_repo(&wiki).unwrap();
+        put(
+            tmp.path(),
+            "entities/alice",
+            "summary: Alice.
+tags: [team]
+",
+            "Knows [[entities/bob]].",
+        );
+        put(tmp.path(), "entities/bob", "", "Body.");
+        put(tmp.path(), "entities/junk", "", "Junk.");
+        put(tmp.path(), "entities/dup", "", "Dup.");
+        put(tmp.path(), "entities/typo", "", "Typo.");
+        let sha = crate::wiki::git::commit_all(&wiki, "baseline")
+            .unwrap()
+            .unwrap();
+        let mut db = indexed(tmp.path());
+        let page = "---
+id: entities/carol
+type: entity
+title: Carol
+summary: Carol.
+---
+
+Body.
+";
+        let calls: Vec<(&str, Value)> = vec![
+            ("brain_search", json!({ "query": "Body" })),
+            (
+                "brain_search",
+                json!({ "query": "Body", "response_format": "detailed" }),
+            ),
+            ("brain_lookup", json!({ "query_or_id": "entities/alice" })),
+            ("brain_lookup", json!({ "query_or_id": "alice" })),
+            (
+                "brain_get_pages",
+                json!({ "ids": ["entities/alice", "entities/nope"], "response_format": "detailed" }),
+            ),
+            (
+                "brain_get_pages",
+                json!({ "ids": ["entities/alice"], "include_context": true }),
+            ),
+            ("brain_query", json!({ "query": "*", "limit": 1 })),
+            ("brain_query", json!({ "facet": "tags" })),
+            ("brain_graph", json!({})),
+            ("brain_graph", json!({ "response_format": "detailed" })),
+            (
+                "brain_write_page",
+                json!({ "id": "entities/carol", "content": page, "confirm_summary": true }),
+            ),
+            (
+                "brain_write_batch",
+                json!({ "pages": [{ "id": "entities/dave", "content": page.replace("carol", "dave").replace("Carol", "Dave") }] }),
+            ),
+            (
+                "brain_patch_page",
+                json!({ "id": "entities/bob", "heading": "## Notes", "content": "x", "confirm_summary": true }),
+            ),
+            ("brain_lint_report", json!({})),
+            (
+                "brain_lint_report",
+                json!({ "response_format": "detailed" }),
+            ),
+            (
+                "brain_history",
+                json!({ "action": "list", "id": "entities/alice" }),
+            ),
+            (
+                "brain_history",
+                json!({ "action": "restore", "id": "entities/bob", "sha": sha }),
+            ),
+            (
+                "brain_refactor",
+                json!({ "action": "rename", "id": "entities/typo", "new_id": "entities/fixed" }),
+            ),
+            (
+                "brain_refactor",
+                json!({ "action": "merge", "from_id": "entities/dup", "into_id": "entities/bob" }),
+            ),
+            (
+                "brain_refactor",
+                json!({ "action": "delete", "id": "entities/junk" }),
+            ),
+            (
+                "brain_write_raw_file",
+                json!({ "connector": "notes", "relative_path": "a.txt", "content": "x" }),
+            ),
+            (
+                "brain_eval",
+                json!({ "action": "add", "query": "Knows", "expected": ["entities/alice"] }),
+            ),
+            ("brain_eval", json!({ "action": "run" })),
+            ("brain_dream", json!({ "action": "queue" })),
+            (
+                "brain_dream",
+                json!({ "action": "log", "entry": "nothing" }),
+            ),
+        ];
+        let specs = tool_specs();
+        let mut mismatches: Vec<String> = Vec::new();
+        for (name, args) in calls {
+            let result: Value =
+                serde_json::from_str(&call(tmp.path(), &mut db, name, args)).unwrap();
+            assert!(result.is_object(), "{name}");
+            let spec = specs.iter().find(|s| s.name == name).unwrap();
+            for (field, schema) in spec.output["properties"].as_object().unwrap() {
+                let (Some(value), Some(ty)) = (result.get(field), schema["type"].as_str()) else {
+                    continue;
+                };
+                if !has_type(value, ty) {
+                    mismatches.push(format!("{name}.{field}: expected {ty}, got {value}"));
+                }
+            }
+        }
+        let ping: Value = serde_json::from_str(&brain_ping_detail(Some(tmp.path()), &db)).unwrap();
+        let spec = specs.iter().find(|s| s.name == "brain_ping").unwrap();
+        for (field, schema) in spec.output["properties"].as_object().unwrap() {
+            if let (Some(value), Some(ty)) = (ping.get(field), schema["type"].as_str()) {
+                if !has_type(value, ty) {
+                    mismatches.push(format!("brain_ping.{field}: expected {ty}, got {value}"));
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:?}");
     }
 }

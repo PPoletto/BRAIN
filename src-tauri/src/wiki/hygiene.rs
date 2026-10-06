@@ -226,7 +226,7 @@ fn orphans(pages: &[PageRow], links: &[(String, String)], now_unix: i64) -> Vec<
             message: format!(
                 "no other page links to '{}', and it was last changed on {} (more than {} \
                  days ago) — link it from a related page, merge it into another page \
-                 (brain_merge_pages) or delete it (brain_delete_page)",
+                 (brain_refactor, action merge) or delete it (brain_refactor, action delete)",
                 p.id,
                 format_local_date(p.mtime),
                 ORPHAN_MIN_AGE_DAYS
@@ -325,7 +325,7 @@ fn duplicate_candidates(rows: &HygieneRows, findings: &mut HygieneFindings) {
     for (score, a, b) in duplicate_pair_rows(rows, &mut findings.notes) {
         let message = format!(
             "'{}' and '{}' may be duplicates (similarity {score:.2}) — if they describe the \
-             same thing, fold one into the other with brain_merge_pages",
+             same thing, fold one into the other with brain_refactor (action merge)",
             a.id, b.id
         );
         for page in [a, b] {

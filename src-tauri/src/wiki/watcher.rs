@@ -130,7 +130,7 @@ async fn run_loop<R: Runtime>(
 /// changes (outside `.git/`) should wake the committer.
 ///
 /// Under `00_meta/` only the SYNCED files (`MIRRORED_META_FILES`:
-/// AGENTS.md, CLAUDE.md, eval-queries.yaml) count — log.md, index.md, the
+/// AGENTS.md, CLAUDE.md, SKILL.md, eval-queries.yaml) count — log.md, index.md, the
 /// audit reports under `00_meta/audit/`, the eval history and the dream
 /// queue/log are written by BRAIN itself and would churn events forever.
 pub(crate) fn is_relevant_event_path(meta_root: &Path, p: &Path) -> bool {
@@ -339,6 +339,12 @@ mod tests {
     fn editing_the_synced_eval_set_wakes_the_auto_committer() {
         let meta = Path::new("/vault/00_meta");
         assert!(is_relevant_event_path(meta, &meta.join("eval-queries.yaml")));
+    }
+
+    #[test]
+    fn editing_skill_md_wakes_the_auto_committer() {
+        let meta = Path::new("/vault/00_meta");
+        assert!(is_relevant_event_path(meta, &meta.join("SKILL.md")));
     }
 
     #[test]

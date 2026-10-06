@@ -128,7 +128,7 @@ export function Settings() {
     }
   }
 
-  // Refresh the bundled AGENTS.md / CLAUDE.md in the vault's 00_meta/
+  // Refresh the bundled AGENTS.md / CLAUDE.md / SKILL.md in the vault's 00_meta/
   // from the current binary. The action pushes its own success toast
   // with a per-file delta in the `detail` field — important here
   // because the user is overwriting potentially-edited files and
@@ -266,9 +266,14 @@ export function Settings() {
             <code className="font-mono">CLAUDE.md</code> — companion file for
             Claude Code
           </li>
+          <li>
+            <code className="font-mono">SKILL.md</code> — the{" "}
+            <code className="font-mono">brain-wiki</code> skill for clients
+            that load Agent Skills
+          </li>
         </ul>
         <p>
-          <strong>Any local edits to those two files will be lost.</strong>{" "}
+          <strong>Any local edits to those three files will be lost.</strong>{" "}
           Your <code className="font-mono">.mcp.json</code> (bearer token, MCP
           server config) is <strong>not</strong> touched, and no wiki page is
           touched either.
@@ -1404,9 +1409,9 @@ function DangerTab({
     <div className="space-y-4">
       {/*
         "Update vault templates" sits under Danger because it
-        overwrites AGENTS.md / CLAUDE.md in 00_meta/ with the
-        bundled copies — any local edits the user made to those
-        two files are lost. The .mcp.json (bearer token, MCP
+        overwrites AGENTS.md / CLAUDE.md / SKILL.md in 00_meta/ with
+        the bundled copies — any local edits the user made to those
+        three files are lost. The .mcp.json (bearer token, MCP
         server config) is deliberately untouched on this path so
         the user's external integration setup survives. Wiki
         content is also untouched.
@@ -1418,11 +1423,12 @@ function DangerTab({
               <span className="text-red-300">Update vault templates</span>
             </CardTitle>
             <CardDescription>
-              Overwrite <code className="font-mono">00_meta/AGENTS.md</code>{" "}
-              and <code className="font-mono">00_meta/CLAUDE.md</code> with the
+              Overwrite <code className="font-mono">00_meta/AGENTS.md</code>,{" "}
+              <code className="font-mono">00_meta/CLAUDE.md</code> and{" "}
+              <code className="font-mono">00_meta/SKILL.md</code> with the
               versions bundled in the current BRAIN release. Use this after a
               BRAIN upgrade to pull new agent conventions into an existing
-              vault. Local edits to those two files will be{" "}
+              vault. Local edits to those three files will be{" "}
               <strong>lost</strong>; the rest of the vault (wiki content,{" "}
               <code className="font-mono">.mcp.json</code>) is untouched.
             </CardDescription>

@@ -828,8 +828,8 @@ pub fn gc_page_access(conn: &rusqlite::Connection, absent_for_days: i64, now_uni
     Ok(n)
 }
 
-/// Salience (H3): count one read (`brain_get_page(s)`,
-/// `brain_get_context`) for each id. One UPSERT per id. `page_access` is
+/// Salience (H3): count one read (`brain_get_pages`, with or without
+/// `include_context`) for each id. One UPSERT per id. `page_access` is
 /// local usage data, not derived from the files: a rebuild never wipes
 /// it; only forgetting/pruning the page removes its row.
 pub fn record_reads(conn: &rusqlite::Connection, ids: &[String], now_unix: i64) -> DbResult<()> {

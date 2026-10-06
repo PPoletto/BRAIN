@@ -18,6 +18,9 @@ pub const BRAIN_MARKER_FILENAME: &str = "brain-marker.json";
 pub const MCP_CONFIG_FILENAME: &str = ".mcp.json";
 pub const AGENTS_FILENAME: &str = "AGENTS.md";
 pub const CLAUDE_FILENAME: &str = "CLAUDE.md";
+/// The `brain-wiki` Agent Skill (open Agent Skills format), flat in
+/// `00_meta/` because the meta mirror syncs plain file names only.
+pub const SKILL_FILENAME: &str = "SKILL.md";
 pub const VAULT_SETTINGS_FILENAME: &str = "settings-internal.json";
 
 pub const WIKI_SUBDIRS: &[&str] = &["entities", "concepts", "sources", "topics"];

@@ -8,15 +8,53 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **Rename, merge and delete pages from Claude/Codex.** Three new MCP
-  tools let an agent clean up the wiki instead of leaving mistakes behind:
-  - `brain_rename_page` gives a page created under a wrong name its
+- **MCP prompts for the recurring jobs.** The MCP server now offers three
+  prompt templates your client can list and insert: `ingest` (a raw file
+  becomes a source page plus entity and concept pages, written together
+  in one `brain_write_batch`), `lint-session` (work through the newest
+  audit kind by kind, with the fix for each finding kind) and `dream`
+  (read the dream queue, work it top-down, at most 10 changes, never
+  delete linked pages, supersede instead of overwriting, confirm or
+  update summaries, end with a dream-log entry). Dreaming stays
+  user-triggered — BRAIN schedules nothing.
+- **MCP resources.** `brain://agents-md` (the vault's AGENTS.md — or the
+  bundled one when no vault is there), `brain://audit/latest` (the newest
+  daily audit) and `brain://dream-queue` (the current dream queue) can be
+  read by clients without a tool call.
+- **Agent Skill `brain-wiki`.** BRAIN now writes `00_meta/SKILL.md` (open
+  Agent Skills format: name, description, then the tool map, the ingest /
+  cleanup / dream workflows and the hard rules) next to AGENTS.md, syncs
+  it between your machines like AGENTS.md and refreshes it with "Update
+  vault templates". The file in `00_meta/` is a template: Agent Skills
+  require the folder to carry the skill's name, so copy it to
+  `<skills dir>/brain-wiki/SKILL.md` of your client to use it (it sits
+  flat in `00_meta/` because the sync of `00_meta` files only handles
+  plain file names). **Update both machines to this release together:**
+  an older BRAIN on the other machine does not know SKILL.md and keeps
+  dropping it from what it shares, so the file's sync entry flips back
+  and forth until both run the new version (no data is lost).
+- **Short or full answers (`response_format`).** `brain_search`,
+  `brain_get_pages`, `brain_query`, `brain_graph` and `brain_lint_report`
+  answer `"concise"` by default (ids, titles, summaries, counts; search
+  hits carry a plain snippet of at most 80 characters — the page summary
+  when there is one — and ten hits stay under 1,500 characters) and
+  everything with `"detailed"` (highlighted snippets, full frontmatter,
+  salience counters, every lint warning).
+- **`brain_ping` with `detail: true`** reports the vault, whether search
+  is semantic (bge-m3) or runs on the hashed fallback, whether the model
+  is loaded, and the index size — without loading the model or building
+  the index (replaces the former embedding-status tool, which could load
+  the model).
+- **Rename, merge and delete pages from Claude/Codex.** The new MCP tool
+  `brain_refactor` lets an agent clean up the wiki instead of leaving
+  mistakes behind:
+  - `action: "rename"` gives a page created under a wrong name its
     correct id and updates every link to it across the vault — including
     links with a custom label.
-  - `brain_merge_pages` folds a duplicate page into the page that should
+  - `action: "merge"` folds a duplicate page into the page that should
     stay: its text is appended under a "Merged from …" heading, tags are
     combined, links are redirected and the duplicate is removed.
-  - `brain_delete_page` removes a junk page. It refuses while other pages
+  - `action: "delete"` removes a junk page. It refuses while other pages
     still link to it and names them; when forced, those links become plain
     text.
 
@@ -57,7 +95,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   deleted automatically.
 - **Duplicate check before a page is created.** Pages can list other
   names in their frontmatter (`aliases: [ACME Corp, Acme Inc]`). Before
-  creating a page, the agent's existence check (`brain_page_exists`) now
+  creating a page, the agent's existence check (`brain_lookup`) now
   also lists pages that are probably the same thing: one of their aliases,
   the same name spelled differently (upper/lower case, `ü` or `ue`,
   punctuation, `_` or space instead of `-`; for longer or multi-word names
@@ -109,9 +147,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Measure search quality (`brain eval`).** Test questions with the
   pages a good search should return live in `00_meta/eval-queries.yaml`
   (synced between your machines; encrypted in an encrypted vault). The
-  agent adds questions with the new MCP tool `brain_eval_add`, which
-  checks that the pages exist and refuses duplicates. `brain eval
-  <vault>` on the command line, the MCP tool `brain_eval` and the new
+  agent adds questions with the MCP tool `brain_eval` (action `add`),
+  which checks that the pages exist and refuses duplicates. `brain eval
+  <vault>` on the command line, `brain_eval` (action `run`) and the new
   "Search quality" card in Settings score full-text, semantic and hybrid
   search (Recall@10, MRR, nDCG@10) and append each run to
   `00_meta/eval-history.md` (kept on this machine). Same index, same
@@ -126,9 +164,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   summaries that no longer match their page, much-linked pages without a
   summary, and pages nobody reads or links to (always "archive or
   supersede", never delete). When you ask your agent to "dream", it reads
-  the list with the new MCP tool `brain_dream_queue` (recomputed when
-  older than an hour), works through at most ten items and notes what it
-  did with `brain_dream_log` in `00_meta/dream-log.md`. Both files stay
+  the list with the new MCP tool `brain_dream` (action `queue`;
+  recomputed when older than an hour), works through at most ten items and
+  notes what it did with `brain_dream` (action `log`) in
+  `00_meta/dream-log.md`. Both files stay
   on this machine. If a summary flagged as outdated is still right, the
   agent confirms it (`confirm_summary: true` on `brain_write_page` /
   `brain_patch_page`) instead of rewriting it. The daily audit also tidies
@@ -173,13 +212,58 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   when Claude/Codex start BRAIN's MCP server on a vault whose index is
   still empty, that server builds the index itself before it answers its
   first request.
-- **MCP log names the client's protocol version.** The MCP server now
-  logs one line per session with the protocol version, client name and
-  client version the connecting app declared, and answers a
-  `server/discover` probe (new in MCP 2026-07-28) with a clear "not yet
-  supported — please use the initialize handshake" error instead of a
-  generic "method not found". Current clients are unaffected; a client
-  that switches to the new protocol now leaves a diagnosable log line.
+- **MCP: both protocol generations, newer protocol versions.** The MCP
+  server now serves the new stateless MCP revision 2026-07-28 (protocol
+  version and client capabilities travel with every request; the server
+  answers `server/discover`, marks every result `resultType: "complete"`,
+  names itself in each result's `_meta` and adds cache hints —
+  `ttlMs` 1 hour, `cacheScope` — to the tool, prompt and resource lists)
+  **and** the classic `initialize` handshake in the same process. The
+  handshake no longer answers with the fixed `2024-11-05`: it confirms
+  the version the client asks for when BRAIN supports it (`2024-11-05`,
+  `2025-03-26`, `2025-06-18`, `2025-11-25`), otherwise `2025-11-25`. Each
+  client only gets the fields its version knows (tool annotations from
+  2025-03-26; tool titles, output schemas and structured results from
+  2025-06-18). A new-style request without client capabilities is refused
+  (`-32602`), an unknown new-style version gets `-32022` with the
+  supported versions. `server/discover` without the new-style metadata
+  still answers "method not found", so clients that probe and fall back
+  keep working. The MCP log line per session now also names the
+  negotiated version. Transport stays stdio.
+- **MCP error handling.** Calling an unknown tool, or a multi-action tool
+  without a valid `action`, is now a protocol error (`-32602`, "Unknown
+  tool: …" / the list of valid actions, as the MCP spec prescribes)
+  instead of a failed tool result — in both protocol generations. "No
+  vault is mounted" is now a readable tool error
+  (`BRAIN_VAULT_NOT_CONFIGURED`, like the existing "vault disconnected")
+  instead of the protocol error `-32000`; reading a vault resource without
+  a vault answers `-31000` (outside the range JSON-RPC/MCP reserve). A
+  request that carries a legacy version in the new-style metadata is
+  answered the legacy way. `initialize` (from protocol 2025-03-26) and
+  `server/discover` now include short usage instructions for the agent.
+- **MCP tool results are compact and structured.** The text of a tool
+  result is now compact JSON (no indentation — fewer tokens); clients on
+  protocol 2025-06-18 or newer also get the same object as
+  `structuredContent`, described by each tool's `outputSchema`. Shapes
+  that were plain lists are now objects: `brain_search` returns
+  `{hits}`, `brain_query` returns `{total, offset, returned, next_offset,
+  hits}`, `brain_write_raw_file` returns `{wrote}`.
+- **MCP tool surface consolidated (breaking, no transition names).** The
+  18 tools of 0.3.4 plus the 7 added in this cycle became 15, each with
+  one clear job; every description now says when to use the tool and
+  which sibling to use instead, and every tool carries a title and
+  read-only / destructive / idempotent hints. Related jobs share a tool
+  with an `action`: `brain_refactor` (rename / merge / delete),
+  `brain_history` (list, the default / restore), `brain_eval` (run, the
+  default / add), `brain_dream` (queue / log); `brain_get_pages` reads a
+  page's links too with `include_context: true`. Removed names answer
+  with an error naming the replacement (see "Removed").
+  `brain_search` now returns 10 hits by default (`limit` up to 20).
+  `brain_query` lists all current pages with `*` (or no query), takes
+  `prefix`, `limit` (default 100) and `offset`, and returns tag counts
+  with `facet: "tags"`. `brain_lint_report` takes `kind` to return one
+  finding kind only. Use "Update vault templates" in Settings so your
+  agent gets the new tool map (AGENTS.md and the new SKILL.md).
 - **Title and summary matches count more in full-text search.** Full-text
   ranking now weights a match in the page title three times and a match
   in the summary five times a match in the body (before, all counted the
@@ -190,6 +274,32 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   passages (was 50), so one long page with many similar passages no
   longer crowds out other pages, and it ranks pages, not passages, before
   combining with full-text search.
+
+### Removed
+
+- **Old MCP tool names (no aliases).** A call with one of these names
+  fails with `-32602` "tool '<old>' was replaced by '<new>' (args: …)".
+  Agents read the tool list per session; update the vault templates so
+  their instructions match.
+
+  | Old tool | New call |
+  |---|---|
+  | `brain_get_page {id}` | `brain_get_pages {ids: [id]}` |
+  | `brain_get_context {id}` | `brain_get_pages {ids: [id], include_context: true}` |
+  | `brain_page_exists {id}` | `brain_lookup {query_or_id: id}` (also takes a bare name) |
+  | `brain_list_pages {type, prefix, limit, offset}` | `brain_query {query: "*"}` or `{query: "type:entity", prefix, limit, offset}` |
+  | `brain_list_tags` | `brain_query {facet: "tags"}` |
+  | `brain_embedding_status` | `brain_ping {detail: true}` |
+  | `brain_get_page_history {id, limit}` | `brain_history {action: "list", id, limit}` |
+  | `brain_restore_page {id, sha}` | `brain_history {action: "restore", id, sha}` |
+  | `brain_rename_page {id, new_id}` ¹ | `brain_refactor {action: "rename", id, new_id}` |
+  | `brain_merge_pages {from_id, into_id}` ¹ | `brain_refactor {action: "merge", from_id, into_id}` |
+  | `brain_delete_page {id, force}` ¹ | `brain_refactor {action: "delete", id, force}` |
+  | `brain_eval_add {…}` ¹ | `brain_eval {action: "add", …}` (`brain_eval` ¹ itself runs the eval with or without `action: "run"`) |
+  | `brain_dream_queue {refresh}` ¹ | `brain_dream {action: "queue", refresh}` |
+  | `brain_dream_log {entry}` ¹ | `brain_dream {action: "log", entry}` |
+
+  ¹ Added earlier in this release cycle; not in 0.3.4.
 
 ### Fixed
 

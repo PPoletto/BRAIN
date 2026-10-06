@@ -4,9 +4,9 @@
 //! BRAIN does the mechanical part — it collects what needs attention into
 //! a prioritised work list, `00_meta/dream-queue.md` — and an agent, when
 //! the user triggers a dream session ("träum mal"), works through it over
-//! MCP (`brain_dream_queue`, then merge / rename / patch / write a
+//! MCP (`brain_dream` action `queue`, then merge / rename / patch / write a
 //! summary) and notes what it did in `00_meta/dream-log.md`
-//! (`brain_dream_log`).
+//! (`brain_dream` action `log`).
 //!
 //! Item kinds, highest priority first:
 //!
@@ -60,10 +60,10 @@ pub const HUB_MIN_INBOUND: usize = 5;
 /// its file has not changed for this many days.
 pub const DECAY_MIN_AGE_DAYS: i64 = 90;
 
-/// `brain_dream_queue` recomputes a queue older than this.
+/// `brain_dream` (action `queue`) recomputes a queue older than this.
 pub const MAX_QUEUE_AGE: chrono::Duration = chrono::Duration::hours(1);
 
-/// Longest `brain_dream_log` entry kept.
+/// Longest `brain_dream` log entry kept.
 const MAX_LOG_ENTRY_CHARS: usize = 2000;
 
 /// Marker of the machine-readable copy of the queue at the end of the
@@ -397,7 +397,7 @@ pub fn render_queue(queue: &DreamQueue) -> String {
     out.push_str(
         "Written by BRAIN. In a dream session, work top-down: at most 10 changes per session, \
          never delete a page other pages link to, supersede instead of overwriting, and note \
-         what you did with `brain_dream_log`. Call `brain_dream_queue` for the live list.\n",
+         what you did with `brain_dream` (action `log`). Call `brain_dream` (action `queue`) for the live list.\n",
     );
     if queue.items.is_empty() {
         out.push_str("\nNothing to do — the wiki is in order.\n");
@@ -486,7 +486,7 @@ pub fn append_dream_log(
         .open(&path)?;
     if is_new {
         file.write_all(
-            b"# Dream log\n\nOne line per dream-session note (brain_dream_log). Local file - not synced.\n\n",
+            b"# Dream log\n\nOne line per dream-session note (brain_dream action log). Local file - not synced.\n\n",
         )?;
     }
     let written = format!("- {} {line}", when.format("%Y-%m-%d %H:%M"));

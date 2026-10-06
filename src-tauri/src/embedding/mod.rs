@@ -58,6 +58,16 @@ pub fn cached_for_vault(vault: &Path) -> Arc<dyn Embedder> {
     global_cache().get_or_load(&bge_m3_dir(vault), try_load_bge_m3)
 }
 
+/// What the process cache holds for `vault`'s bge-m3 model, WITHOUT
+/// loading it: `"loaded"`, `"failed"` (files present, load failed — the
+/// hashed fallback serves), `"not-loaded"` (loads lazily on the next
+/// search), or `"loading"` when the cache lock is held right now (a load
+/// in progress, or — rarely — a concurrent cache hit). Never blocks: the
+/// MCP `brain_ping` detail path must stay instant.
+pub fn model_state(vault: &Path) -> &'static str {
+    global_cache().peek(&bge_m3_dir(vault))
+}
+
 /// Drop every cached embedder and every remembered load failure. Call
 /// after the model files changed on disk (e.g. a completed download) or
 /// on unmount to release the model's RAM. May block while a load is in
@@ -219,6 +229,20 @@ impl EmbedderCache {
 
     fn clear(&self) {
         self.lock().clear();
+    }
+
+    /// Non-blocking slot state for [`model_state`].
+    fn peek(&self, model_dir: &Path) -> &'static str {
+        let slots = match self.slots.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return "loading",
+        };
+        match slots.get(model_dir) {
+            Some(Slot::Loaded { .. }) => "loaded",
+            Some(Slot::Failed(_)) => "failed",
+            None => "not-loaded",
+        }
     }
 
     /// Removes `Loaded` slots idle for longer than `max_idle` and returns
@@ -470,6 +494,29 @@ mod tests {
         let cache = EmbedderCache::default();
         let _ = cache.get_or_load(tmp.path(), try_load_bge_m3);
         assert_eq!(cache.slot_kind(tmp.path()), None);
+    }
+
+    #[test]
+    fn peeking_an_untouched_model_dir_reports_not_loaded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert_eq!(EmbedderCache::default().peek(tmp.path()), "not-loaded");
+    }
+
+    #[test]
+    fn peeking_a_loaded_model_dir_reports_loaded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = EmbedderCache::default();
+        let _ = cache.get_or_load(tmp.path(), fake_loader);
+        assert_eq!(cache.peek(tmp.path()), "loaded");
+    }
+
+    #[test]
+    fn peeking_a_model_dir_whose_load_failed_reports_failed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_broken_model(tmp.path());
+        let cache = EmbedderCache::default();
+        let _ = cache.get_or_load(tmp.path(), try_load_bge_m3);
+        assert_eq!(cache.peek(tmp.path()), "failed");
     }
 
     #[test]

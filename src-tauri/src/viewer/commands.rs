@@ -100,7 +100,7 @@ pub async fn run_retrieval_eval(
         if set.is_empty() {
             return Err(BrainError::Internal(
                 "no test questions yet — add them to 00_meta/eval-queries.yaml or let an agent \
-                 use brain_eval_add"
+                 use brain_eval (action \"add\")"
                     .into(),
             ));
         }

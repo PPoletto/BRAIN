@@ -50,7 +50,7 @@ pub const EVAL_HISTORY_FILENAME: &str = "eval-history.md";
 /// Cut-off rank of every metric.
 pub const EVAL_K: usize = 10;
 
-/// Longest id `brain_eval_add` generates from a query.
+/// Longest id `brain_eval` (action `add`) generates from a query.
 const GENERATED_ID_MAX_CHARS: usize = 48;
 
 const SET_HEADER: &str = "\
@@ -58,7 +58,7 @@ const SET_HEADER: &str = "\
 # id: stable name; query: the question as a user would ask it;
 # expected: page ids a good search returns in its top 10; note: optional.
 # Run with `brain eval <vault>` or the MCP tool brain_eval; add entries
-# with brain_eval_add. Synced between machines like AGENTS.md.
+# with brain_eval (action add). Synced between machines like AGENTS.md.
 ";
 
 const HISTORY_HEADER: &str = "\
@@ -584,7 +584,7 @@ pub fn add_eval_query(vault: &Path, new: NewEvalQuery) -> EvalResult<EvalQuery> 
         if !exists {
             return Err(EvalError::Invalid(format!(
                 "expected page '{id}' does not exist — use the id of an existing page \
-                 (brain_page_exists)"
+                 (brain_lookup)"
             )));
         }
         if !expected.contains(&id) {

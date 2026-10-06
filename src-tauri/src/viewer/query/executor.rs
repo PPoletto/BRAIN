@@ -16,7 +16,7 @@ pub struct QueryHit {
     pub path: String,
     pub title: String,
     pub updated_at: Option<String>,
-    /// Salience counters (H3): reads via brain_get_page(s)/get_context
+    /// Salience counters (H3): reads via brain_get_pages/get_context
     /// and appearances in a brain_search top 10. 0 when never counted.
     pub reads: i64,
     pub search_hits: i64,

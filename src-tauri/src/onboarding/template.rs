@@ -1,7 +1,8 @@
 //! Template population for a freshly initialized vault.
 //!
-//! Writes the canonical `AGENTS.md`, `CLAUDE.md`, and `.mcp.json` files into
-//! the vault's `00_meta/`. Idempotent: existing files are not overwritten.
+//! Writes the canonical `AGENTS.md`, `CLAUDE.md`, `SKILL.md` (the
+//! `brain-wiki` Agent Skill) and `.mcp.json` files into the vault's
+//! `00_meta/`. Idempotent: existing files are not overwritten.
 
 use std::path::Path;
 
@@ -9,12 +10,25 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::vault::layout::{
-    meta_dir, AGENTS_FILENAME, CLAUDE_FILENAME, MCP_CONFIG_FILENAME,
+    meta_dir, AGENTS_FILENAME, CLAUDE_FILENAME, MCP_CONFIG_FILENAME, SKILL_FILENAME,
 };
 use crate::vault::VaultResult;
 
-const AGENTS_MD: &str = include_str!("templates/AGENTS.md");
+/// The bundled AGENTS.md — also served by the MCP resource
+/// `brain://agents-md` when a vault has none.
+pub(crate) const AGENTS_MD: &str = include_str!("templates/AGENTS.md");
 const CLAUDE_MD: &str = include_str!("templates/CLAUDE.md");
+/// The bundled `brain-wiki` Agent Skill (frontmatter `name` /
+/// `description` + the AGENTS.md essentials).
+pub(crate) const SKILL_MD: &str = include_str!("templates/SKILL.md");
+
+/// The template files `populate` writes when missing and
+/// `refresh_vault_templates` overwrites, in that order.
+const TEMPLATE_FILES: [(&str, &str); 3] = [
+    (AGENTS_FILENAME, AGENTS_MD),
+    (CLAUDE_FILENAME, CLAUDE_MD),
+    (SKILL_FILENAME, SKILL_MD),
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpConfig {
@@ -94,8 +108,9 @@ pub fn populate(vault: &Path) -> VaultResult<()> {
     let meta = meta_dir(vault);
     std::fs::create_dir_all(&meta)?;
 
-    write_if_missing(&meta.join(AGENTS_FILENAME), AGENTS_MD.as_bytes())?;
-    write_if_missing(&meta.join(CLAUDE_FILENAME), CLAUDE_MD.as_bytes())?;
+    for (filename, contents) in TEMPLATE_FILES {
+        write_if_missing(&meta.join(filename), contents.as_bytes())?;
+    }
 
     let mcp_path = meta.join(MCP_CONFIG_FILENAME);
     if !mcp_path.exists() {
@@ -129,7 +144,8 @@ pub struct TemplateUpdateEntry {
     pub size_after: u64,
 }
 
-/// Force-overwrites the bundled vault templates (AGENTS.md, CLAUDE.md)
+/// Force-overwrites the bundled vault templates (AGENTS.md, CLAUDE.md,
+/// SKILL.md)
 /// in `00_meta/`. The mirror of `populate()` for an existing vault —
 /// `populate()` is idempotent and skips existing files (correct on
 /// first boot), but the user occasionally needs to pull a newer
@@ -145,11 +161,8 @@ pub struct TemplateUpdateEntry {
 pub fn refresh_vault_templates(vault: &Path) -> VaultResult<Vec<TemplateUpdateEntry>> {
     let meta = meta_dir(vault);
     std::fs::create_dir_all(&meta)?;
-    let mut out = Vec::with_capacity(2);
-    for (filename, contents) in [
-        (AGENTS_FILENAME, AGENTS_MD),
-        (CLAUDE_FILENAME, CLAUDE_MD),
-    ] {
+    let mut out = Vec::with_capacity(TEMPLATE_FILES.len());
+    for (filename, contents) in TEMPLATE_FILES {
         let path = meta.join(filename);
         let entry = write_or_replace(&path, contents.as_bytes())?;
         out.push(entry);
@@ -218,6 +231,82 @@ mod tests {
         assert!(m.join(AGENTS_FILENAME).exists());
         assert!(m.join(CLAUDE_FILENAME).exists());
         assert!(m.join(MCP_CONFIG_FILENAME).exists());
+    }
+
+    #[test]
+    fn populate_creates_the_brain_wiki_skill_file() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        populate(tmp.path()).unwrap();
+        assert!(meta_dir(tmp.path()).join(SKILL_FILENAME).exists());
+    }
+
+    #[test]
+    fn the_skill_template_starts_with_agent_skills_frontmatter_naming_brain_wiki() {
+        assert!(
+            SKILL_MD.starts_with("---\nname: brain-wiki\ndescription: "),
+            "{}",
+            &SKILL_MD[..60]
+        );
+    }
+
+    #[test]
+    fn the_agents_template_names_every_served_mcp_tool() {
+        let missing: Vec<&str> = crate::mcp::tools::TOOL_NAMES
+            .iter()
+            .copied()
+            .filter(|name| !AGENTS_MD.contains(&format!("`{name}`")))
+            .collect();
+        assert!(missing.is_empty(), "{missing:?}");
+    }
+
+    #[test]
+    fn the_skill_template_names_every_served_mcp_tool() {
+        let missing: Vec<&str> = crate::mcp::tools::TOOL_NAMES
+            .iter()
+            .copied()
+            .filter(|name| !SKILL_MD.contains(&format!("`{name}`")))
+            .collect();
+        assert!(missing.is_empty(), "{missing:?}");
+    }
+
+    /// `brain_*` tool tokens of `text` that the server does not serve,
+    /// ignoring the "Renamed tools" paragraph (it lists the old names on
+    /// purpose).
+    fn unknown_tool_tokens(text: &str) -> Vec<String> {
+        let without_renamed = match text.find("**Renamed tools.**") {
+            Some(start) => {
+                let end = text[start..].find("\n\n").map_or(text.len(), |i| start + i);
+                format!("{}{}", &text[..start], &text[end..])
+            }
+            None => text.to_string(),
+        };
+        let token = regex::Regex::new(r"brain_[a-z_]+").unwrap();
+        token
+            .find_iter(&without_renamed)
+            .map(|m| m.as_str().to_string())
+            .filter(|name| !crate::mcp::tools::TOOL_NAMES.contains(&name.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn the_agents_template_names_only_served_mcp_tools_outside_the_renamed_paragraph() {
+        assert_eq!(unknown_tool_tokens(AGENTS_MD), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_skill_template_names_only_served_mcp_tools() {
+        assert_eq!(unknown_tool_tokens(SKILL_MD), Vec::<String>::new());
+    }
+
+    #[test]
+    fn refresh_vault_templates_rewrites_an_outdated_skill_file() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        let skill = meta_dir(tmp.path()).join(SKILL_FILENAME);
+        std::fs::write(&skill, "stale").unwrap();
+        refresh_vault_templates(tmp.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(&skill).unwrap(), SKILL_MD);
     }
 
     #[test]

@@ -95,7 +95,7 @@ When a fact changes (a new contract, a new role, a revised decision), do
 
 `brain_query` hides superseded, expired and not-yet-valid pages by
 default (`valid:all` shows them, `valid:expired` lists only them).
-`brain_get_page` and `brain_get_context` mark a superseded page with the
+`brain_get_pages` marks a superseded page with the
 fields `superseded_by` and `notice` — follow it for current facts. The
 notice is not part of the page: **never copy it into a page body.**
 `superseded_by` must point at an existing page that is not itself
@@ -103,9 +103,9 @@ notice is not part of the page: **never copy it into a page body.**
 `dangling-supersede` / `supersede-cycle` **error** blocks the
 auto-commit. When an expired page is still linked from current pages,
 the lint reports `expired-but-linked` — point those links at the
-successor. `brain_rename_page`, `brain_merge_pages` and
-`brain_delete_page` keep `superseded_by` and `sources` consistent the
-same way they keep links consistent.
+successor. `brain_refactor` (rename, merge, delete) keeps
+`superseded_by` and `sources` consistent the same way it keeps links
+consistent.
 
 ## Wiki Links — STRICT RULE
 
@@ -134,7 +134,7 @@ that way in the user's editor too.
 Always link to the **fully-qualified ID** (`entities/dan-shapiro`, not just
 `dan-shapiro`). Never link to a page you have not verified exists — broken
 wiki links are a hard `broken-link` error and block the auto-commit. Use
-`brain_page_exists` for cheap pre-write checks.
+`brain_lookup` for cheap pre-write checks.
 
 ### One exception: aliased links inside Markdown tables
 
@@ -156,42 +156,68 @@ for the job:
 
 | Tool | Use when |
 |---|---|
-| `brain_ping` | Quick liveness check between batches; works even if the vault is disconnected |
-| `brain_search` | Free-text / hybrid (lexical + semantic) search across pages |
-| `brain_query` | Structured filter by fields (id, type, title, tag, created, updated). Hides superseded/expired pages unless you add `valid:all`; `sort:salience` lists the most-read pages first |
-| `brain_get_page` | Read one page by id |
-| `brain_get_pages` | Read N pages by id in one call — use for refactor sweeps and consistency audits |
-| `brain_page_exists` | Check before creating a new page: says whether the id exists and lists pages that are probably the same thing (`matches`) |
-| `brain_get_context` | One page + its 1-hop wiki-link neighbourhood |
-| `brain_list_pages` | List ids per bucket (optional type/prefix filter, pagination) |
-| `brain_list_tags` | Enumerate tags with their page counts — use this *before* `brain_query tag:foo` so you know which tags exist |
-| `brain_graph` | Whole graph (nodes + edges) for analysis |
-| `brain_lint_report` | Vault-wide lint state — call this at the start of a cleanup session, and at the end to confirm everything is clean |
-| `brain_embedding_status` | Tell semantic-bge-m3 search apart from the deterministic hashed fallback (the fallback produces valid numbers but zero semantic meaning) |
-| `brain_write_page` | Create or overwrite one page |
+| `brain_ping` | Quick liveness check between batches; works even if the vault is disconnected. `detail: true` also says whether search is semantic (bge-m3) or runs on the hashed fallback, and how big the index is |
+| `brain_search` | Free-text / hybrid (lexical + semantic) search when you do not know the page ids |
+| `brain_lookup` | **Before creating a page**: pass the planned id (`entities/acme`) or just a name (`ACME Corp`); says whether it exists and lists pages that are probably the same thing (`matches`). No page bodies |
+| `brain_get_pages` | Read one or more pages by id (`ids: ["entities/alice"]` for one) — also for refactor sweeps and consistency audits. `include_context: true` adds each page's 1-hop neighbourhood (`outbound` links, `backlinks`) |
+| `brain_query` | List or filter by fields (id, type, title, tag, created, updated). `*` lists every current page; `prefix`, `limit`, `offset` page through them. Hides superseded/expired pages unless you add `valid:all`; `sort:salience` lists the most-read pages first. `facet: "tags"` returns the tags with their page counts — use it *before* filtering with `tag:` so you know which tags exist |
+| `brain_graph` | Whole graph (nodes + edges) for structure analysis |
+| `brain_write_page` | Create or overwrite one page (including its frontmatter) |
 | `brain_write_batch` | **Atomic multi-page write — use this any time several new pages reference each other**, otherwise the single-page form cascades broken-link errors during the intermediate writes |
+| `brain_patch_page` | Replace one section of an existing page (frontmatter untouched) |
+| `brain_refactor` | Fix the structure: `action: "rename"` — a page has the **wrong id** (typo, wrong slug, wrong type directory); moves it and rewrites every link to it. `action: "merge"` — two pages are **duplicates**; appends the duplicate's body to the surviving page, redirects its links, removes the duplicate. `action: "delete"` — a page is **junk**; refuses while other pages link to it, `force: true` deletes anyway and turns those links into plain text. All recoverable via `brain_history` |
+| `brain_lint_report` | Vault-wide lint state — call this at the start of a cleanup session, and at the end to confirm everything is clean |
+| `brain_history` | `action: "list"` (default) lists the Git commits that touched one page; `action: "restore"` replaces the page with its version at a commit sha and records a `revert: …` commit — never destructive. Use it to roll back a bad overwrite |
 | `brain_write_raw_file` | Place a raw ingest artifact under `01_raw/<connector>/...` before turning it into a `source` page |
-| `brain_get_page_history` | List the Git commits that touched one page — pair with the next tool to roll back a bad overwrite |
-| `brain_restore_page` | Replace a page with the version at a given commit sha. Records a `revert: …` commit, never destructive |
-| `brain_rename_page` | A page has the **wrong id** (typo, wrong slug, wrong type directory). Moves it and rewrites every link to it across the vault |
-| `brain_merge_pages` | Two pages are **duplicates**. Appends the duplicate's body to the surviving page, redirects its links, removes the duplicate |
-| `brain_delete_page` | A page is **junk** and should not exist. Refuses while other pages link to it; `force: true` deletes anyway and turns those links into plain text. Recoverable via `brain_restore_page` |
-| `brain_dream_queue` | The prioritised consolidation list for a dream session (see "Dreaming") |
-| `brain_dream_log` | Note in one line what a dream session changed |
-| `brain_eval` | Measure search quality on the vault's test questions (Recall@10, MRR, nDCG@10 for full-text, vector and hybrid search) |
-| `brain_eval_add` | Add a test question plus the page ids a good search must return — e.g. after the user complains that a search missed something |
+| `brain_eval` | Search quality: `action: "run"` measures Recall@10, MRR and nDCG@10 for full-text, vector and hybrid search; `action: "add"` stores a test question plus the page ids a good search must return |
+| `brain_dream` | Consolidation (see "Dreaming"): `action: "queue"` returns the prioritised work list, `action: "log"` records what a dream session changed |
+
+**Concise by default.** `brain_search`, `brain_get_pages`,
+`brain_query`, `brain_graph` and `brain_lint_report` take
+`response_format`: `"concise"` (default — ids, titles, summaries,
+counts) or `"detailed"` (every field). Ask for `"detailed"` only when you
+need it — e.g. `brain_get_pages` detailed returns the full frontmatter,
+which you need before rewriting a page with `brain_write_page`.
+
+**Renamed tools.** Older instructions may name `brain_get_page`,
+`brain_get_context`, `brain_page_exists`, `brain_list_pages`,
+`brain_list_tags`, `brain_embedding_status`, `brain_rename_page`,
+`brain_merge_pages`, `brain_delete_page`, `brain_get_page_history`,
+`brain_restore_page`, `brain_eval_add`, `brain_dream_queue` or
+`brain_dream_log`. They no longer exist; calling one returns an error that
+names its replacement (see the table above).
+
+### Prompts and Resources
+
+The server also offers ready-made **prompts** — pick them from your
+client's prompt menu or ask for them by name:
+
+- `ingest` — raw file → source page → entity/concept pages, written in one
+  `brain_write_batch` (argument `source`: what to ingest).
+- `lint-session` — work through the newest audit / lint report kind by
+  kind (optional argument `focus`: one finding kind).
+- `dream` — the dream protocol below (optional argument `max_changes`,
+  default 10).
+
+And **resources** you can read without a tool call:
+`brain://agents-md` (this file), `brain://audit/latest` (the newest daily
+audit) and `brain://dream-queue` (the current dream queue as JSON).
 
 ### Before Creating a Page
 
-Call `brain_page_exists` with the id you intend to create. Its `matches`
-list pages of the same type that are probably the same thing:
-`alias` (your slug is one of that page's `aliases`), `normalised` (same
-slug after lowercasing, umlauts `ü`→`ue`, punctuation, `_` and spaces →
-`-`; also `muller-gmbh` vs `mueller-gmbh`) or `similar` (a near spelling,
-e.g. one letter apart). **If `page_exists` reports matches, use the
-existing page** — update it and, if your name for the thing differs, add
-that name to its `aliases`. If it says `matches_checked: false`, the
-search index is not built yet; check `brain_list_pages` by hand.
+Call `brain_lookup` with the id you intend to create (`entities/acme`)
+— or, if you do not know the type yet, just the name (`ACME Corp`; then
+all four types are checked and a page that already uses exactly that slug
+is reported as `exact`). Its `matches` list pages of the same type that
+are probably the same thing: `alias` (your slug is one of that page's
+`aliases`), `normalised` (same slug after lowercasing, umlauts `ü`→`ue`,
+punctuation, `_` and spaces → `-`; also `muller-gmbh` vs `mueller-gmbh`)
+or `similar` (a near spelling, e.g. one letter apart). **If `brain_lookup`
+reports matches, use the existing page** — update it and, if your name for
+the thing differs, add that name to its `aliases`. If it says
+`matches_checked: false`, the search index is not built yet; check by hand
+with `brain_query` (`query: "valid:all"`, `prefix: "entities/acme"` — `valid:all`
+so superseded and expired pages count as possible duplicates too).
 
 `brain_write_page` and `brain_write_batch` refuse to create a page with
 an `alias` or `normalised` match and name the existing page. Pass
@@ -200,7 +226,8 @@ an `alias` or `normalised` match and name the existing page. Pass
 slug and title, and list the other id in `distinct_from`. Overwriting an
 existing id is never refused. If two existing pages share a name through
 an alias or the same slug, the lint reports `alias-collision`: merge them
-(`brain_merge_pages`), fix the alias, or add `distinct_from`.
+(`brain_refactor` with `action: "merge"`), fix the alias, or add
+`distinct_from`.
 
 ### Bulk-Ingest Workflow
 
@@ -229,11 +256,12 @@ The `brain_write_page` response carries `previous_size_bytes` and
 agent in an earlier turn) accidentally shrunk a rich page into a thin
 one, recover via:
 
-1. `brain_get_page_history` for the page id — returns the recent
-   commits that touched the page, newest first, each `{sha, ts, message}`.
+1. `brain_history` (`action: "list"`) for the page id — returns the
+   recent commits that touched the page, newest first, each
+   `{sha, ts, message}`.
 2. Pick the sha *before* the bad overwrite (typically the second
    entry — the topmost is the bad write itself).
-3. `brain_restore_page` with that sha. BRAIN replaces the file with
+3. `brain_history` with `action: "restore"` and that sha. BRAIN replaces the file with
    the chosen revision and records a `revert: restored …` commit so
    the history stays append-only.
 
@@ -245,25 +273,26 @@ Confirm with the user before restoring if the change is non-trivial
 Never fix a wrong id by writing a second page and leaving the first one
 behind — every link keeps pointing at the old id. Instead:
 
-1. **Wrong id, right content** → `brain_rename_page` with `id` and
-   `new_id`. BRAIN moves the page, updates its frontmatter `id` (and
+1. **Wrong id, right content** → `brain_refactor` with
+   `action: "rename"`, `id` and `new_id`. BRAIN moves the page, updates its frontmatter `id` (and
    `type` if the type directory changes) and rewrites `[[old]]` /
    `[[old|Alias]]` links in every page. If `new_id` already exists, the
    two pages are duplicates — go to step 2.
-2. **Duplicate of an existing page** → `brain_merge_pages` with
-   `from_id` (the duplicate) and `into_id` (the page to keep). Then read
+2. **Duplicate of an existing page** → `brain_refactor` with
+   `action: "merge"`, `from_id` (the duplicate) and `into_id` (the page to keep). Then read
    the surviving page and tidy the appended `## Merged from …` section
    with `brain_patch_page`.
-3. **Junk that should not exist** → `brain_delete_page`. If it refuses
+3. **Junk that should not exist** → `brain_refactor` with
+   `action: "delete"`. If it refuses
    because other pages link to it, decide whether those links should
    point somewhere else (rename or merge instead) before passing
    `force: true`.
 
 Each of these records one commit (plus a `wiki: checkpoint before
 refactor` commit first if there were uncommitted changes). Nothing is
-lost: to bring back a deleted or merged page, call
-`brain_get_page_history` with the **old** id and pass
-`brain_restore_page` a sha from **before** the delete/merge commit — the
+lost: to bring back a deleted or merged page, call `brain_history`
+(`action: "list"`) with the **old** id and restore (`action: "restore"`)
+a sha from **before** the delete/merge commit — the
 topmost entry is the removal itself. After a rename, the history under
 the new id starts at the rename; older revisions are listed under the old
 id. Confirm with the user before deleting or merging pages they wrote
@@ -272,7 +301,7 @@ themselves.
 Page ids for these tools must look like `entities/dan-shapiro`: a type
 directory, then letters, digits, `.`, `_` or `-` (no spaces or
 parentheses — they break markdown links). If a tool reports
-`commit: null` with a `note`, the change is already on disk; do not
+no `commit` but a `note`, the change is already on disk; do not
 repeat it.
 
 ### Lint Output is Page-Scoped
@@ -288,20 +317,22 @@ or from something earlier in the session" — the server already did it.
 Once a day BRAIN audits the whole wiki and writes the result to
 `00_meta/audit/<YYYY-MM-DD>.md` (one file per day; read-only for you).
 At the **start of a maintenance session** ("clean up the wiki", "tidy
-my notes"), read the newest file in `00_meta/audit/` — or, if you cannot
-read vault files directly, call `brain_lint_report`, which returns the
-same findings live — and work through it:
+my notes"), read the newest file in `00_meta/audit/` (MCP resource
+`brain://audit/latest`) — or call `brain_lint_report`, which returns the
+same findings live (concise: counts per kind; then `response_format:
+"detailed"` with `kind` for one kind's findings) — and work through it
+(the `lint-session` prompt walks you through it):
 
 - `duplicate-candidate` — two pages of the same type that read almost
   the same (similarity score in the message). Open both; if they
-  describe the same thing, `brain_merge_pages` the weaker into the
-  stronger. If they are genuinely different, leave them.
+  describe the same thing, merge the weaker into the stronger
+  (`brain_refactor`, `action: "merge"`). If they are genuinely different, leave them.
 - `orphan` — no other page links here and it has not changed for 90+
   days. Link it from a related page, merge it into one, or — if it is
-  junk — `brain_delete_page` it.
+  junk — delete it (`brain_refactor`, `action: "delete"`).
 - `broken-link` — a link to a page that does not exist. Fix the link,
-  create the missing page, or `brain_rename_page` the page that was
-  meant.
+  create the missing page, or rename the page that was meant
+  (`brain_refactor`, `action: "rename"`).
 - `alias-collision` — two pages share a name via id or `aliases`. Merge
   them if they are the same thing; otherwise remove the clashing alias.
 - `missing-sources` — an entity or concept page names no `sources`. Add
@@ -325,39 +356,43 @@ wiki in two halves. BRAIN itself does the mechanical half: with the daily
 audit (and whenever you ask) it writes a prioritised work list, the
 **dream queue** (`00_meta/dream-queue.md`). You do the thinking half — but
 **only when the user triggers it** ("träum mal", "dream", "tidy up the
-wiki while I'm away"); never start a dream session on your own.
+wiki while I'm away", or the `dream` prompt). BRAIN never schedules a
+dream session and you never start one on your own; a user who wants it
+regularly can schedule it in their own client.
 
-A dream session:
+A dream session (the `dream` prompt contains the same protocol):
 
-1. Call `brain_dream_queue` (it recomputes the queue if it is older than
-   an hour; `refresh: true` forces it). Each item has a `priority` (1 is
-   most urgent), a `kind`, the `pages`, a `reason` and a
+1. Call `brain_dream` with `action: "queue"` (it recomputes the queue if
+   it is older than an hour; `refresh: true` forces it). Each item has a
+   `priority` (1 is most urgent), a `kind`, the `pages`, a `reason` and a
    `suggested_action`.
 2. Work **top-down**, at most **10 changes per session**:
    - `fix-link` — repair the broken link or `sources` entry (right id,
-     create the missing page, or `brain_rename_page` the page that was
-     meant).
-   - `merge` — read both pages; if they describe the same thing,
-     `brain_merge_pages` the weaker into the stronger. If not, leave them
-     (and add `distinct_from` if they share a name).
+     create the missing page, or rename the page that was meant with
+     `brain_refactor`).
+   - `merge` — read both pages (`brain_get_pages`); if they describe the
+     same thing, merge the weaker into the stronger (`brain_refactor`,
+     `action: "merge"`) and tidy
+     the appended section with `brain_patch_page`. If not, leave them (and
+     add `distinct_from` if they share a name).
    - `update-summary` / `write-summary` — read the page and write a
      fitting one-to-two-sentence `summary` (`brain_patch_page` cannot edit
      frontmatter — rewrite the page with `brain_write_page`, body
      unchanged). If a stale summary is still accurate, confirm it instead:
-     pass `confirm_summary: true` to `brain_write_page` or
-     `brain_patch_page` (with the page content unchanged) and the item
-     goes away.
+     write the page unchanged with `brain_write_page` and
+     `confirm_summary: true`, and the item goes away.
    - `archive-or-supersede` / `review-or-archive` — a page nobody reads or
      links to. Link it from a related page if it is still useful; if its
      facts were replaced, set `superseded_by` and `valid_to`. Do not
      delete it.
-3. Hard rules: **never delete a page other pages link to**; **supersede
-   instead of overwriting** facts; keep minority views and open questions
-   instead of flattening them into one "truth"; ask the user before
-   changing pages they clearly wrote themselves.
-4. Finish with one `brain_dream_log` entry saying what you changed and
-   why ("merged entities/acme-inc into entities/acme; summaries for 3
-   hubs"). Every change stays recoverable with `brain_restore_page`.
+3. Hard rules: **at most 10 changes**; **never delete a page other pages
+   link to**; **supersede instead of overwriting** facts; keep minority
+   views and open questions instead of flattening them into one "truth";
+   ask the user before changing pages they clearly wrote themselves.
+4. Finish with `brain_dream` `action: "log"` and one `entry` saying what
+   you changed and why ("merged entities/acme-inc into entities/acme;
+   summaries for 3 hubs"). Every change stays recoverable with
+   `brain_history` (`action: "restore"`).
 
 The queue lists each page at most once; what you leave undone (or what
 your changes uncover) shows up in the next queue.
@@ -366,11 +401,12 @@ your changes uncover) shows up in the next queue.
 
 `00_meta/eval-queries.yaml` holds test questions with the pages a good
 search must return (synced between the user's machines). When the user
-says a search missed something, add the question with `brain_eval_add`
-(only existing page ids). `brain_eval` measures how well full-text,
-vector and hybrid search find the expected pages and appends the numbers
-to `00_meta/eval-history.md`. Add questions through `brain_eval_add`, not
-by editing the files, and never mix them with any external test suite.
+says a search missed something, add the question with `brain_eval`
+`action: "add"` (only existing page ids). `brain_eval` `action: "run"`
+measures how well full-text, vector and hybrid search find the expected
+pages and appends the numbers to `00_meta/eval-history.md`. Add questions
+through `brain_eval`, not by editing the files, and never mix them with
+any external test suite.
 
 ## Commit Behavior
 
@@ -416,7 +452,7 @@ Before writing, briefly confirm with the user:
 
 When the user **asks** about something they previously told you, search the
 Brain first with `brain_search` (or `brain_query` for structured filters)
-and read matching pages with `brain_get_page` rather than relying on the
+and read matching pages with `brain_get_pages` rather than relying on the
 conversation context alone.
 
 ## Hard Rules
@@ -430,7 +466,7 @@ conversation context alone.
 - Never put secrets (API keys, passwords, tokens) in frontmatter or body.
 - Never edit `00_meta/` or `03_db/` files unless explicitly instructed.
 - Prefer extending an existing entity over creating a new sibling. If
-  `brain_page_exists` reports matches, use the existing page.
+  `brain_lookup` reports matches, use the existing page.
 - Facts are never overwritten — supersede the old page (`superseded_by`)
   and set its `valid_to`.
 - If you accidentally overwrite a richer page with thinner content,

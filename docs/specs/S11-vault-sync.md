@@ -69,7 +69,7 @@ are PII (person/customer names). So filenames must become opaque.
 - **BRAIN already keys internally on `frontmatter.id`, not the filename** —
   the graph, indexer and wiki-link resolution use `id`. The change is
   therefore mostly at the filesystem-access boundary, but that boundary is
-  pervasive: `brain_write_page`, `brain_page_exists`, `restore_page`,
+  pervasive: `brain_write_page`, `brain_lookup`, `restore_page`,
   `history`, `lint`, the indexer and `tree` all compute `id → path`
   directly today and must route through the map.
 

@@ -373,14 +373,27 @@ directly). The Settings tab in BRAIN spells this out.
 
 | Tool | Purpose |
 |------|---------|
-| `brain_search`        | Hybrid search across the wiki |
-| `brain_query`         | Dataview-style structured query |
-| `brain_get_page`      | Read a single page by id |
-| `brain_get_context`   | Page body + outbound links + backlinks |
-| `brain_list_pages`    | Tree listing |
-| `brain_graph`         | `{nodes, edges}` for graph rendering |
-| `brain_write_page`    | Create or update a page (lints before commit) |
-| `brain_write_raw_file`| Drop a raw source file under `01_raw/<connector>/…` |
+| `brain_ping`             | Liveness probe; `detail: true` adds vault, embedding model and index facts |
+| `brain_search`           | Hybrid (full-text + semantic) search across the wiki |
+| `brain_lookup`           | Does a page / name exist already? Probable duplicates, no bodies |
+| `brain_get_pages`        | Read one or more pages by id; `include_context: true` adds outbound links + backlinks |
+| `brain_query`            | Structured listing/filter by metadata; `facet: "tags"` for tag counts |
+| `brain_graph`            | `{nodes, edges}` of the link graph |
+| `brain_write_page`       | Create or overwrite one page (lints before commit) |
+| `brain_write_batch`      | Atomic write of several interlinked pages |
+| `brain_patch_page`       | Replace one section of a page |
+| `brain_refactor`         | `action: rename / merge / delete` — fix a wrong id, fold a duplicate into the survivor, delete a junk page (refuses while linked) |
+| `brain_lint_report`      | Wiki-wide lint state |
+| `brain_history`          | `action: list / restore` — Git commits that touched a page, restore a page from one |
+| `brain_write_raw_file`   | Drop a raw source file under `01_raw/<connector>/…` |
+| `brain_eval`             | Search-quality eval (`action: run` (default) / `add`) |
+| `brain_dream`            | Dream queue / dream log (`action: queue / log`) |
+
+Read tools take `response_format: "concise"` (default) or `"detailed"`.
+The server also offers MCP prompts (`ingest`, `lint-session`, `dream`) and
+resources (`brain://agents-md`, `brain://audit/latest`,
+`brain://dream-queue`), and speaks both the legacy `initialize`-based MCP
+revisions (2024-11-05 … 2025-11-25) and the stateless 2026-07-28 revision.
 
 ### Manual setup snippet
 

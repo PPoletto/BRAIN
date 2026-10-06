@@ -17,7 +17,7 @@ pub struct PageFrontmatter {
     pub created: Option<String>,
     pub updated: Option<String>,
     /// Alternative names of the page (A2). Matched by
-    /// `brain_page_exists` / the create-duplicate check via [`slug_key`].
+    /// `brain_lookup` / the create-duplicate check via [`slug_key`].
     /// Lenient: a single string or a list of scalars is accepted.
     #[serde(default, deserialize_with = "de_string_list", skip_serializing_if = "Vec::is_empty")]
     pub aliases: Vec<String>,
@@ -46,7 +46,7 @@ pub struct PageFrontmatter {
     #[serde(default, deserialize_with = "de_opt_scalar", skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     /// Every other frontmatter key (e.g. `status`), kept so JSON views
-    /// of the frontmatter (`brain_get_page`, `pages.frontmatter`) do not
+    /// of the frontmatter (`brain_get_pages`, `pages.frontmatter`) do not
     /// silently drop fields no named member covers. On disk the
     /// frontmatter text is never re-serialised, so nothing is lost there.
     /// Held as JSON values, converted at parse time: non-string keys

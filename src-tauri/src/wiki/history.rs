@@ -66,8 +66,8 @@ fn changed_file_count(repo: &Repository, commit: &git2::Commit<'_>) -> WikiResul
 /// page may scan many candidates. `MAX_SCAN` caps that so a malformed
 /// request never walks the entire history unboundedly.
 ///
-/// Powers the `brain_get_page_history` MCP tool — agents call this
-/// before `brain_restore_page` to pick the revision they want to
+/// Powers the `brain_history` MCP tool (action list) — agents call this
+/// before action restore to pick the revision they want to
 /// roll back to.
 pub fn history_for_page(
     wiki_path: &Path,

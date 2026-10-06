@@ -122,9 +122,9 @@ pub fn render_audit_report(vault: &Path, report: &LintReport, date: chrono::Naiv
     out.push('\n');
     out.push_str(
         "Written by BRAIN's scheduled audit. In a maintenance session, work through the \
-         findings below: merge duplicate candidates (`brain_merge_pages`), link, merge or \
-         delete orphans (`brain_delete_page`), fix broken links or rename wrongly named \
-         pages (`brain_rename_page`). Errors block auto-commits; everything else is advice. \
+         findings below: merge duplicate candidates (`brain_refactor`, action merge), link, merge or \
+         delete orphans (`brain_refactor`, action delete), fix broken links or rename wrongly named \
+         pages (`brain_refactor`, action rename). Errors block auto-commits; everything else is advice. \
          Running the audit again on the same day replaces this file.\n",
     );
     out.push('\n');

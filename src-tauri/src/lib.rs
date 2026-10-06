@@ -269,7 +269,7 @@ pub fn run_eval(vault_arg: Option<&str>) -> i32 {
     };
     if set.is_empty() {
         eprintln!(
-            "eval: no test questions yet — add entries to 00_meta/{} (or use the MCP tool brain_eval_add)",
+            "eval: no test questions yet — add entries to 00_meta/{} (or use the MCP tool brain_eval with action \"add\")",
             viewer::eval::EVAL_SET_FILENAME
         );
         return 5;

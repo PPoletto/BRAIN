@@ -73,7 +73,7 @@ For a single-fact memo about a person, EXTEND that person's `entities/<slug>` pa
 
 LINK SYNTAX — STRICT: when the body of a page references another page, ALWAYS use Obsidian-style wiki-links: `[[entities/dan-shapiro]]` or `[[entities/dan-shapiro|Dan]]` for an aliased label. NEVER use standard markdown links like `[Dan](entities/dan-shapiro)` or absolute `http://tauri.localhost/...` URLs for internal references — they don't feed the graph view and trigger lint warnings. Inside Markdown table cells the un-aliased `[[id]]` form is required (the `|` in the alias-form collides with the table cell separator).
 
-When the user asks about something they previously told you, call `brain_search` first, then `brain_get_page` on the best hit, before answering from conversation context alone.
+When the user asks about something they previously told you, call `brain_search` first, then `brain_get_pages` on the best hits, before answering from conversation context alone.
 
 Before writing a new page, briefly confirm: \"I'll save this to your BRAIN as `entities/<slug>` — okay?\"";
 

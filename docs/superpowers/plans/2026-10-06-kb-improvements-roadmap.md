@@ -112,10 +112,12 @@ reaktive) Konsolidierungs-/Audit-Läufe und **Archivieren statt Löschen** — d
 „Delete verweigert bei Verweisern" und `superseded_by` (Slice C).
 
 **Umfang**
-- A1 `brain_rename_page`, `brain_delete_page` (verweigert bei Backlinks, `force` entschärft
-  Links), `brain_merge_pages` — **in Umsetzung** (Opus-Agent), inkl. Linkumschreibung
+- A1 Umbenennen, Löschen (verweigert bei Backlinks, `force` entschärft Links) und
+  Zusammenführen von Seiten — heute `brain_refactor` (`action: rename | delete | merge`,
+  Slice D) — **umgesetzt**, inkl. Linkumschreibung
   vault-weit, ein Commit pro Operation, AGENTS.md-Abschnitt „falsche Seite reparieren".
-- A2 Frontmatter `aliases: [..]` (Liste alternativer Namen). `brain_page_exists` und
+- A2 Frontmatter `aliases: [..]` (Liste alternativer Namen). `brain_lookup` (vormals
+  Existenzprüfung) und
   `brain_write_page` prüfen Treffer auch gegen Aliases und gegen einen unscharfen Vergleich
   des Slugs (Kleinschreibung, Umlaute → ae/oe/ue, Bindestrich/Unterstrich, Levenshtein ≤ 2)
   und antworten mit „existiert vermutlich schon als `<id>`" statt stillschweigend eine
@@ -189,7 +191,7 @@ Agent beim Anlegen einer Seite automatisch eine Beispielfrage dazu eintragen?
 **Umfang**
 - C1 Frontmatter-Konvention: `valid_from`, `valid_to` (ISO-Datum), `superseded_by: <id>`,
   `sources: [<id>, …]` (Quellenseiten vom Typ `sources`).
-- C2 `brain_query` versteht `valid:now` (Standard) und `valid:all`; `brain_get_context`
+- C2 `brain_query` versteht `valid:now` (Standard) und `valid:all`; `brain_get_pages`
   kennzeichnet abgelöste Seiten im Ergebnis („superseded by …").
 - C3 Lint: (a) Seite mit Fakten-Typ (`entities`, `concepts`) ohne `sources` → Hinweis,
   (b) `superseded_by` zeigt auf nicht existierende Seite → Fehler, (c) Seiten mit
@@ -210,9 +212,16 @@ Agent beim Anlegen einer Seite automatisch eine Beispielfrage dazu eintragen?
 **Bezug:** Recherche B3 (Anthropic „Writing effective tools for agents", Context-Bloat).
 
 **Umfang**
-- D1 Tools zusammenlegen: `brain_page_exists` → in `brain_get_page` (liefert `exists:false`
-  statt Fehler); `brain_get_page` + `brain_get_pages` → `brain_get_pages(ids: [..])`;
-  `brain_list_tags` → `brain_query` mit `facet:tags`. Ziel ≤ 14 Tools inkl. Slice A.
+- D1 Tools zusammenlegen — **Nutzerentscheidung: genau 15 Tools** (`brain_ping`,
+  `brain_search`, `brain_lookup`, `brain_get_pages`, `brain_query`, `brain_graph`,
+  `brain_write_page`, `brain_write_batch`, `brain_patch_page`, `brain_refactor`,
+  `brain_lint_report`, `brain_history`, `brain_write_raw_file`, `brain_eval`,
+  `brain_dream`). Einzel- und Mehrfachlesen → `brain_get_pages(ids: [..])`, Kontext per
+  `include_context: true`; Existenzprüfung → `brain_lookup` (Id oder Name, ohne Bodies);
+  Seiten- und Tag-Listing → `brain_query` (`*`, `facet: "tags"`); Umbenennen/Zusammenführen/
+  Löschen → `brain_refactor` (`action`); Historie/Wiederherstellen → `brain_history`
+  (`action`); Eval und Traum je ein Tool mit `action`. Die vollständige Zuordnung alt → neu
+  steht im CHANGELOG.
 - D2 `response_format: "concise" | "detailed"` an `search`, `query`, `get_pages`,
   `lint_report`; Standard `concise` (ids, Titel, Snippet) — spart Kontext.
 - D3 Strukturierte Ausgaben: `outputSchema` + `structuredContent` für alle Tools mit
@@ -227,7 +236,8 @@ Agent beim Anlegen einer Seite automatisch eine Beispielfrage dazu eintragen?
   (2026-07-28)? Nur dokumentieren, nicht umbauen, solange stdio funktioniert.
 
 **Akzeptanzkriterien**
-- `tools/list` ≤ 14 Einträge; jede Beschreibung nennt den Anwendungsfall in einem Satz.
+- `tools/list` genau 15 Einträge; jede Beschreibung nennt den Anwendungsfall in einem Satz
+  und das Geschwister-Tool für den Fall „nicht hierfür".
 - `brain_search` concise für 10 Treffer < 1.500 Zeichen; detailed enthält Snippets.
 - Alte Tool-Namen liefern einen Fehler mit dem neuen Namen (eine Übergangsversion lang).
 
@@ -302,16 +312,16 @@ vor (Tiefschlaf); ein geplanter Agenten-Lauf über MCP erledigt das inhaltliche 
   AGENTS.md-Abschnitt mit harten Regeln: max N Änderungen pro Lauf (Standard 10), nie
   verlinkte Seiten löschen, Ablösen statt Überschreiben (`superseded_by`),
   Minderheitshypothesen behalten (Preprint: Verfestigung), jeder Lauf hinterlässt ein
-  lesbares Log, alles per `brain_restore_page` rückholbar. **Auslösung (Nutzerentscheidung
+  lesbares Log, alles per `brain_history` (`action: restore`) rückholbar. **Auslösung (Nutzerentscheidung
   06.10.): kein Zeitplan.** Der Nutzer triggert die REM-Phase bei Gelegenheit selbst — im
   Client per Prompt-Template `dream` oder schlicht „träum mal" an den Agenten, der dann
-  `brain_dream_queue` liest; wer automatisieren will, kann es (z. B. `/schedule`), BRAIN
+  `brain_dream` (`action: queue`) liest; wer automatisieren will, kann es (z. B. `/schedule`), BRAIN
   setzt es nicht voraus. Damit die Queue jederzeit frisch ist, erzeugt BRAIN sie nicht nur
-  nachts, sondern auch **on demand**: Tool `brain_dream_queue` (gibt die aktuelle Queue
+  nachts, sondern auch **on demand**: Tool `brain_dream` mit `action: queue` (gibt die aktuelle Queue
   zurück, rechnet sie neu, wenn älter als 1 h) — so braucht ein spontaner Traum keinen
   vorherigen Tiefschlaf-Lauf.
 - H3 **Salienz**: Tabelle `page_access(page_id, reads, last_read_at, search_hits)`;
-  Hooks in `brain_get_page(s)`, `brain_get_context` (reads) und `brain_search` (Treffer in
+  Hooks in `brain_get_pages` (reads, auch mit `include_context`) und `brain_search` (Treffer in
   Top-10). `brain_query` erhält `sort:salience`; Audit/Traumqueue nutzen sie. Keine
   Zeitstempel ins Frontmatter (würde Commits erzeugen) — nur DB, lokal, nicht gesynct.
 - H4 (später, optional) lokaler LLM-Provider (Ollama) ausschließlich für
@@ -322,7 +332,7 @@ vor (Tiefschlaf); ein geplanter Agenten-Lauf über MCP erledigt das inhaltliche 
   Queue nennt pro Eintrag Typ, Seiten-ids, Grund und die empfohlene Operation.
 - Eine Seite, die der Agent dreimal liest, hat `reads = 3` in `page_access`; `brain_query
   sort:salience` sortiert sie nach vorn.
-- Ein simulierter Traum-Lauf (Test: Queue mit einem Dubletten-Paar → `brain_merge_pages`)
+- Ein simulierter Traum-Lauf (Test: Queue mit einem Dubletten-Paar → `brain_refactor` merge)
   reduziert die Queue beim nächsten Tiefschlaf um genau diesen Eintrag.
 
 **Aufwand:** H1 S–M, H2 S, H3 S. **Risiko:** gering (alles additiv, nichts löscht).
