@@ -175,3 +175,75 @@ Aufwand für einen Rust-Entwickler allein: S = Tage, M = 1–3 Wochen, L = > 1 M
 - [Claude Code verwarf Vektor-RAG](https://smartscope.blog/ai-development/practices/rag-debate-agentic-search-code-exploration/) · [AI Engineer Europe 2026: „RAG is dead?"](https://www.ai.engineer/talks/UM6sFg_jdlE-rag-is-dead-right-kuba-rogut)
 - [Obsidian Bases (heise)](https://heise.de/-10590574) · [Obsidian MCP-Server-Übersicht](https://contextbolt.com/blog/obsidian-mcp-claude/) · [Smart Connections Review](https://www.promptquorum.com/power-local-llm/smart-connections-review) · [Obsidian Copilot](https://community.obsidian.md/plugins/copilot)
 - [LanceDB Newsletter 06/2026](https://www.lancedb.com/blog/newsletter-june-2026) · [Vector-DB-Vergleich 05/2026](https://www.web3aiblog.com/blog/vector-database-showdown-pinecone-weaviate-qdrant-lancedb-chroma-may-2026)
+
+
+---
+
+# Teil 2 — Zusammenführung mit der Deep-Research (06.10.2026)
+
+> Zweiter, unabhängiger Durchlauf mit dem Deep-Research-Harness (Sonnet-5.5-Agenten,
+> 5 Suchwinkel, 23 Quellen, 90 extrahierte Behauptungen, 25 adversarial 3-fach verifiziert:
+> 19 bestätigt, 6 widerlegt). Nur bestätigte Befunde sind unten übernommen; widerlegte sind
+> explizit gelistet. Gesamturteil beider Durchläufe deckt sich: **Keep für die
+> Kernarchitektur, kein Replace belegt, Upgrade bei Retrieval-Qualität, MCP-Konformität und
+> Wiki-Governance.**
+
+## Was die Deep-Research gegenüber Teil 1 ändert
+
+| Thema | Teil 1 | Deep-Research (verifiziert) | Konsequenz |
+|---|---|---|---|
+| **MCP-Protokoll** | „stdio bleibt zulässig, SDK-Stand prüfen" (B3, nachrangig) | **Spec 2026-07-28 ist final und zustandslos**: `initialize`-Handshake und `Mcp-Session-Id` entfallen, jede Anfrage trägt Protokollversion/Client-Info/Capabilities; `initialize` **und `ping` entfallen**, `server/discover` wird Pflicht, neue Pflichtfelder `resultType`, `ttlMs`, `cacheScope` auf Listen-Ergebnissen; Roots/Sampling/Logging/HTTP+SSE deprecated (≥ 12 Monate Frist). 3-0 bestätigt über Cloudflare-Blog, offiziellen MCP-Blog, Changelog. | **Priorität rauf**: eigener Prüfpunkt ganz vorn in der Roadmap (Slice 0). Unser Server implementiert heute `initialize` + `tools/list` + `tools/call`; Claude-Desktop-Logs zeigen, dass Clients aktuell noch `initialize` senden. Wann sie umschalten ist **ungeprüft** → Dual-Version-Support planen, nicht hektisch umbauen. |
+| **Reranker** | B2, M, „wirksamster Einzelbaustein" | Bestätigt −67 % Top-20-Fehlerrate gegenüber Baseline, **aber nur ~34 % relativ zusätzlich** zu Contextual Embeddings + Contextual BM25 (2,9 % → 1,9 %). Anthropics Messung: Cohere-API-Reranker, nicht CPU-lokal, nicht auf Markdown-Wikis. ONNX-Export von `bge-reranker-v2-m3` (fp32 + quantisiert) liegt fertig vor. | Gating bleibt richtig; erwarteter Gewinn kleiner als die Schlagzeile. Erst Eval (B1), dann Benchmark auf dieser CPU. |
+| **Contextual Retrieval** | Chunk-Header umgesetzt | Zahlen bestätigt (−35 % mit kontextuellen Embeddings, **−49 % mit zusätzlich kontextuellem BM25**); gemessen mit Gemini-Embeddings, Übertragbarkeit auf bge-m3 unbelegt. Hinweis des Harness: prüfen, ob der Kontext auch im **BM25/FTS5-Index** landet. | Unser FTS ist **seitenweise** (Titel + ganzer Body), der Seitenkontext ist dort implizit vorhanden. Chunk-Level-FTS mit Header wäre ein Experiment für B1, keine Pflicht. `summary` in FTS (Slice B2) bleibt. |
+| **Late Chunking** | „nicht übernehmen" | Bestätigt: nur ~2,7–3,6 % relativer nDCG@10-Gewinn (BeIR), getestet mit jina/nomic, nicht bge-m3. | Bleibt draußen. |
+| **GraphRAG-Familie** | „nicht übernehmen" | GraphRAG-Bench (ICLR 2026) 3-0 bestätigt: bei einfachen Faktenabfragen höchstens gleichauf, „frequently underperforms vanilla RAG on many real-world tasks". HippoRAG 2 als Gegenbefund nur herstellerseitig. | Bleibt draußen; der kuratierte Linkgraph genügt. |
+| **sqlite-vec** | „beibehalten, beobachten" | Bestätigt: letzte stabile 0.1.9 (31.03.2026), danach Alphas bis 0.1.10.alpha.4 (18.05.2026), kein 1.0, README warnt vor Breaking Changes. Kein Beleg, dass LanceDB/Qdrant/DuckDB VSS bei wenigen tausend Seiten besser wären. | Keep. Versionspinning beibehalten; ANN erst bei Bedarf. |
+| **Wiki-Governance** | B5/B6 (Gültigkeit, Lint) | Preprint 2604.12034 (Miteski, 04/2026): Hauptrisiko von LLM-Wikis ist **Verfestigung (Entrenchment) und nutzergekoppelter Drift**, nicht Retrieval-Qualität. Fünf Operationen: TRIAGE, DECAY, CONTEXTUALIZE, CONSOLIDATE, AUDIT; „Karpathy's lint operation handles some of this reactively". **Ein-Autor-Preprint ohne Implementierung** → Design-Hypothese (2-1). | Stützt Slice A/C: geplante statt nur reaktive Lint-/Audit-Läufe, **Archivieren statt Löschen** (deckt sich mit „Delete verweigert bei Verweisern" + `superseded_by`), Decay als Waisen-Regel. |
+| **Obsidian-Vergleich** | „Obsidian-MCP read-only; BRAIN schreibt/patcht" | Zwei Behauptungen **widerlegt** (1-2): dass der Smart-Connections-MCP read-only sei und dass Smart Connections keinen MCP-Zugang habe. Bestätigt: Smart Connections bettet lokal mit kleinem Modell ein (Drittquellen: bge-micro-v2, 384 Dim); MCP-Brücken brauchen eine **laufende Obsidian-Instanz**, BRAINs stdio-Server startet als Subprozess ohne GUI. | Teil-1-Formulierung abschwächen: Unterschied liegt bei **Modellqualität, Betrieb ohne GUI, Git-Verschlüsselung und agentengepflegter Struktur** — nicht pauschal bei „Schreiben können". |
+
+## Nicht abgedeckt durch die Deep-Research (Teil-1-Aussagen bleiben unverifiziert)
+
+Agent-Memory-Frameworks (LangGraph/LangMem, Letta, mem0, Zep/Graphiti), ColBERT/Sparse
+(bge-m3-Sparse, SPLADE), Vektor-Quantisierung, Storage-Alternativen (LanceDB, Qdrant
+embedded, DuckDB VSS) und MCP-Best-Practices jenseits der Spec-Änderung: hier fand der
+Harness **keine verifizierte Evidenz**. Die Teil-1-Einschätzungen dazu stehen weiter, sind
+aber als Einzelrecherche ohne adversariale Prüfung zu lesen.
+
+## Widerlegte Behauptungen (nicht verwenden)
+
+- „Contextual Preprocessing kostet ~1,02 USD pro Mio. Dokument-Token" — 0-3 widerlegt.
+- „Das LLM-Wiki-Muster ist als etablierter Gegenentwurf zu RAG anerkannt" — 0-3 widerlegt
+  (das Muster ist belegt, seine Etablierung als RAG-Alternative nicht).
+- „Lokale semantische Suche (QMD) spart > 60 % Claude-Code-Token gegenüber grep" — 0-3.
+- „Late Chunking braucht zwingend ≥ 8192 Token Kontext / Transfer auf bge-m3" — 1-2.
+- „Smart-Connections-MCP ist read-only" / „Smart Connections hat keinen MCP-Zugang" — 1-2.
+
+## Priorisierte Chancenliste des Harness (Abgleich mit Teil 1, Abschnitt B)
+
+1. MCP-Konformität mit Spec 2026-07-28 prüfen/anpassen — Nutzen hoch, Aufwand S–M, Risiko
+   niedrig. *(neu gegenüber Teil 1, dort nur B3-Nebenpunkt)*
+2. Contextual Chunking gegen Anthropics Verfahren abgleichen, FTS-Seite prüfen — Nutzen
+   mittel–hoch, Aufwand S–M. *(= Teil 1 B4 + Hinweis)*
+3. Eigene Retrieval-Evaluation mit realen Queries **vor** weiteren Upgrades — Nutzen hoch,
+   Aufwand S. *(= Teil 1 B1)*
+4. Optionaler lokaler Cross-Encoder-Reranker auf Top-k — Nutzen mittel (inkrementell ~34 %),
+   Aufwand M, Risiko mittel. *(= Teil 1 B2, Erwartung gedämpft)*
+5. Geplante Konsolidierungs-/Audit-Läufe — Nutzen mittel, Aufwand M, Risiko mittel
+   (Hypothese). *(= Teil 1 B5/B6)*
+6. sqlite-vec beobachten, ANN aus 0.1.10 bei Bedarf. *(= Teil 1 B9)*
+
+Aufwand/Risiko sind Einschätzungen des Harness, keine Belege. Teil 1 B3 (Tools straffen,
+strukturierte Ausgaben, Prompts), B7 (Graph-Nachbarn) und B8 (Viewer) wurden vom Harness
+nicht bewertet — mangels Evidenz, nicht wegen Gegenbelegen.
+
+## Quellen der Deep-Research (verifiziert zitiert)
+
+- [Karpathy LLM-Wiki Gist (Primärquelle)](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)
+- [Miteski: LLM-Wiki-Governance-Preprint, arXiv 2604.12034](https://arxiv.org/pdf/2604.12034)
+- [GraphRAG-Bench, arXiv 2506.05690 (ICLR 2026)](https://arxiv.org/pdf/2506.05690) · [Systematische GraphRAG-Evaluierung 2502.11371](https://arxiv.org/abs/2502.11371) · [HippoRAG 2, 2502.14802](https://arxiv.org/abs/2502.14802)
+- [Anthropic: Contextual Retrieval](https://anthropic.com/news/contextual-retrieval)
+- [bge-reranker-v2-m3 ONNX (onnx-community)](https://huggingface.co/onnx-community/bge-reranker-v2-m3-ONNX)
+- [Late Chunking, arXiv 2409.04701v3](https://arxiv.org/html/2409.04701v3) · [Chunking-Vergleich 2504.19754](https://arxiv.org/abs/2504.19754)
+- [sqlite-vec Releases](https://github.com/asg017/sqlite-vec) · [sqlite-vec Versionsstand (RubyGems)](https://rubygems.org/gems/sqlite-vec?locale=en) · [Mozilla Builders: sqlite-vec](https://builders.mozilla.org/project/sqlite-vec/)
+- [Smart Connections (Obsidian)](https://community.obsidian.md/plugins/smart-connections) · [smart-connections-mcp](https://github.com/msdanyg/smart-connections-mcp) · [Obsidian + Claude Code Integration (Blog)](https://blog.starmorph.com/blog/obsidian-claude-code-integration-guide)
+- [MCP 2026-07-28 Release (offiziell)](https://blog.modelcontextprotocol.io/posts/2026-07-28/) · [MCP Spec Changelog 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28/changelog) · [Cloudflare: MCP v2](https://blog.cloudflare.com/mcp-v2/)
