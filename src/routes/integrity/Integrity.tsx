@@ -39,6 +39,13 @@ const LINT_KIND_LABELS: Record<string, string> = {
   "duplicate-candidate": "Possible duplicates",
   "duplicate-detection-skipped": "Duplicate detection skipped",
   "hygiene-skipped": "Hygiene checks skipped",
+  "alias-collision": "Pages sharing a name (id or alias)",
+  "dangling-supersede": "Replaced by a missing page",
+  "missing-sources": "Entity/concept pages without sources",
+  "expired-but-linked": "Expired pages still linked",
+  "broken-source": "Sources without a page",
+  "invalid-date": "Invalid validity dates",
+  "supersede-cycle": "Pages replacing each other",
 };
 
 export function Integrity() {

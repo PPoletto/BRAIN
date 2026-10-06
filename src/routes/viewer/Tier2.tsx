@@ -166,7 +166,12 @@ export function Tier2() {
             <div className="border-b border-neutral-800 px-3 py-2 text-xs text-neutral-500">
               <strong className="text-neutral-300">Fields:</strong> id · type · title · tag · created · updated.{" "}
               <strong className="text-neutral-300">Operators:</strong> <code>:</code>, <code>:&gt;</code>, <code>:&lt;</code>.{" "}
-              <strong className="text-neutral-300">Combine:</strong> AND, OR, NOT, parens.
+              <strong className="text-neutral-300">Combine:</strong> AND, OR, NOT, parens.{" "}
+              <strong className="text-neutral-300">Validity:</strong> replaced or expired pages are
+              hidden — add <code>valid:all</code> to show them, <code>valid:expired</code> for only
+              those.{" "}
+              <strong className="text-neutral-300">Order:</strong> <code>sort:salience</code> lists
+              the pages your agent reads most first.
             </div>
           )}
           {error && (

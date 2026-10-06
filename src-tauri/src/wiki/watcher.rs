@@ -242,7 +242,8 @@ fn run_lint_and_commit(wiki: &Path) -> super::WikiResult<LintCommit> {
     if !report.is_clean() {
         return Ok(LintCommit::LintFailed(report));
     }
-    let warnings = report.warnings;
+    // Advisory kinds expected on many pages stay out of the toast.
+    let warnings = lint::toast_warnings(report.warnings);
     let summary = summarize_changes(wiki)?;
     if summary.is_empty() {
         return Ok(LintCommit::NoChanges);

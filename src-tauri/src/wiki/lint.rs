@@ -114,8 +114,59 @@ pub fn add_hygiene(
     }
 }
 
+/// Advisory warning kinds that can hit many pages at once (every entity
+/// page of an older vault lacks `sources`) or repeat on every commit until
+/// a person decides. They are reported by `brain_lint_report`, the write
+/// responses, the audit and the Integrity page, but the watcher leaves
+/// them out of its after-commit toast ([`toast_warnings`]).
+pub const QUIET_WARNING_KINDS: &[&str] = &["missing-sources", "alias-collision", "expired-but-linked"];
+
+/// The warnings the watcher shows in its after-commit toast: all but the
+/// [`QUIET_WARNING_KINDS`].
+pub fn toast_warnings(warnings: Vec<LintWarning>) -> Vec<LintWarning> {
+    warnings
+        .into_iter()
+        .filter(|w| !QUIET_WARNING_KINDS.contains(&w.kind.as_str()))
+        .collect()
+}
+
+/// Page types whose pages state facts and should name their `sources`
+/// (Slice C, `missing-sources`).
+const FACT_TYPES: &[&str] = &["entity", "concept"];
+
+/// Today's local date as `YYYY-MM-DD` — the reference day of the
+/// validity rules (`expired-but-linked`) and of `brain_query valid:now`.
+pub fn today_local() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+/// True for a `YYYY-MM-DD`-shaped string (digits and dashes only; the
+/// calendar is not checked). Dates of another shape are treated as absent
+/// by the validity rules and by `brain_query valid:` (and reported as
+/// `invalid-date`).
+pub fn is_iso_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b.iter().enumerate().all(|(i, c)| match i {
+            4 | 7 => *c == b'-',
+            _ => c.is_ascii_digit(),
+        })
+}
+
+/// True when the page's `valid_to` is a valid date before `today`
+/// (`YYYY-MM-DD`; ISO dates compare correctly as strings).
+pub fn is_expired(fm: &super::page::PageFrontmatter, today: &str) -> bool {
+    fm.valid_to.as_deref().is_some_and(|d| is_iso_date(d) && d < today)
+}
+
 /// Runs the lint over `02_wiki/`.
 pub fn lint(vault: &Path) -> WikiResult<LintReport> {
+    lint_as_of(vault, &today_local())
+}
+
+/// [`lint`] with an explicit reference day (`YYYY-MM-DD`) for the
+/// validity rules — the seam the tests use.
+pub fn lint_as_of(vault: &Path, today: &str) -> WikiResult<LintReport> {
     let wiki = wiki_dir(vault);
     let mut by_id: HashMap<String, Vec<PathBuf>> = HashMap::new();
     let mut all_pages: Vec<(PathBuf, ParsedPage)> = Vec::new();
@@ -259,11 +310,208 @@ pub fn lint(vault: &Path) -> WikiResult<LintReport> {
         }
     }
 
+    validity_rules(&all_pages, &known_ids, today, &mut errors, &mut warnings);
+    alias_collisions(&all_pages, &mut warnings);
+
     Ok(LintReport {
         errors,
         warnings,
         notes: Vec::new(),
     })
+}
+
+/// Slice C: `dangling-supersede` and `supersede-cycle` (errors);
+/// `missing-sources`, `broken-source`, `invalid-date` and
+/// `expired-but-linked` (warnings).
+fn validity_rules(
+    pages: &[(PathBuf, ParsedPage)],
+    known_ids: &HashSet<&String>,
+    today: &str,
+    errors: &mut Vec<LintError>,
+    warnings: &mut Vec<LintWarning>,
+) {
+    // Inbound links from CURRENT pages (not expired, not superseded):
+    // target id → linking ids.
+    let mut current_linkers: HashMap<&str, Vec<&str>> = HashMap::new();
+    // id → successor, for the cycle check.
+    let mut successor_of: HashMap<&str, &str> = HashMap::new();
+    for (_, parsed) in pages {
+        let fm = &parsed.frontmatter;
+        if let Some(s) = fm.superseded_by.as_deref() {
+            successor_of.insert(fm.id.as_str(), s.split('#').next().unwrap_or(s).trim());
+        }
+        if is_expired(fm, today) || fm.superseded_by.is_some() {
+            continue;
+        }
+        let mut targets: Vec<&str> = parsed
+            .wiki_links
+            .iter()
+            .map(|l| l.split('#').next().unwrap_or(l).trim())
+            .filter(|t| !t.is_empty() && *t != fm.id)
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        for t in targets {
+            current_linkers.entry(t).or_default().push(fm.id.as_str());
+        }
+    }
+
+    for (file, parsed) in pages {
+        let fm = &parsed.frontmatter;
+        let path = file.to_string_lossy().to_string();
+        if let Some(successor) = fm.superseded_by.as_deref() {
+            let target = successor.split('#').next().unwrap_or(successor).trim();
+            if !known_ids.contains(&target.to_string()) {
+                errors.push(LintError {
+                    path: path.clone(),
+                    kind: "dangling-supersede".into(),
+                    message: format!(
+                        "superseded_by '{successor}' points at a page that does not exist — \
+                         write the successor page first, or fix the id"
+                    ),
+                });
+            } else if let Some(chain) = supersede_cycle(fm.id.as_str(), &successor_of) {
+                errors.push(LintError {
+                    path: path.clone(),
+                    kind: "supersede-cycle".into(),
+                    message: format!(
+                        "superseded_by forms a cycle ({}) — a page cannot (indirectly) replace \
+                         itself; point superseded_by at the page that is current",
+                        chain.join(" → ")
+                    ),
+                });
+            }
+        }
+        if FACT_TYPES.contains(&fm.page_type.as_str()) && fm.sources.is_empty() {
+            warnings.push(LintWarning {
+                path: path.clone(),
+                kind: "missing-sources".into(),
+                message: format!(
+                    "{} page without `sources` — list the source pages its facts come from \
+                     (frontmatter `sources: [sources/…]`)",
+                    fm.page_type
+                ),
+            });
+        }
+        for source in &fm.sources {
+            if !known_ids.contains(source) {
+                warnings.push(LintWarning {
+                    path: path.clone(),
+                    kind: "broken-source".into(),
+                    message: format!(
+                        "sources entry '{source}' has no page — fix the id, create the source \
+                         page, or remove the entry"
+                    ),
+                });
+            }
+        }
+        let mut bad_dates: Vec<String> = [("valid_from", &fm.valid_from), ("valid_to", &fm.valid_to)]
+            .into_iter()
+            .filter_map(|(key, v)| {
+                v.as_deref()
+                    .filter(|d| !is_iso_date(d))
+                    .map(|d| format!("{key} '{d}' is not a YYYY-MM-DD date"))
+            })
+            .collect();
+        if let (Some(from), Some(to)) = (fm.valid_from.as_deref(), fm.valid_to.as_deref()) {
+            if is_iso_date(from) && is_iso_date(to) && from > to {
+                bad_dates.push(format!("valid_from {from} is after valid_to {to}"));
+            }
+        }
+        if !bad_dates.is_empty() {
+            warnings.push(LintWarning {
+                path: path.clone(),
+                kind: "invalid-date".into(),
+                message: format!(
+                    "{} — until fixed, the validity filter ignores the date",
+                    bad_dates.join("; ")
+                ),
+            });
+        }
+        if is_expired(fm, today) {
+            if let Some(linkers) = current_linkers.get(fm.id.as_str()) {
+                let mut linkers = linkers.clone();
+                linkers.sort_unstable();
+                let shown: Vec<&str> = linkers.iter().copied().take(5).collect();
+                let more = linkers.len().saturating_sub(shown.len());
+                let successor = fm
+                    .superseded_by
+                    .as_deref()
+                    .map(|s| format!(" — point them at '{s}'"))
+                    .unwrap_or_else(|| {
+                        " — point them at the current page, or set `superseded_by`".to_string()
+                    });
+                warnings.push(LintWarning {
+                    path,
+                    kind: "expired-but-linked".into(),
+                    message: format!(
+                        "valid_to {} has passed, but {} current page(s) still link here: {}{}{successor}",
+                        fm.valid_to.as_deref().unwrap_or_default(),
+                        linkers.len(),
+                        shown.join(", "),
+                        if more > 0 { format!(" and {more} more") } else { String::new() },
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// The supersede chain starting at `start` when it leads back to `start`
+/// (self-supersede, A → B → A, …), else `None`.
+fn supersede_cycle<'a>(start: &'a str, successor_of: &HashMap<&'a str, &'a str>) -> Option<Vec<&'a str>> {
+    let mut chain = vec![start];
+    let mut seen: HashSet<&str> = HashSet::from([start]);
+    let mut current = start;
+    while let Some(&next) = successor_of.get(current) {
+        chain.push(next);
+        if next == start {
+            return Some(chain);
+        }
+        if !seen.insert(next) {
+            return None; // a cycle further down the chain, not through `start`
+        }
+        current = next;
+    }
+    None
+}
+
+/// A2: `alias-collision` — two pages of one type directory share a name
+/// through an alias or an identical slug (see
+/// [`super::duplicates::name_collisions`]; `distinct_from` opts a pair
+/// out). Reported on both pages.
+fn alias_collisions(pages: &[(PathBuf, ParsedPage)], warnings: &mut Vec<LintWarning>) {
+    let entries: Vec<super::duplicates::NameEntry> = pages
+        .iter()
+        .map(|(_, p)| super::duplicates::NameEntry {
+            id: p.frontmatter.id.clone(),
+            title: p.frontmatter.title.clone(),
+            aliases: p.frontmatter.aliases.clone(),
+            distinct_from: p.frontmatter.distinct_from.clone(),
+        })
+        .collect();
+    let mut others_of: HashMap<&str, Vec<&str>> = HashMap::new();
+    let pairs = super::duplicates::name_collisions(&entries);
+    for (a, b) in &pairs {
+        others_of.entry(a.as_str()).or_default().push(b.as_str());
+        others_of.entry(b.as_str()).or_default().push(a.as_str());
+    }
+    for (file, parsed) in pages {
+        let id = parsed.frontmatter.id.as_str();
+        let Some(others) = others_of.get(id) else {
+            continue;
+        };
+        warnings.push(LintWarning {
+            path: file.to_string_lossy().to_string(),
+            kind: "alias-collision".into(),
+            message: format!(
+                "'{id}' has the same name as {} (via id or alias) — if they are the same \
+                 thing, fold one into the other with brain_merge_pages; if they are different, \
+                 change the clashing alias or add `distinct_from: [<other id>]`",
+                others.iter().map(|o| format!("'{o}'")).collect::<Vec<_>>().join(", ")
+            ),
+        });
+    }
 }
 
 /// True iff any line of `body` looks like a Markdown table row
@@ -683,5 +931,210 @@ mod tests {
             .warnings
             .iter()
             .all(|w| w.kind != "non-canonical-wiki-link"));
+    }
+
+    // ---- A2 / C ------------------------------------------------------------
+
+    /// A page with extra frontmatter lines (each ending in a newline).
+    fn page_with(id: &str, page_type: &str, extra: &str, body: &str) -> String {
+        format!("---\nid: {id}\ntype: {page_type}\ntitle: t\n{extra}---\n\n{body}\n")
+    }
+
+    fn kinds_for(report: &LintReport, kind: &str) -> usize {
+        report.errors.iter().filter(|e| e.kind == kind).count()
+            + report.warnings.iter().filter(|w| w.kind == kind).count()
+    }
+
+    const TODAY: &str = "2026-10-06";
+
+    #[test]
+    fn two_pages_sharing_a_name_through_an_alias_get_an_alias_collision_warning_each() {
+        let tmp = make_vault();
+        write_page(tmp.path(), "entities", "acme", &page_with("entities/acme", "entity", "aliases: [ACME Corp]\n", "x"));
+        write_page(tmp.path(), "entities", "acme-corp", &page_with("entities/acme-corp", "entity", "", "y"));
+        let report = lint_as_of(tmp.path(), TODAY).unwrap();
+        assert_eq!(kinds_for(&report, "alias-collision"), 2);
+    }
+
+    #[test]
+    fn a_superseded_by_pointing_at_a_missing_page_is_a_dangling_supersede_error() {
+        let tmp = make_vault();
+        write_page(tmp.path(), "entities", "a", &page_with("entities/a", "entity", "superseded_by: entities/gone\n", "x"));
+        let report = lint_as_of(tmp.path(), TODAY).unwrap();
+        assert!(report.errors.iter().any(|e| e.kind == "dangling-supersede"));
+    }
+
+    #[test]
+    fn a_superseded_by_pointing_at_an_existing_page_is_not_an_error() {
+        let tmp = make_vault();
+        write_page(tmp.path(), "entities", "a", &page_with("entities/a", "entity", "superseded_by: entities/b\n", "x"));
+        write_page(tmp.path(), "entities", "b", &page_with("entities/b", "entity", "", "y"));
+        let report = lint_as_of(tmp.path(), TODAY).unwrap();
+        assert_eq!(kinds_for(&report, "dangling-supersede"), 0);
+    }
+
+    #[test]
+    fn an_entity_page_without_sources_gets_a_missing_sources_warning() {
+        let tmp = make_vault();
+        write_page(tmp.path(), "entities", "a", &page_with("entities/a", "entity", "", "x"));
+        let report = lint_as_of(tmp.path(), TODAY).unwrap();
+        assert!(report.warnings.iter().any(|w| w.kind == "missing-sources"));
+    }
+
+    #[test]
+    fn a_topic_page_without_sources_gets_no_missing_sources_warning() {
+        let tmp = make_vault();
+        write_page(tmp.path(), "topics", "t", &page_with("topics/t", "topic", "", "x"));
+        let report = lint_as_of(tmp.path(), TODAY).unwrap();
+        assert_eq!(kinds_for(&report, "missing-sources"), 0);
+    }
+
+    #[test]
+    fn missing_sources_never_blocks_a_commit() {
+        let tmp = make_vault();
+        write_page(tmp.path(), "concepts", "c", &page_with("concepts/c", "concept", "", "x"));
+        let report = lint_as_of(tmp.path(), TODAY).unwrap();
+        assert!(report.is_clean(), "unexpected errors: {:?}", report.errors);
+    }
+
+    #[test]
+    fn an_expired_page_linked_from_a_current_page_gets_an_expired_but_linked_warning() {
+        let tmp = make_vault();
+        write_page(tmp.path(), "entities", "old", &page_with("entities/old", "entity", "valid_to: 2025-12-31\n", "x"));
+        write_page(tmp.path(), "entities", "cur", &page_with("entities/cur", "entity", "", "see [[entities/old]]"));
+        let report = lint_as_of(tmp.path(), TODAY).unwrap();
+        assert_eq!(kinds_for(&report, "expired-but-linked"), 1);
+    }
+
+    #[test]
+    fn an_expired_page_linked_only_from_expired_pages_gets_no_expired_but_linked_warning() {
+        let tmp = make_vault();
+        write_page(tmp.path(), "entities", "old", &page_with("entities/old", "entity", "valid_to: 2025-12-31\n", "x"));
+        write_page(
+            tmp.path(),
+            "entities",
+            "older",
+            &page_with("entities/older", "entity", "valid_to: 2024-12-31\n", "see [[entities/old]]"),
+        );
+        let report = lint_as_of(tmp.path(), TODAY).unwrap();
+        assert_eq!(kinds_for(&report, "expired-but-linked"), 0);
+    }
+
+    #[test]
+    fn a_page_valid_until_today_is_not_expired() {
+        let tmp = make_vault();
+        write_page(tmp.path(), "entities", "old", &page_with("entities/old", "entity", "valid_to: 2026-10-06\n", "x"));
+        write_page(tmp.path(), "entities", "cur", &page_with("entities/cur", "entity", "", "see [[entities/old]]"));
+        let report = lint_as_of(tmp.path(), TODAY).unwrap();
+        assert_eq!(kinds_for(&report, "expired-but-linked"), 0);
+    }
+
+    // ---- review fixes: dates, cycles, sources, collisions, toast ----------
+
+    #[test]
+    fn a_sources_entry_without_a_page_gets_a_broken_source_warning() {
+        let tmp = make_vault();
+        write_page(tmp.path(), "entities", "a", &page_with("entities/a", "entity", "sources: [sources/gone]\n", "x"));
+        let report = lint_as_of(tmp.path(), TODAY).unwrap();
+        assert_eq!(kinds_for(&report, "broken-source"), 1);
+    }
+
+    #[test]
+    fn a_valid_to_that_is_not_an_iso_date_gets_an_invalid_date_warning() {
+        let tmp = make_vault();
+        write_page(tmp.path(), "entities", "a", &page_with("entities/a", "entity", "valid_to: end of 2025\n", "x"));
+        let report = lint_as_of(tmp.path(), TODAY).unwrap();
+        assert_eq!(kinds_for(&report, "invalid-date"), 1);
+    }
+
+    #[test]
+    fn a_valid_from_after_valid_to_gets_an_invalid_date_warning() {
+        let tmp = make_vault();
+        write_page(
+            tmp.path(),
+            "entities",
+            "a",
+            &page_with("entities/a", "entity", "valid_from: 2026-02-01\nvalid_to: 2026-01-01\n", "x"),
+        );
+        let report = lint_as_of(tmp.path(), TODAY).unwrap();
+        assert_eq!(kinds_for(&report, "invalid-date"), 1);
+    }
+
+    #[test]
+    fn an_invalid_valid_to_does_not_make_a_page_expired() {
+        let tmp = make_vault();
+        write_page(tmp.path(), "entities", "old", &page_with("entities/old", "entity", "valid_to: 1999\n", "x"));
+        write_page(tmp.path(), "entities", "cur", &page_with("entities/cur", "entity", "", "see [[entities/old]]"));
+        let report = lint_as_of(tmp.path(), TODAY).unwrap();
+        assert_eq!(kinds_for(&report, "expired-but-linked"), 0);
+    }
+
+    #[test]
+    fn a_page_superseded_by_itself_is_a_supersede_cycle_error() {
+        let tmp = make_vault();
+        write_page(tmp.path(), "entities", "a", &page_with("entities/a", "entity", "superseded_by: entities/a\n", "x"));
+        let report = lint_as_of(tmp.path(), TODAY).unwrap();
+        assert!(report.errors.iter().any(|e| e.kind == "supersede-cycle"));
+    }
+
+    #[test]
+    fn two_pages_superseding_each_other_are_both_supersede_cycle_errors() {
+        let tmp = make_vault();
+        write_page(tmp.path(), "entities", "a", &page_with("entities/a", "entity", "superseded_by: entities/b\n", "x"));
+        write_page(tmp.path(), "entities", "b", &page_with("entities/b", "entity", "superseded_by: entities/a\n", "y"));
+        let report = lint_as_of(tmp.path(), TODAY).unwrap();
+        assert_eq!(kinds_for(&report, "supersede-cycle"), 2);
+    }
+
+    #[test]
+    fn a_supersede_chain_without_a_cycle_is_no_error() {
+        let tmp = make_vault();
+        write_page(tmp.path(), "entities", "a", &page_with("entities/a", "entity", "superseded_by: entities/b\n", "x"));
+        write_page(tmp.path(), "entities", "b", &page_with("entities/b", "entity", "superseded_by: entities/c\n", "y"));
+        write_page(tmp.path(), "entities", "c", &page_with("entities/c", "entity", "", "z"));
+        let report = lint_as_of(tmp.path(), TODAY).unwrap();
+        assert_eq!(kinds_for(&report, "supersede-cycle"), 0);
+    }
+
+    #[test]
+    fn distinct_from_silences_the_alias_collision_lint() {
+        let tmp = make_vault();
+        write_page(
+            tmp.path(),
+            "entities",
+            "acme",
+            &page_with("entities/acme", "entity", "aliases: [ACME Corp]\ndistinct_from: [entities/acme-corp]\n", "x"),
+        );
+        write_page(tmp.path(), "entities", "acme-corp", &page_with("entities/acme-corp", "entity", "", "y"));
+        let report = lint_as_of(tmp.path(), TODAY).unwrap();
+        assert_eq!(kinds_for(&report, "alias-collision"), 0);
+    }
+
+    #[test]
+    fn two_ids_that_only_match_after_umlaut_folding_get_no_alias_collision_warning() {
+        let tmp = make_vault();
+        write_page(tmp.path(), "entities", "koehler", &page_with("entities/koehler", "entity", "", "x"));
+        write_page(tmp.path(), "entities", "kohler", &page_with("entities/kohler", "entity", "", "y"));
+        let report = lint_as_of(tmp.path(), TODAY).unwrap();
+        assert_eq!(kinds_for(&report, "alias-collision"), 0);
+    }
+
+    #[test]
+    fn the_commit_toast_leaves_out_the_quiet_warning_kinds() {
+        let w = |kind: &str| LintWarning {
+            path: "p".into(),
+            kind: kind.into(),
+            message: "m".into(),
+        };
+        let shown: Vec<String> = toast_warnings(vec![
+            w("missing-sources"),
+            w("alias-collision"),
+            w("expired-but-linked"),
+            w("missing-title"),
+        ])
+        .into_iter()
+        .map(|w| w.kind)
+        .collect();
+        assert_eq!(shown, vec!["missing-title"]);
     }
 }

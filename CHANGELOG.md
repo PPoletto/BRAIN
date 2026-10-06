@@ -55,9 +55,56 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   are listed in the audit file and on the Integrity page. A running audit
   never prevents ejecting the vault, and reports older than 30 days are
   deleted automatically.
+- **Duplicate check before a page is created.** Pages can list other
+  names in their frontmatter (`aliases: [ACME Corp, Acme Inc]`). Before
+  creating a page, the agent's existence check (`brain_page_exists`) now
+  also lists pages that are probably the same thing: one of their aliases,
+  the same name spelled differently (upper/lower case, `ü` or `ue`,
+  punctuation, `_` or space instead of `-`; for longer or multi-word names
+  also `u` instead of `ue`, as in "Muller GmbH" / "Mueller GmbH"), or a
+  near spelling. Creating a page whose name matches an existing page or
+  one of its aliases is refused with the id and title of the existing
+  page; near spellings are only listed. The agent can still create the
+  page on purpose (`allow_duplicate`). Updating an existing page is never
+  refused, and a page that was deleted outside BRAIN no longer counts.
+  The lint report flags two pages that share a name through an alias or
+  the same name (`alias-collision`); pages that only look alike can say
+  so with `distinct_from`. Merging two pages keeps the removed page's
+  name as an alias of the remaining one.
+- **Replaced facts stay in the wiki, marked as replaced.** Pages can say
+  from when and until when their facts hold (`valid_from`, `valid_to`),
+  which page replaces them (`superseded_by`) and which source pages their
+  facts come from (`sources`). Structured queries (`brain_query` and the
+  Query view) hide replaced and expired pages unless the query says
+  `valid:all` (`valid:expired` shows only those). When the agent reads a
+  replaced page, the answer names the page that replaces it; the page
+  text itself is returned unchanged. Renaming, merging and deleting pages
+  keep `superseded_by` and `sources` up to date like links (deleting a
+  page that others name there is refused unless forced). The lint report
+  flags a replacement that points at a missing page or loops back
+  (errors), entity and concept pages without sources, sources without a
+  page, dates that are not `YYYY-MM-DD`, and expired pages that current
+  pages still link to.
+- **Most-read pages first.** BRAIN counts locally how often the agent
+  reads a page and how often it shows up in the top ten search results.
+  `sort:salience` in a structured query lists the most-used pages first;
+  query results show the counts. The counts are kept only in the vault's
+  local index and are never synced. Rebuilding the index keeps them; they
+  move with a page when the agent renames or merges it, and the counts of
+  a page that is gone are removed once it has been missing and unread for
+  30 days. Reading pages never starts building the index.
+
+  Use "Update vault templates" in Settings to give your agent the new
+  instructions (aliases, the duplicate check, superseding instead of
+  overwriting).
 
 ### Changed
 
+- **Structured queries hide replaced and expired pages by default.**
+  `brain_query` and the Query view now leave out pages with
+  `superseded_by`, a `valid_to` in the past or a `valid_from` in the
+  future, unless the query says `valid:all`. Vaults that do not use these
+  fields see no difference.
 - **Semantic search understands where a passage belongs.** Pages are now
   split for the search index along their headings, and every passage is
   indexed together with a short context line — the page title, its type

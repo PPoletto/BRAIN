@@ -96,7 +96,7 @@ pub enum RefactorError {
     SameFile { a: String, b: String },
 
     #[error(
-        "page '{id}' is still linked from {count} page(s): {list}. Rename it \
+        "page '{id}' is still linked (or named in superseded_by / sources) from {count} page(s): {list}. Rename it \
          (brain_rename_page) if only its id is wrong, merge it into the right page \
          (brain_merge_pages) if it is a duplicate, or pass force=true to delete it anyway and \
          turn those links into plain text",
@@ -125,6 +125,8 @@ pub struct RenameOutcome {
     /// Ids (after the rename) of the pages whose links were rewritten.
     pub rewritten_pages: Vec<String>,
     pub rewritten_links: usize,
+    /// `superseded_by` / `sources` frontmatter entries pointed at the new id.
+    pub rewritten_references: usize,
     /// The commit sha, or `None` if git saw nothing to commit or the
     /// commit failed (then `note` says so).
     pub commit: Option<String>,
@@ -139,6 +141,9 @@ pub struct DeleteOutcome {
     /// Ids of the pages whose links to the deleted page became plain text.
     pub defused_in: Vec<String>,
     pub defused_links: usize,
+    /// `superseded_by` / `sources` frontmatter entries naming the deleted
+    /// page that were removed (only with `force`).
+    pub removed_references: usize,
     pub commit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -153,6 +158,8 @@ pub struct MergeOutcome {
     /// `from_id` were redirected to `into_id`.
     pub rewritten_pages: Vec<String>,
     pub rewritten_links: usize,
+    /// `superseded_by` / `sources` frontmatter entries pointed at `into_id`.
+    pub rewritten_references: usize,
     pub commit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -243,11 +250,14 @@ pub(crate) fn rename_page_with_store(
         }
     }
     let (moved, self_links) = rewrite_page_links(&moved, old_id, &LinkAction::Retarget(new_id));
+    let (moved, self_refs) =
+        rewrite_frontmatter_refs(&moved, new_id, old_id, RefAction::Retarget(new_id));
     verify_frontmatter_id(&moved, new_id)?;
 
     let mut rewritten_pages: Vec<String> = Vec::new();
     let mut rewritten_links = self_links;
-    if self_links > 0 {
+    let mut rewritten_references = self_refs;
+    if self_links + self_refs > 0 {
         rewritten_pages.push(new_id.to_string());
     }
     let mut ops = vec![
@@ -262,8 +272,11 @@ pub(crate) fn rename_page_with_store(
     ];
     for p in pages.iter().filter(|p| !same_file(&p.path, &src_path)) {
         let (new_raw, n) = rewrite_page_links(&p.raw, old_id, &LinkAction::Retarget(new_id));
-        if n > 0 {
+        let (new_raw, r) =
+            rewrite_frontmatter_refs(&new_raw, &p.id, old_id, RefAction::Retarget(new_id));
+        if n + r > 0 {
             rewritten_links += n;
+            rewritten_references += r;
             rewritten_pages.push(p.id.clone());
             ops.push(Op::Write {
                 path: p.path.clone(),
@@ -286,6 +299,7 @@ pub(crate) fn rename_page_with_store(
         new_id: new_id.to_string(),
         rewritten_pages,
         rewritten_links,
+        rewritten_references,
         commit,
         note,
     })
@@ -322,7 +336,7 @@ pub(crate) fn delete_page_with_store(
     let pages = collect_pages(vault)?;
     let referrers: Vec<&PageFile> = pages
         .iter()
-        .filter(|p| !same_file(&p.path, &path) && links_to(&p.raw, id))
+        .filter(|p| !same_file(&p.path, &path) && (links_to(&p.raw, id) || names_in_frontmatter(&p.raw, id)))
         .collect();
     if !referrers.is_empty() && !force {
         let mut ids: Vec<String> = referrers.iter().map(|p| p.id.clone()).collect();
@@ -336,11 +350,14 @@ pub(crate) fn delete_page_with_store(
 
     let mut defused_in: Vec<String> = Vec::new();
     let mut defused_links = 0usize;
+    let mut removed_references = 0usize;
     let mut ops: Vec<Op> = Vec::new();
     for p in referrers {
         let (new_raw, n) = rewrite_page_links(&p.raw, id, &LinkAction::Defuse(&label));
-        if n > 0 {
+        let (new_raw, r) = rewrite_frontmatter_refs(&new_raw, &p.id, id, RefAction::Remove);
+        if n + r > 0 {
             defused_links += n;
+            removed_references += r;
             defused_in.push(p.id.clone());
             ops.push(Op::Write {
                 path: p.path.clone(),
@@ -358,6 +375,7 @@ pub(crate) fn delete_page_with_store(
         deleted: id.to_string(),
         defused_in,
         defused_links,
+        removed_references,
         commit,
         note,
     })
@@ -422,6 +440,33 @@ pub(crate) fn merge_pages_with_store(
         merged = set_frontmatter_tags(&merged, &tags)
             .ok_or_else(|| malformed(into_id, "frontmatter could not be located"))?;
     }
+    // The surviving page keeps the source's other names: its aliases and
+    // its old id (so a later create under that name is caught as a
+    // duplicate), and the union of both pages' sources.
+    let mut aliases = into.frontmatter.aliases.clone();
+    for a in from.frontmatter.aliases.iter().chain(std::iter::once(&from.frontmatter.id)) {
+        if a != into_id && !aliases.contains(a) {
+            aliases.push(a.clone());
+        }
+    }
+    if aliases != into.frontmatter.aliases {
+        merged = set_frontmatter_list(&merged, "aliases", &aliases)
+            .ok_or_else(|| malformed(into_id, "frontmatter could not be located"))?;
+    }
+    let mut sources = into.frontmatter.sources.clone();
+    for s in &from.frontmatter.sources {
+        if s != into_id && s != from_id && !sources.contains(s) {
+            sources.push(s.clone());
+        }
+    }
+    if sources != into.frontmatter.sources {
+        merged = set_frontmatter_list(&merged, "sources", &sources)
+            .ok_or_else(|| malformed(into_id, "frontmatter could not be located"))?;
+    }
+    // References from the target to the source would now point at itself.
+    let (merged_refs, mut rewritten_references) =
+        rewrite_frontmatter_refs(&merged, into_id, from_id, RefAction::Retarget(into_id));
+    merged = merged_refs;
     let check = parse(&merged).map_err(|e| malformed(into_id, e))?;
     if check.frontmatter.id != into_id || check.frontmatter.tags != tags {
         return Err(malformed(
@@ -442,8 +487,11 @@ pub(crate) fn merge_pages_with_store(
         .filter(|p| !same_file(&p.path, &from_path) && !same_file(&p.path, &into_path))
     {
         let (new_raw, n) = rewrite_page_links(&p.raw, from_id, &LinkAction::Retarget(into_id));
-        if n > 0 {
+        let (new_raw, r) =
+            rewrite_frontmatter_refs(&new_raw, &p.id, from_id, RefAction::Retarget(into_id));
+        if n + r > 0 {
             rewritten_links += n;
+            rewritten_references += r;
             rewritten_pages.push(p.id.clone());
             ops.push(Op::Write {
                 path: p.path.clone(),
@@ -462,6 +510,7 @@ pub(crate) fn merge_pages_with_store(
         into_id: into_id.to_string(),
         rewritten_pages,
         rewritten_links,
+        rewritten_references,
         commit,
         note,
     })
@@ -659,6 +708,92 @@ fn rewrite_page_links(raw: &str, id: &str, action: &LinkAction<'_>) -> (String, 
     }
 }
 
+/// What to do with a frontmatter reference (`superseded_by`, `sources`)
+/// to the id being refactored.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum RefAction<'a> {
+    /// Point it at another id.
+    Retarget(&'a str),
+    /// Remove it (the `superseded_by` line / the `sources` entry).
+    Remove,
+}
+
+/// Whether a page file's frontmatter names `id` in `superseded_by` or
+/// `sources`.
+fn names_in_frontmatter(raw: &str, id: &str) -> bool {
+    match parse(raw) {
+        Ok(p) => {
+            p.frontmatter.superseded_by.as_deref() == Some(id)
+                || p.frontmatter.sources.iter().any(|s| s == id)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Rewrite the frontmatter references to `id` of the page file `raw`
+/// (whose own id is `own_id`): `superseded_by: <id>` and `id` entries of
+/// `sources` (flow list, block list or single value; `[[id]]` forms too).
+/// A retarget onto the page itself becomes a removal. Only the touched
+/// entries change (a rewritten `sources` is written as a flow list);
+/// every other byte stays. Returns the new text and the number of
+/// references changed; an unparseable file is returned unchanged.
+pub(crate) fn rewrite_frontmatter_refs(
+    raw: &str,
+    own_id: &str,
+    id: &str,
+    action: RefAction<'_>,
+) -> (String, usize) {
+    let Ok(parsed) = parse(raw) else {
+        return (raw.to_string(), 0);
+    };
+    let fm = &parsed.frontmatter;
+    let action = match action {
+        RefAction::Retarget(target) if target == own_id => RefAction::Remove,
+        other => other,
+    };
+    let mut out = raw.to_string();
+    let mut changed = 0usize;
+    if fm.superseded_by.as_deref() == Some(id) {
+        let line = match action {
+            RefAction::Retarget(target) => Some(format!("superseded_by: {}", yaml_scalar(target))),
+            RefAction::Remove => None,
+        };
+        if let Some(new) = set_frontmatter_entry(&out, "superseded_by", line.as_deref()) {
+            out = new;
+            changed += 1;
+        }
+    }
+    let hits = fm.sources.iter().filter(|s| *s == id).count();
+    if hits > 0 {
+        let mut list: Vec<String> = Vec::new();
+        for s in &fm.sources {
+            let kept = if s == id {
+                match action {
+                    RefAction::Retarget(target) => Some(target.to_string()),
+                    RefAction::Remove => None,
+                }
+            } else {
+                Some(s.clone())
+            };
+            if let Some(v) = kept {
+                if !list.contains(&v) {
+                    list.push(v);
+                }
+            }
+        }
+        let new = if list.is_empty() {
+            set_frontmatter_entry(&out, "sources", None)
+        } else {
+            set_frontmatter_list(&out, "sources", &list)
+        };
+        if let Some(new) = new {
+            out = new;
+            changed += hits;
+        }
+    }
+    (out, changed)
+}
+
 /// Whether a page file's body links to `id` — the same edge definition
 /// the backlinks view and the indexer use.
 fn links_to(raw: &str, id: &str) -> bool {
@@ -700,12 +835,63 @@ fn set_frontmatter_scalar(raw: &str, key: &str, value: &str) -> Option<String> {
 /// Set the frontmatter `tags` to `tags` (flow style), replacing an
 /// existing `tags:` entry in either flow or block style.
 fn set_frontmatter_tags(raw: &str, tags: &[String]) -> Option<String> {
+    set_frontmatter_list(raw, "tags", tags)
+}
+
+/// Set the top-level frontmatter list `key` to `items` (flow style,
+/// JSON-quoted — valid YAML), replacing an existing entry in flow, block
+/// or single-value style, or appending one.
+fn set_frontmatter_list(raw: &str, key: &str, items: &[String]) -> Option<String> {
+    let rendered = serde_json::to_string(items).ok()?;
+    set_frontmatter_entry(raw, key, Some(&format!("{key}: {rendered}")))
+}
+
+/// Replace the top-level frontmatter entry `key` (with its block
+/// continuation lines) by `line`, or remove it when `line` is `None`
+/// (a no-op for a missing key). `None` when the file has no frontmatter.
+fn set_frontmatter_entry(raw: &str, key: &str, line: Option<&str>) -> Option<String> {
     let (start, end) = frontmatter_span(raw)?;
     let yaml = &raw[start..end];
-    let rendered = serde_json::to_string(tags).ok()?;
-    let line = format!("tags: {rendered}");
-    let new_yaml = replace_top_level_entry(yaml, "tags", &line, true, dominant_eol(raw));
+    let new_yaml = match line {
+        Some(line) => replace_top_level_entry(yaml, key, line, true, dominant_eol(raw)),
+        None => remove_top_level_entry(yaml, key),
+    };
     Some(format!("{}{new_yaml}{}", &raw[..start], &raw[end..]))
+}
+
+/// `yaml` without the top-level `key:` entry and its block continuation
+/// lines. When the entry was the last one, the line break before it goes
+/// too (the closing fence supplies its own), so no blank line is left.
+fn remove_top_level_entry(yaml: &str, key: &str) -> String {
+    let prefix = format!("{key}:");
+    let lines: Vec<&str> = yaml.split_inclusive('\n').collect();
+    let Some(idx) = lines.iter().position(|l| l.starts_with(&prefix)) else {
+        return yaml.to_string();
+    };
+    let mut last = idx;
+    while last + 1 < lines.len() {
+        let next = lines[last + 1];
+        if next.starts_with(' ') || next.starts_with('\t') || next.starts_with("- ") {
+            last += 1;
+        } else {
+            break;
+        }
+    }
+    let mut out: String = lines[..idx].concat();
+    out.push_str(&lines[last + 1..].concat());
+    if last + 1 == lines.len() {
+        // The removed entry closed the YAML; its predecessor's line break
+        // would now double the closing fence's.
+        if out.ends_with('\n') {
+            out.pop();
+            if lines[last].ends_with('\r') && out.ends_with('\r') {
+                // CRLF file: keep the `\r` the fence's `\n` pairs with.
+            } else if out.ends_with('\r') {
+                out.pop();
+            }
+        }
+    }
+    out
 }
 
 /// Replace the top-level `key:` entry in `yaml` with `line`. With
@@ -1593,7 +1779,7 @@ mod tests {
         merge_pages_with_store(v.path(), "entities/dup", "entities/main", &store()).unwrap();
         assert_eq!(
             read(v.path(), "entities/main"),
-            "---\nid: entities/main\ntype: entity\ntitle: Main\ntags: [\"a\",\"b\",\"c\"]\n---\n\nMain facts.\n\n## Merged from entities/dup\n\nDup facts, see Main.\n"
+            "---\nid: entities/main\ntype: entity\ntitle: Main\ntags: [\"a\",\"b\",\"c\"]\naliases: [\"entities/dup\"]\n---\n\nMain facts.\n\n## Merged from entities/dup\n\nDup facts, see Main.\n"
         );
     }
 
@@ -1991,5 +2177,168 @@ mod tests {
         merge_pages_with_store(v.path(), "entities/dup", "entities/main", &store()).unwrap();
         let merged = read(v.path(), "entities/main");
         assert_eq!(merged.matches('\n').count(), merged.matches("\r\n").count());
+    }
+
+    // --- superseded_by / sources references (B1) --------------------------
+
+    fn page_fm(id: &str, extra: &str, body: &str) -> String {
+        format!("---\nid: {id}\ntype: entity\ntitle: T\n{extra}---\n\n{body}\n")
+    }
+
+    fn reference_vault() -> TempDir {
+        vault_with(&[
+            ("entities/old", page_fm("entities/old", "", "Old body.")),
+            (
+                "entities/replaced",
+                page_fm("entities/replaced", "superseded_by: entities/old\n", "Earlier."),
+            ),
+            (
+                "entities/cited",
+                page_fm("entities/cited", "sources: [entities/old, sources/keep]\n", "Facts."),
+            ),
+            (
+                "entities/block",
+                page_fm("entities/block", "sources:\n  - entities/old\n  - sources/keep\n", "Facts."),
+            ),
+            ("sources/keep", page_fm("sources/keep", "", "Source.")),
+        ])
+    }
+
+    #[test]
+    fn rename_points_superseded_by_at_the_new_id() {
+        let v = reference_vault();
+        rename_page_with_store(v.path(), "entities/old", "entities/new", &store()).unwrap();
+        assert_eq!(
+            read(v.path(), "entities/replaced"),
+            page_fm("entities/replaced", "superseded_by: entities/new\n", "Earlier.")
+        );
+    }
+
+    #[test]
+    fn rename_points_a_flow_sources_entry_at_the_new_id() {
+        let v = reference_vault();
+        rename_page_with_store(v.path(), "entities/old", "entities/new", &store()).unwrap();
+        assert_eq!(
+            read(v.path(), "entities/cited"),
+            page_fm("entities/cited", "sources: [\"entities/new\",\"sources/keep\"]\n", "Facts.")
+        );
+    }
+
+    #[test]
+    fn rename_points_a_block_sources_entry_at_the_new_id() {
+        let v = reference_vault();
+        rename_page_with_store(v.path(), "entities/old", "entities/new", &store()).unwrap();
+        let parsed = parse(&read(v.path(), "entities/block")).unwrap();
+        assert_eq!(parsed.frontmatter.sources, vec!["entities/new", "sources/keep"]);
+    }
+
+    #[test]
+    fn rename_reports_the_rewritten_references() {
+        let v = reference_vault();
+        let out = rename_page_with_store(v.path(), "entities/old", "entities/new", &store()).unwrap();
+        assert_eq!(out.rewritten_references, 3);
+    }
+
+    #[test]
+    fn rename_points_a_single_string_superseded_by_written_as_a_wiki_link_at_the_new_id() {
+        let v = vault_with(&[
+            ("entities/old", page_fm("entities/old", "", "Old.")),
+            (
+                "entities/a",
+                page_fm("entities/a", "superseded_by: \"[[entities/old]]\"\n", "A."),
+            ),
+        ]);
+        rename_page_with_store(v.path(), "entities/old", "entities/new", &store()).unwrap();
+        let parsed = parse(&read(v.path(), "entities/a")).unwrap();
+        assert_eq!(parsed.frontmatter.superseded_by.as_deref(), Some("entities/new"));
+    }
+
+    #[test]
+    fn merge_points_superseded_by_at_the_surviving_page() {
+        let v = reference_vault();
+        merge_pages_with_store(v.path(), "entities/old", "entities/cited", &store()).unwrap();
+        let parsed = parse(&read(v.path(), "entities/replaced")).unwrap();
+        assert_eq!(parsed.frontmatter.superseded_by.as_deref(), Some("entities/cited"));
+    }
+
+    #[test]
+    fn merge_drops_a_sources_entry_of_the_survivor_that_named_the_merged_page() {
+        let v = reference_vault();
+        merge_pages_with_store(v.path(), "entities/old", "entities/cited", &store()).unwrap();
+        let parsed = parse(&read(v.path(), "entities/cited")).unwrap();
+        assert_eq!(parsed.frontmatter.sources, vec!["sources/keep"]);
+    }
+
+    #[test]
+    fn merge_keeps_the_merged_page_id_and_aliases_as_aliases_of_the_survivor() {
+        let v = vault_with(&[
+            ("entities/old", page_fm("entities/old", "aliases: [Old Corp]\n", "Old.")),
+            ("entities/new", page_fm("entities/new", "aliases: [New Corp]\n", "New.")),
+        ]);
+        merge_pages_with_store(v.path(), "entities/old", "entities/new", &store()).unwrap();
+        let parsed = parse(&read(v.path(), "entities/new")).unwrap();
+        assert_eq!(parsed.frontmatter.aliases, vec!["New Corp", "Old Corp", "entities/old"]);
+    }
+
+    #[test]
+    fn delete_refuses_while_a_page_is_superseded_by_it() {
+        let v = vault_with(&[
+            ("entities/old", page_fm("entities/old", "", "Old.")),
+            ("entities/a", page_fm("entities/a", "superseded_by: entities/old\n", "A.")),
+        ]);
+        let err = delete_page_with_store(v.path(), "entities/old", false, &store()).unwrap_err();
+        assert!(matches!(
+            err,
+            RefactorError::StillLinked { ref referrers, .. } if referrers == &vec!["entities/a".to_string()]
+        ));
+    }
+
+    #[test]
+    fn delete_refuses_while_a_page_names_it_in_sources() {
+        let v = vault_with(&[
+            ("sources/s", page_fm("sources/s", "", "S.")),
+            ("entities/a", page_fm("entities/a", "sources: [sources/s]\n", "A.")),
+        ]);
+        let err = delete_page_with_store(v.path(), "sources/s", false, &store()).unwrap_err();
+        assert!(matches!(err, RefactorError::StillLinked { .. }));
+    }
+
+    #[test]
+    fn forced_delete_removes_the_superseded_by_line_and_nothing_else() {
+        let v = vault_with(&[
+            ("entities/old", page_fm("entities/old", "", "Old.")),
+            ("entities/a", page_fm("entities/a", "superseded_by: entities/old\nvalid_to: 2025-01-01\n", "A.")),
+        ]);
+        delete_page_with_store(v.path(), "entities/old", true, &store()).unwrap();
+        assert_eq!(read(v.path(), "entities/a"), page_fm("entities/a", "valid_to: 2025-01-01\n", "A."));
+    }
+
+    #[test]
+    fn forced_delete_of_the_last_entry_leaves_no_blank_line_before_the_fence() {
+        let v = vault_with(&[
+            ("entities/old", page_fm("entities/old", "", "Old.")),
+            ("entities/a", page_fm("entities/a", "superseded_by: entities/old\n", "A.")),
+        ]);
+        delete_page_with_store(v.path(), "entities/old", true, &store()).unwrap();
+        assert_eq!(read(v.path(), "entities/a"), page_fm("entities/a", "", "A."));
+    }
+
+    #[test]
+    fn forced_delete_removes_only_the_sources_entry_of_the_deleted_page() {
+        let v = vault_with(&[
+            ("sources/s", page_fm("sources/s", "", "S.")),
+            ("sources/t", page_fm("sources/t", "", "T.")),
+            ("entities/a", page_fm("entities/a", "sources: [sources/s, sources/t]\n", "A.")),
+        ]);
+        delete_page_with_store(v.path(), "sources/s", true, &store()).unwrap();
+        let parsed = parse(&read(v.path(), "entities/a")).unwrap();
+        assert_eq!(parsed.frontmatter.sources, vec!["sources/t"]);
+    }
+
+    #[test]
+    fn remove_top_level_entry_keeps_crlf_line_endings() {
+        let raw = "---\r\nid: entities/a\r\nsuperseded_by: entities/old\r\n---\r\n\r\nA.\r\n";
+        let out = set_frontmatter_entry(raw, "superseded_by", None).unwrap();
+        assert_eq!(out, "---\r\nid: entities/a\r\n---\r\n\r\nA.\r\n");
     }
 }

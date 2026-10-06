@@ -16,6 +16,216 @@ pub struct PageFrontmatter {
     pub tags: Vec<String>,
     pub created: Option<String>,
     pub updated: Option<String>,
+    /// Alternative names of the page (A2). Matched by
+    /// `brain_page_exists` / the create-duplicate check via [`slug_key`].
+    /// Lenient: a single string or a list of scalars is accepted.
+    #[serde(default, deserialize_with = "de_string_list", skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    /// First day the page's facts hold (`YYYY-MM-DD`, Slice C).
+    #[serde(default, deserialize_with = "de_opt_scalar", skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<String>,
+    /// Last day the page's facts hold (`YYYY-MM-DD`, Slice C).
+    #[serde(default, deserialize_with = "de_opt_scalar", skip_serializing_if = "Option::is_none")]
+    pub valid_to: Option<String>,
+    /// Id of the page that replaces this one (Slice C). `[[id]]` is
+    /// accepted and stored as `id`.
+    #[serde(default, deserialize_with = "de_opt_page_ref", skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    /// Ids of the source pages the facts come from (Slice C). `[[id]]`
+    /// entries are accepted and stored as `id`.
+    #[serde(default, deserialize_with = "de_page_ref_list", skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<String>,
+    /// Ids of pages that share a name with this one but are a different
+    /// thing (A2): silences the `alias-collision` lint for those pairs.
+    #[serde(default, deserialize_with = "de_page_ref_list", skip_serializing_if = "Vec::is_empty")]
+    pub distinct_from: Vec<String>,
+    /// Every other frontmatter key (e.g. `summary`), kept so JSON views
+    /// of the frontmatter (`brain_get_page`, `pages.frontmatter`) do not
+    /// silently drop fields no named member covers. On disk the
+    /// frontmatter text is never re-serialised, so nothing is lost there.
+    /// Held as JSON values, converted at parse time: non-string keys
+    /// (`2025: …`, also in nested maps) are kept under their text form and
+    /// keys that are not scalars are dropped, so neither the parse nor the
+    /// JSON serialisation can fail on unusual YAML.
+    #[serde(flatten, deserialize_with = "de_extra")]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+fn de_extra<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<std::collections::BTreeMap<String, serde_json::Value>, D::Error> {
+    let mapping = serde_yaml::Mapping::deserialize(d)?;
+    Ok(mapping
+        .into_iter()
+        .filter_map(|(k, v)| Some((yaml_key(k)?, yaml_to_json(v))))
+        .collect())
+}
+
+/// A YAML mapping key as text; `None` for keys that are not scalars.
+fn yaml_key(k: YamlValue) -> Option<String> {
+    match k {
+        YamlValue::String(s) => Some(s),
+        YamlValue::Number(n) => Some(n.to_string()),
+        YamlValue::Bool(b) => Some(b.to_string()),
+        YamlValue::Null => Some("null".to_string()),
+        YamlValue::Tagged(t) => yaml_key(t.value),
+        _ => None,
+    }
+}
+
+/// YAML → JSON with every mapping key turned into text ([`yaml_key`]).
+fn yaml_to_json(v: YamlValue) -> serde_json::Value {
+    use serde_json::Value as J;
+    match v {
+        YamlValue::Null => J::Null,
+        YamlValue::Bool(b) => J::Bool(b),
+        YamlValue::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                J::from(i)
+            } else if let Some(u) = n.as_u64() {
+                J::from(u)
+            } else {
+                n.as_f64()
+                    .and_then(serde_json::Number::from_f64)
+                    .map(J::Number)
+                    .unwrap_or_else(|| J::String(n.to_string()))
+            }
+        }
+        YamlValue::String(s) => J::String(s),
+        YamlValue::Sequence(items) => J::Array(items.into_iter().map(yaml_to_json).collect()),
+        YamlValue::Mapping(map) => J::Object(
+            map.into_iter()
+                .filter_map(|(k, v)| Some((yaml_key(k)?, yaml_to_json(v))))
+                .collect(),
+        ),
+        YamlValue::Tagged(t) => yaml_to_json(t.value),
+    }
+}
+
+/// Scalars of a YAML value as strings: a scalar yields itself, a
+/// sequence its scalar entries (nested sequences are flattened — an
+/// unquoted `[[id]]` parses as a list inside a list), null nothing.
+/// Mappings are ignored.
+fn yaml_scalars(value: YamlValue, out: &mut Vec<String>) {
+    match value {
+        YamlValue::Null => {}
+        YamlValue::Bool(b) => out.push(b.to_string()),
+        YamlValue::Number(n) => out.push(n.to_string()),
+        YamlValue::String(s) => out.push(s),
+        YamlValue::Sequence(items) => {
+            for item in items {
+                yaml_scalars(item, out);
+            }
+        }
+        YamlValue::Tagged(tagged) => yaml_scalars(tagged.value, out),
+        YamlValue::Mapping(_) => {}
+    }
+}
+
+fn clean_entries(raw: Vec<String>, page_ref: bool) -> Vec<String> {
+    raw.into_iter()
+        .map(|s| if page_ref { strip_page_ref(&s) } else { s.trim().to_string() })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// `[[entities/x]]`, `[[entities/x|Alias]]` or `entities/x.md` → `entities/x`.
+fn strip_page_ref(raw: &str) -> String {
+    let s = raw.trim();
+    let s = s.strip_prefix("[[").unwrap_or(s);
+    let s = s.strip_suffix("]]").unwrap_or(s);
+    let s = s.split('|').next().unwrap_or(s).trim();
+    s.strip_suffix(".md").unwrap_or(s).to_string()
+}
+
+fn de_list<'de, D: serde::Deserializer<'de>>(d: D, page_ref: bool) -> Result<Vec<String>, D::Error> {
+    let value = Option::<YamlValue>::deserialize(d)?;
+    let mut raw = Vec::new();
+    if let Some(v) = value {
+        yaml_scalars(v, &mut raw);
+    }
+    Ok(clean_entries(raw, page_ref))
+}
+
+fn de_string_list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    de_list(d, false)
+}
+
+fn de_page_ref_list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    de_list(d, true)
+}
+
+fn de_opt_scalar<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(de_list(d, false)?.into_iter().next())
+}
+
+fn de_opt_page_ref<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(de_list(d, true)?.into_iter().next())
+}
+
+/// Normalised form of a page slug, alias or title for duplicate
+/// matching (A2): lowercase, `ä→ae ö→oe ü→ue ß→ss`, every character that
+/// is not a letter or digit (`_`, space, `.`, `,`, `&`, `/` …) → `-`,
+/// repeated `-` collapsed, leading/trailing `-` trimmed.
+/// `"Müller_GmbH"`, `"Mueller GmbH."` and `"mueller-gmbh"` share the key
+/// `mueller-gmbh`.
+pub fn slug_key(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars().flat_map(char::to_lowercase) {
+        match c {
+            'ä' => out.push_str("ae"),
+            'ö' => out.push_str("oe"),
+            'ü' => out.push_str("ue"),
+            'ß' => out.push_str("ss"),
+            c if c.is_alphanumeric() => out.push(c),
+            _ => out.push('-'),
+        }
+    }
+    let mut collapsed = String::with_capacity(out.len());
+    for c in out.chars() {
+        if c == '-' && collapsed.ends_with('-') {
+            continue;
+        }
+        collapsed.push(c);
+    }
+    collapsed.trim_matches('-').to_string()
+}
+
+/// [`slug_key`] of an alias. An alias written as a page id
+/// (`entities/old-name`, e.g. the id a merge folded in) is keyed by its
+/// slug, so it compares with page slugs.
+pub fn alias_key(alias: &str) -> String {
+    let trimmed = alias.trim();
+    let slug = WIKI_TYPE_PREFIXES
+        .iter()
+        .find_map(|p| trimmed.strip_prefix(p))
+        .unwrap_or(trimmed);
+    slug_key(slug)
+}
+
+/// [`slug_key`] with the umlaut transliterations folded to the bare
+/// vowel (`ae→a`, `oe→o`, `ue→u`), so the two common spellings of a
+/// German name (`mueller` / `muller`) compare equal. Used next to
+/// `slug_key` equality for the "normalised" duplicate class.
+pub fn umlaut_folded_key(key: &str) -> String {
+    key.replace("ae", "a").replace("oe", "o").replace("ue", "u")
+}
+
+/// Levenshtein edit distance over chars.
+pub fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
 }
 
 #[derive(Debug, Clone)]
@@ -544,5 +754,119 @@ Intro mentions [Dan](entities/dan-shapiro).
 ";
         let out = normalize_internal_links(body);
         assert_eq!(out, body);
+    }
+
+    // ---- A2 / C: name keys and optional frontmatter fields --------------
+
+    fn frontmatter_with(extra: &str) -> PageFrontmatter {
+        parse(&format!("---\nid: entities/x\ntype: entity\n{extra}---\n\nbody\n"))
+            .unwrap()
+            .frontmatter
+    }
+
+    #[test]
+    fn slug_key_lowercases_and_transliterates_umlauts_and_sharp_s() {
+        assert_eq!(slug_key("Müller Öl Übergröße"), "mueller-oel-uebergroesse");
+    }
+
+    #[test]
+    fn slug_key_turns_underscores_and_spaces_into_single_hyphens() {
+        assert_eq!(slug_key("__Foo  _ Bar--Baz_"), "foo-bar-baz");
+    }
+
+    #[test]
+    fn slug_key_of_an_umlaut_slug_equals_its_transliterated_slug() {
+        assert_eq!(slug_key("Müller_GmbH"), slug_key("mueller-gmbh"));
+    }
+
+    #[test]
+    fn the_umlaut_folded_key_equates_ue_and_u() {
+        assert_eq!(umlaut_folded_key("mueller-gmbh"), umlaut_folded_key("muller-gmbh"));
+    }
+
+    #[test]
+    fn levenshtein_counts_one_dropped_letter_as_one_edit() {
+        assert_eq!(levenshtein("dan-shapiro", "dan-shapio"), 1);
+    }
+
+    #[test]
+    fn aliases_accept_a_single_string() {
+        assert_eq!(frontmatter_with("aliases: Acme Corp\n").aliases, vec!["Acme Corp"]);
+    }
+
+    #[test]
+    fn aliases_accept_a_list_with_numbers() {
+        assert_eq!(frontmatter_with("aliases: [Acme, 2024]\n").aliases, vec!["Acme", "2024"]);
+    }
+
+    #[test]
+    fn an_unquoted_wiki_link_in_superseded_by_is_read_as_the_page_id() {
+        assert_eq!(
+            frontmatter_with("superseded_by: [[entities/b]]\n").superseded_by.as_deref(),
+            Some("entities/b")
+        );
+    }
+
+    #[test]
+    fn sources_drop_wiki_link_brackets_and_md_suffixes() {
+        assert_eq!(
+            frontmatter_with("sources: [\"[[sources/a|A]]\", sources/b.md]\n").sources,
+            vec!["sources/a", "sources/b"]
+        );
+    }
+
+    #[test]
+    fn validity_dates_are_read_as_strings() {
+        let fm = frontmatter_with("valid_from: 2024-01-01\nvalid_to: 2025-12-31\n");
+        assert_eq!(
+            (fm.valid_from.as_deref(), fm.valid_to.as_deref()),
+            (Some("2024-01-01"), Some("2025-12-31"))
+        );
+    }
+
+    #[test]
+    fn the_json_view_of_the_frontmatter_keeps_unknown_keys_like_summary() {
+        let json = serde_json::to_value(frontmatter_with("summary: Short.\n")).unwrap();
+        assert_eq!(json["summary"], serde_json::json!("Short."));
+    }
+
+    #[test]
+    fn a_numeric_frontmatter_key_does_not_fail_the_parse() {
+        assert_eq!(frontmatter_with("2025: revenue\n").extra["2025"], serde_json::json!("revenue"));
+    }
+
+    #[test]
+    fn a_nested_map_with_numeric_keys_serialises_to_json() {
+        let fm = frontmatter_with("figures:\n  2024: 10\n  2025: 12\n");
+        assert_eq!(
+            serde_json::to_value(&fm).unwrap()["figures"],
+            serde_json::json!({ "2024": 10, "2025": 12 })
+        );
+    }
+
+    #[test]
+    fn slug_key_turns_punctuation_into_hyphens() {
+        assert_eq!(slug_key("Acme, Inc. & Co"), "acme-inc-co");
+    }
+
+    #[test]
+    fn alias_key_drops_a_type_directory_prefix() {
+        assert_eq!(alias_key("entities/Old_Name"), "old-name");
+    }
+
+    #[test]
+    fn distinct_from_is_read_as_page_ids() {
+        assert_eq!(
+            frontmatter_with("distinct_from: [\"[[entities/y]]\"]\n").distinct_from,
+            vec!["entities/y"]
+        );
+    }
+
+    #[test]
+    fn the_json_view_of_the_frontmatter_omits_unset_optional_fields() {
+        let json = serde_json::to_value(frontmatter_with("")).unwrap();
+        let mut keys: Vec<&String> = json.as_object().unwrap().keys().collect();
+        keys.sort();
+        assert_eq!(keys, vec!["created", "id", "tags", "title", "type", "updated"]);
     }
 }

@@ -6,6 +6,7 @@
 pub mod audit;
 pub mod auto_sync;
 pub mod commands;
+pub mod duplicates;
 pub mod encryption;
 pub mod git;
 pub mod history;

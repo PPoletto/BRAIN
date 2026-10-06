@@ -96,6 +96,21 @@ const INDEX_FORMAT_VERSION: i64 = 3;
 /// `schema_meta` key holding the format version of a COMPLETED rebuild.
 const VERSION_KEY: &str = "index_format_version";
 
+/// Version of the frontmatter METADATA the index derives per page
+/// without embedding: `pages.frontmatter` JSON, the `valid_from` /
+/// `valid_to` / `superseded_by` columns, `page_aliases` and
+/// `page_sources`. Bumping it does NOT re-embed: while the stored value
+/// is older, unchanged pages (the fast path) get their metadata rewritten
+/// instead of only their path/mtime. Written in the final transaction of
+/// a completed rebuild, like [`VERSION_KEY`].
+///
+/// History:
+///  - v1: aliases, sources, valid_from, valid_to, superseded_by (A2/C).
+const META_FORMAT_VERSION: i64 = 1;
+
+/// `schema_meta` key holding [`META_FORMAT_VERSION`] of a completed rebuild.
+const META_VERSION_KEY: &str = "index_meta_version";
+
 /// `schema_meta` key present while a format upgrade or forced re-index is
 /// in progress: the version whose rows earlier batches already wrote (see
 /// module docs).
@@ -209,6 +224,10 @@ fn rebuild_batched<E: Embedder + ?Sized>(
     let files = collect_page_files(&wiki_dir(vault))?;
     let total = files.len();
     db.with(begin_format_upgrade)?;
+    // Metadata of unchanged pages is refreshed only while the stored
+    // metadata format is older than this build's (see META_FORMAT_VERSION).
+    let refresh_meta =
+        db.with(|conn| Ok(read_meta_i64(conn, META_VERSION_KEY) != Some(META_FORMAT_VERSION)))?;
 
     let mut seen_ids: HashSet<String> = HashSet::new();
     let mut done = 0usize;
@@ -250,7 +269,7 @@ fn rebuild_batched<E: Embedder + ?Sized>(
         db.with(|conn| {
             let tx = immediate(conn)?;
             for (page, write) in prepared.iter().zip(&writes) {
-                write_page(&tx, page, write)?;
+                write_page(&tx, page, write, refresh_meta)?;
             }
             tx.commit()?;
             Ok(())
@@ -273,6 +292,7 @@ fn rebuild_batched<E: Embedder + ?Sized>(
     db.with(|conn| {
         let tx = immediate(conn)?;
         prune_missing(&tx, &seen_ids)?;
+        gc_page_access(&tx, PAGE_ACCESS_GC_DAYS, chrono::Utc::now().timestamp())?;
         let full_run = read_meta(&tx, PENDING_KEY).is_some() || rewritten == seen_ids.len();
         let name = embedder.name();
         if full_run {
@@ -281,6 +301,7 @@ fn rebuild_batched<E: Embedder + ?Sized>(
             write_meta(&tx, EMBEDDER_KEY, MIXED_EMBEDDERS)?;
         }
         write_meta(&tx, VERSION_KEY, &INDEX_FORMAT_VERSION.to_string())?;
+        write_meta(&tx, META_VERSION_KEY, &META_FORMAT_VERSION.to_string())?;
         tx.execute("DELETE FROM schema_meta WHERE key = ?1", params![PENDING_KEY])?;
         tx.commit()?;
         Ok(())
@@ -448,7 +469,12 @@ fn embed_page<E: Embedder + ?Sized>(parsed: &ParsedPage, embedder: &E) -> Vec<(S
         .collect()
 }
 
-fn write_page(tx: &rusqlite::Transaction, page: &PreparedPage, write: &PageWrite) -> DbResult<()> {
+fn write_page(
+    tx: &rusqlite::Transaction,
+    page: &PreparedPage,
+    write: &PageWrite,
+    refresh_meta: bool,
+) -> DbResult<()> {
     let id = &page.parsed.frontmatter.id;
     let path = page.path.to_string_lossy().to_string();
     let chunks = match write {
@@ -460,6 +486,9 @@ fn write_page(tx: &rusqlite::Transaction, page: &PreparedPage, write: &PageWrite
                 "UPDATE pages SET path=?1, file_mtime=?2 WHERE id=?3",
                 params![&path, page.mtime, id],
             )?;
+            if refresh_meta {
+                write_page_meta(tx, &page.parsed)?;
+            }
             return Ok(());
         }
         PageWrite::Full(chunks) => chunks,
@@ -519,6 +548,8 @@ fn write_page(tx: &rusqlite::Transaction, page: &PreparedPage, write: &PageWrite
         )?;
     }
 
+    write_page_meta(tx, parsed)?;
+
     // Chunks + embeddings: replace. We mirror each embedding into the
     // sqlite-vec `chunk_vectors` virtual table so KNN sub-queries can
     // join on `chunks.id = chunk_vectors.rowid`. Mirror is best-effort
@@ -554,6 +585,41 @@ fn write_page(tx: &rusqlite::Transaction, page: &PreparedPage, write: &PageWrite
     Ok(())
 }
 
+/// The frontmatter metadata derived without embedding (see
+/// [`META_FORMAT_VERSION`]): the `pages.frontmatter` JSON, the validity
+/// columns, `page_aliases` and `page_sources`. Replaces whatever was
+/// stored for the page. The `pages` row must exist.
+fn write_page_meta(tx: &rusqlite::Transaction, parsed: &ParsedPage) -> DbResult<()> {
+    let fm = &parsed.frontmatter;
+    let id = &fm.id;
+    let frontmatter_json = serde_json::to_string(fm).unwrap_or_default();
+    tx.execute(
+        "UPDATE pages SET frontmatter=?1, valid_from=?2, valid_to=?3, superseded_by=?4 WHERE id=?5",
+        params![
+            &frontmatter_json,
+            fm.valid_from.as_deref(),
+            fm.valid_to.as_deref(),
+            fm.superseded_by.as_deref(),
+            id
+        ],
+    )?;
+    tx.execute("DELETE FROM page_aliases WHERE page_id = ?1", params![id])?;
+    for alias in &fm.aliases {
+        tx.execute(
+            "INSERT OR IGNORE INTO page_aliases(page_id, alias) VALUES (?1, ?2)",
+            params![id, alias],
+        )?;
+    }
+    tx.execute("DELETE FROM page_sources WHERE page_id = ?1", params![id])?;
+    for source in &fm.sources {
+        tx.execute(
+            "INSERT OR IGNORE INTO page_sources(page_id, source_id) VALUES (?1, ?2)",
+            params![id, source],
+        )?;
+    }
+    Ok(())
+}
+
 fn prune_missing(tx: &rusqlite::Transaction, seen: &HashSet<String>) -> DbResult<()> {
     let mut stmt = tx.prepare("SELECT id FROM pages")?;
     let existing: Vec<String> = stmt
@@ -581,6 +647,11 @@ pub fn forget_pages(conn: &rusqlite::Connection, ids: &[String]) -> DbResult<()>
     let tx = conn.unchecked_transaction()?;
     for id in ids {
         delete_page_rows(&tx, id)?;
+        // An MCP refactor removed the page on purpose, so its read counts
+        // go too (a rename/merge carries them over with
+        // `carry_page_access` first). The rebuild's prune step does NOT
+        // drop them — see `gc_page_access`.
+        tx.execute("DELETE FROM page_access WHERE page_id = ?1", params![id])?;
     }
     mark_broken_links(&tx)?;
     tx.commit()?;
@@ -605,7 +676,77 @@ fn delete_page_rows(conn: &rusqlite::Connection, id: &str) -> DbResult<()> {
     conn.execute("DELETE FROM pages_fts WHERE id = ?1", params![id])?;
     conn.execute("DELETE FROM wiki_links WHERE src_id = ?1", params![id])?;
     conn.execute("DELETE FROM page_tags WHERE page_id = ?1", params![id])?;
+    conn.execute("DELETE FROM page_aliases WHERE page_id = ?1", params![id])?;
+    conn.execute("DELETE FROM page_sources WHERE page_id = ?1", params![id])?;
     conn.execute("DELETE FROM chunks WHERE page_id = ?1", params![id])?;
+    Ok(())
+}
+
+/// Days a `page_access` row may outlive its page before
+/// [`gc_page_access`] drops it.
+pub const PAGE_ACCESS_GC_DAYS: i64 = 30;
+
+/// Drop the salience counters of pages that are gone from the index and
+/// were not read for `absent_for_days` days. A page that vanished only
+/// for a while (moved out and back, a sync in progress, an interrupted
+/// rebuild) keeps its counts; the rebuild's prune step never touches
+/// `page_access`. Rows never read (`last_read_at` NULL) count as old.
+pub fn gc_page_access(conn: &rusqlite::Connection, absent_for_days: i64, now_unix: i64) -> DbResult<usize> {
+    let cutoff = now_unix - absent_for_days * 24 * 60 * 60;
+    let n = conn.execute(
+        "DELETE FROM page_access \
+         WHERE page_id NOT IN (SELECT id FROM pages) AND COALESCE(last_read_at, 0) < ?1",
+        params![cutoff],
+    )?;
+    Ok(n)
+}
+
+/// Salience (H3): count one read (`brain_get_page(s)`,
+/// `brain_get_context`) for each id. One UPSERT per id. `page_access` is
+/// local usage data, not derived from the files: a rebuild never wipes
+/// it; only forgetting/pruning the page removes its row.
+pub fn record_reads(conn: &rusqlite::Connection, ids: &[String], now_unix: i64) -> DbResult<()> {
+    let tx = conn.unchecked_transaction()?;
+    for id in ids {
+        tx.execute(
+            "INSERT INTO page_access(page_id, reads, search_hits, last_read_at) VALUES (?1, 1, 0, ?2) \
+             ON CONFLICT(page_id) DO UPDATE SET reads = reads + 1, last_read_at = excluded.last_read_at",
+            params![id, now_unix],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Salience (H3): count one search hit (id in a `brain_search` top 10)
+/// for each id. One UPSERT per id.
+pub fn record_search_hits(conn: &rusqlite::Connection, ids: &[String]) -> DbResult<()> {
+    let tx = conn.unchecked_transaction()?;
+    for id in ids {
+        tx.execute(
+            "INSERT INTO page_access(page_id, reads, search_hits) VALUES (?1, 0, 1) \
+             ON CONFLICT(page_id) DO UPDATE SET search_hits = search_hits + 1",
+            params![id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Move the salience counters of `from` onto `to` (rename: `to` is new;
+/// merge: `to` survives and the counts are added up, keeping the later
+/// `last_read_at`). Call before [`forget_pages`] drops `from`'s row.
+pub fn carry_page_access(conn: &rusqlite::Connection, from: &str, to: &str) -> DbResult<()> {
+    conn.execute(
+        "INSERT INTO page_access(page_id, reads, search_hits, last_read_at) \
+         SELECT ?2, reads, search_hits, last_read_at FROM page_access WHERE page_id = ?1 \
+         ON CONFLICT(page_id) DO UPDATE SET \
+            reads = reads + excluded.reads, \
+            search_hits = search_hits + excluded.search_hits, \
+            last_read_at = NULLIF(MAX(COALESCE(last_read_at, 0), COALESCE(excluded.last_read_at, 0)), 0)",
+        params![from, to],
+    )?;
+    conn.execute("DELETE FROM page_access WHERE page_id = ?1", params![from])?;
     Ok(())
 }
 
@@ -716,6 +857,9 @@ mod tests {
         let mut total = count("SELECT count(*) FROM pages_fts WHERE id = ?1")
             + count("SELECT count(*) FROM chunks WHERE page_id = ?1")
             + count("SELECT count(*) FROM page_tags WHERE page_id = ?1")
+            + count("SELECT count(*) FROM page_aliases WHERE page_id = ?1")
+            + count("SELECT count(*) FROM page_sources WHERE page_id = ?1")
+            + count("SELECT count(*) FROM page_access WHERE page_id = ?1")
             + count("SELECT count(*) FROM wiki_links WHERE src_id = ?1");
         if crate::db::migrations::chunk_vectors_available(conn) {
             total += conn
@@ -740,6 +884,7 @@ mod tests {
         rebuild(&db, tmp.path()).unwrap();
         let left = db
             .with(|conn| {
+                record_reads(conn, &["entities/alice".to_string()], 1)?;
                 forget_pages(conn, &["entities/alice".to_string()])?;
                 Ok(leftover_rows(conn, "entities/alice"))
             })
@@ -1369,5 +1514,210 @@ the contract renews for 12 months".to_string()]
             })
             .unwrap();
         assert!(body.contains("[[entities/bob#Contract]]"), "{body}");
+    }
+
+    // ---- A2 / C / H3: frontmatter metadata and salience ------------------
+
+    /// A page with extra frontmatter lines (each ending in a newline).
+    fn write_page_with(vault: &Path, id: &str, extra: &str) {
+        let (sub, slug) = id.split_once('/').unwrap();
+        let dir = wiki_dir(vault).join(sub);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{slug}.md")),
+            format!("---\nid: {id}\ntype: entity\ntitle: T\n{extra}---\n\nBody.\n"),
+        )
+        .unwrap();
+    }
+
+    fn strings(db: &DbHandle, sql: &str) -> Vec<String> {
+        db.with(|conn| {
+            let mut stmt = conn.prepare(sql)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, Option<String>>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows.into_iter().map(|v| v.unwrap_or_default()).collect())
+        })
+        .unwrap()
+    }
+
+    fn reads_of(db: &DbHandle, id: &str) -> i64 {
+        let id = id.to_string();
+        db.with(move |conn| {
+            Ok(conn
+                .query_row("SELECT reads FROM page_access WHERE page_id = ?1", params![id], |r| r.get(0))
+                .unwrap_or(0))
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn rebuild_indexes_the_aliases_of_a_page() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        write_page_with(tmp.path(), "entities/acme", "aliases: [ACME Corp, Acme Inc]\n");
+        let db = DbHandle::open(tmp.path()).unwrap();
+        rebuild(&db, tmp.path()).unwrap();
+        assert_eq!(
+            strings(&db, "SELECT alias FROM page_aliases WHERE page_id = 'entities/acme' ORDER BY alias"),
+            vec!["ACME Corp", "Acme Inc"]
+        );
+    }
+
+    #[test]
+    fn rebuild_indexes_the_sources_of_a_page() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        write_page_with(tmp.path(), "entities/acme", "sources: [sources/a, \"[[sources/b]]\"]\n");
+        let db = DbHandle::open(tmp.path()).unwrap();
+        rebuild(&db, tmp.path()).unwrap();
+        assert_eq!(
+            strings(&db, "SELECT source_id FROM page_sources ORDER BY source_id"),
+            vec!["sources/a", "sources/b"]
+        );
+    }
+
+    #[test]
+    fn rebuild_indexes_the_validity_fields_into_the_pages_row() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        write_page_with(
+            tmp.path(),
+            "entities/old",
+            "valid_from: 2024-01-01\nvalid_to: 2025-12-31\nsuperseded_by: entities/new\n",
+        );
+        let db = DbHandle::open(tmp.path()).unwrap();
+        rebuild(&db, tmp.path()).unwrap();
+        assert_eq!(
+            strings(
+                &db,
+                "SELECT valid_from || '|' || valid_to || '|' || superseded_by FROM pages WHERE id = 'entities/old'"
+            ),
+            vec!["2024-01-01|2025-12-31|entities/new"]
+        );
+    }
+
+    #[test]
+    fn a_rebuild_keeps_the_read_counts_of_page_access() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        write_page(tmp.path(), "entities", "alice", "x", &[]);
+        let db = DbHandle::open(tmp.path()).unwrap();
+        rebuild(&db, tmp.path()).unwrap();
+        db.with(|conn| record_reads(conn, &["entities/alice".to_string()], 1)).unwrap();
+        db.with(invalidate_all_pages).unwrap();
+        rebuild(&db, tmp.path()).unwrap();
+        assert_eq!(reads_of(&db, "entities/alice"), 1);
+    }
+
+    #[test]
+    fn a_rebuild_keeps_recent_read_counts_of_a_page_whose_file_is_gone() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        write_page(tmp.path(), "entities", "alice", "x", &[]);
+        let db = DbHandle::open(tmp.path()).unwrap();
+        rebuild(&db, tmp.path()).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        db.with(|conn| record_reads(conn, &["entities/alice".to_string()], now)).unwrap();
+        std::fs::remove_file(wiki_dir(tmp.path()).join("entities/alice.md")).unwrap();
+        rebuild(&db, tmp.path()).unwrap();
+        assert_eq!(reads_of(&db, "entities/alice"), 1);
+    }
+
+    #[test]
+    fn a_rebuild_drops_read_counts_of_a_page_gone_and_unread_for_30_days() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        write_page(tmp.path(), "entities", "alice", "x", &[]);
+        let db = DbHandle::open(tmp.path()).unwrap();
+        rebuild(&db, tmp.path()).unwrap();
+        let long_ago = chrono::Utc::now().timestamp() - 31 * 24 * 60 * 60;
+        db.with(|conn| record_reads(conn, &["entities/alice".to_string()], long_ago)).unwrap();
+        std::fs::remove_file(wiki_dir(tmp.path()).join("entities/alice.md")).unwrap();
+        rebuild(&db, tmp.path()).unwrap();
+        assert_eq!(reads_of(&db, "entities/alice"), 0);
+    }
+
+    #[test]
+    fn gc_page_access_keeps_old_counts_of_a_page_that_still_exists() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        write_page(tmp.path(), "entities", "alice", "x", &[]);
+        let db = DbHandle::open(tmp.path()).unwrap();
+        rebuild(&db, tmp.path()).unwrap();
+        db.with(|conn| {
+            record_reads(conn, &["entities/alice".to_string()], 1)?;
+            gc_page_access(conn, PAGE_ACCESS_GC_DAYS, chrono::Utc::now().timestamp())
+        })
+        .unwrap();
+        assert_eq!(reads_of(&db, "entities/alice"), 1);
+    }
+
+    #[test]
+    fn record_search_hits_counts_each_call() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        let db = DbHandle::open(tmp.path()).unwrap();
+        let hits = db
+            .with(|conn| {
+                let ids = vec!["entities/alice".to_string()];
+                record_search_hits(conn, &ids)?;
+                record_search_hits(conn, &ids)?;
+                Ok(conn.query_row(
+                    "SELECT search_hits FROM page_access WHERE page_id = 'entities/alice'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(hits, 2);
+    }
+
+    #[test]
+    fn carrying_page_access_onto_an_existing_row_adds_the_counts() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        let db = DbHandle::open(tmp.path()).unwrap();
+        db.with(|conn| {
+            record_reads(conn, &["entities/a".to_string()], 5)?;
+            record_reads(conn, &["entities/b".to_string(), "entities/b".to_string()], 9)?;
+            carry_page_access(conn, "entities/a", "entities/b")
+        })
+        .unwrap();
+        assert_eq!(reads_of(&db, "entities/b"), 3);
+    }
+
+    /// An index written before the metadata version existed: the page
+    /// rows are current, but no aliases were stored.
+    fn index_without_metadata(tmp: &TempDir, db: &DbHandle) {
+        write_page_with(tmp.path(), "entities/acme", "aliases: [ACME Corp]\n");
+        rebuild(db, tmp.path()).unwrap();
+        db.with(|conn| {
+            conn.execute("DELETE FROM page_aliases", [])?;
+            conn.execute("DELETE FROM schema_meta WHERE key = ?1", params![META_VERSION_KEY])?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn an_outdated_metadata_version_fills_the_aliases_of_unchanged_pages() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        let db = DbHandle::open(tmp.path()).unwrap();
+        index_without_metadata(&tmp, &db);
+        rebuild(&db, tmp.path()).unwrap();
+        assert_eq!(strings(&db, "SELECT alias FROM page_aliases"), vec!["ACME Corp"]);
+    }
+
+    #[test]
+    fn an_outdated_metadata_version_does_not_re_embed_unchanged_pages() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        let db = DbHandle::open(tmp.path()).unwrap();
+        index_without_metadata(&tmp, &db);
+        let embedder = RecordingEmbedder::new();
+        rebuild_with(&db, tmp.path(), &embedder).unwrap();
+        assert_eq!(embedder.count(), 0);
     }
 }

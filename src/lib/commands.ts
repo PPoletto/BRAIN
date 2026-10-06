@@ -128,6 +128,14 @@ export const commands = {
         path: string;
         title: string;
         updated_at: string | null;
+        /** Salience counters (agent reads / search top-10 appearances). */
+        reads: number;
+        search_hits: number;
+        last_read_at: number | null;
+        /** Validity frontmatter, present only when the page sets it. */
+        valid_from?: string;
+        valid_to?: string;
+        superseded_by?: string;
       }>
     >("query_pages", { query }),
 

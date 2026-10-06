@@ -59,8 +59,46 @@ Rules:
   `tag:`. The `brain_query` tool's `tag:foo` operator queries the `tags`
   list — those are two different namespaces (query syntax vs. frontmatter
   key), don't conflate them.
+- `aliases` (optional) lists other names the thing goes by — spelling
+  variants, abbreviations, former names: `aliases: [ACME Corp, Acme Inc]`.
+  BRAIN uses them to spot duplicates (see "Before Creating a Page" below).
+- `sources` (optional, expected on `entity` and `concept` pages) lists the
+  `sources/…` pages the facts come from: `sources: [sources/kickoff-2026]`.
+  An entity or concept page without `sources` is flagged as a
+  `missing-sources` warning.
+- `valid_from` / `valid_to` (optional, `YYYY-MM-DD`) say from when / until
+  when the page's facts hold. `superseded_by: <id>` names the page that
+  replaces this one. A date in another format is flagged as
+  `invalid-date` and ignored by the validity filter.
+- `distinct_from` (optional) lists ids of pages that share a name with
+  this one but are a different thing — it silences the `alias-collision`
+  warning for that pair.
 - Don't invent additional fields unless asked. Extra fields parse fine but
   no tool reads them, so they're dead weight.
+
+### Facts Are Never Overwritten — Supersede
+
+When a fact changes (a new contract, a new role, a revised decision), do
+**not** rewrite the old page so the old state disappears. Instead:
+
+1. Write the new state as its own page (or update the page that already
+   describes the current state).
+2. On the old page set `superseded_by: <new id>` and `valid_to:` (the last
+   day the old facts held). Leave its body as it was.
+
+`brain_query` hides superseded, expired and not-yet-valid pages by
+default (`valid:all` shows them, `valid:expired` lists only them).
+`brain_get_page` and `brain_get_context` mark a superseded page with the
+fields `superseded_by` and `notice` — follow it for current facts. The
+notice is not part of the page: **never copy it into a page body.**
+`superseded_by` must point at an existing page that is not itself
+(directly or in a loop) superseded back — otherwise a
+`dangling-supersede` / `supersede-cycle` **error** blocks the
+auto-commit. When an expired page is still linked from current pages,
+the lint reports `expired-but-linked` — point those links at the
+successor. `brain_rename_page`, `brain_merge_pages` and
+`brain_delete_page` keep `superseded_by` and `sources` consistent the
+same way they keep links consistent.
 
 ## Wiki Links — STRICT RULE
 
@@ -113,10 +151,10 @@ for the job:
 |---|---|
 | `brain_ping` | Quick liveness check between batches; works even if the vault is disconnected |
 | `brain_search` | Free-text / hybrid (lexical + semantic) search across pages |
-| `brain_query` | Structured filter by fields (id, type, title, tag, created, updated) |
+| `brain_query` | Structured filter by fields (id, type, title, tag, created, updated). Hides superseded/expired pages unless you add `valid:all`; `sort:salience` lists the most-read pages first |
 | `brain_get_page` | Read one page by id |
 | `brain_get_pages` | Read N pages by id in one call — use for refactor sweeps and consistency audits |
-| `brain_page_exists` | Cheap yes/no check before creating a new page (avoids accidental overwrite) |
+| `brain_page_exists` | Check before creating a new page: says whether the id exists and lists pages that are probably the same thing (`matches`) |
 | `brain_get_context` | One page + its 1-hop wiki-link neighbourhood |
 | `brain_list_pages` | List ids per bucket (optional type/prefix filter, pagination) |
 | `brain_list_tags` | Enumerate tags with their page counts — use this *before* `brain_query tag:foo` so you know which tags exist |
@@ -131,6 +169,27 @@ for the job:
 | `brain_rename_page` | A page has the **wrong id** (typo, wrong slug, wrong type directory). Moves it and rewrites every link to it across the vault |
 | `brain_merge_pages` | Two pages are **duplicates**. Appends the duplicate's body to the surviving page, redirects its links, removes the duplicate |
 | `brain_delete_page` | A page is **junk** and should not exist. Refuses while other pages link to it; `force: true` deletes anyway and turns those links into plain text. Recoverable via `brain_restore_page` |
+
+### Before Creating a Page
+
+Call `brain_page_exists` with the id you intend to create. Its `matches`
+list pages of the same type that are probably the same thing:
+`alias` (your slug is one of that page's `aliases`), `normalised` (same
+slug after lowercasing, umlauts `ü`→`ue`, punctuation, `_` and spaces →
+`-`; also `muller-gmbh` vs `mueller-gmbh`) or `similar` (a near spelling,
+e.g. one letter apart). **If `page_exists` reports matches, use the
+existing page** — update it and, if your name for the thing differs, add
+that name to its `aliases`. If it says `matches_checked: false`, the
+search index is not built yet; check `brain_list_pages` by hand.
+
+`brain_write_page` and `brain_write_batch` refuse to create a page with
+an `alias` or `normalised` match and name the existing page. Pass
+`allow_duplicate: true` only when the two really are different things
+(two people with the same name, say) — then give each a distinguishing
+slug and title, and list the other id in `distinct_from`. Overwriting an
+existing id is never refused. If two existing pages share a name through
+an alias or the same slug, the lint reports `alias-collision`: merge them
+(`brain_merge_pages`), fix the alias, or add `distinct_from`.
 
 ### Bulk-Ingest Workflow
 
@@ -232,6 +291,16 @@ same findings live — and work through it:
 - `broken-link` — a link to a page that does not exist. Fix the link,
   create the missing page, or `brain_rename_page` the page that was
   meant.
+- `alias-collision` — two pages share a name via id or `aliases`. Merge
+  them if they are the same thing; otherwise remove the clashing alias.
+- `missing-sources` — an entity or concept page names no `sources`. Add
+  the source pages its facts come from.
+- `broken-source` — a `sources` entry has no page. Fix the id or create
+  the source page.
+- `invalid-date` — `valid_from` / `valid_to` is not `YYYY-MM-DD`, or
+  `valid_from` lies after `valid_to`.
+- `expired-but-linked` — the page's `valid_to` has passed but current
+  pages still link to it. Point those links at the successor.
 
 Confirm with the user before merging or deleting pages they wrote
 themselves. The next day's audit shows what is left.
@@ -293,7 +362,10 @@ conversation context alone.
   any change while a drift page exists.
 - Never put secrets (API keys, passwords, tokens) in frontmatter or body.
 - Never edit `00_meta/` or `03_db/` files unless explicitly instructed.
-- Prefer extending an existing entity over creating a new sibling.
+- Prefer extending an existing entity over creating a new sibling. If
+  `brain_page_exists` reports matches, use the existing page.
+- Facts are never overwritten — supersede the old page (`superseded_by`)
+  and set its `valid_to`.
 - If you accidentally overwrite a richer page with thinner content,
   notice via the `previous_size_bytes` vs. `new_size_bytes` delta in the
   write response and tell the user.

@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 
 use crate::vault::layout::{raw_dir, wiki_dir};
 use crate::viewer::{graph, search, tree};
-use crate::wiki::{history as wiki_history, lint, page, refactor};
+use crate::wiki::{duplicates, history as wiki_history, lint, page, refactor};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 // `serverInfo.name` shown in MCP `initialize` handshake responses. We use
@@ -707,7 +707,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "brain_get_page",
-            "description": "Read a wiki page by id (e.g. 'entities/alice'). Returns title, frontmatter, body.",
+            "description": "Read a wiki page by id (e.g. 'entities/alice'). Returns title, frontmatter, body. If the page has been replaced (frontmatter `superseded_by`), the response also carries `superseded_by: <id>` and `notice: \"Superseded by <id>\"` — read the successor for current facts. Never copy the notice into a page.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "id": { "type": "string" } },
@@ -716,7 +716,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "brain_get_pages",
-            "description": "Bulk-read variant of brain_get_page. Pass an array of ids; the response contains one entry per id in request order, each shaped `{id, found, page?}`. Missing ids are returned as `{id, found: false}` rather than aborting the call — so the agent can decide per-id whether to create-or-skip. Use for refactor sweeps and consistency audits where 5–20 related pages need to be inspected at once.",
+            "description": "Bulk-read variant of brain_get_page (superseded pages are marked the same way). Pass an array of ids; the response contains one entry per id in request order, each shaped `{id, found, page?}`. Missing ids are returned as `{id, found: false}` rather than aborting the call — so the agent can decide per-id whether to create-or-skip. Use for refactor sweeps and consistency audits where 5–20 related pages need to be inspected at once.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -731,7 +731,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "brain_page_exists",
-            "description": "Lightweight existence check: returns {id, exists} for the given page id. Use this when you only need yes/no (e.g. before deciding to create-vs-update) — much cheaper than brain_get_page, which loads and parses the entire markdown body.",
+            "description": "Existence check before creating a page: returns {id, exists, matches, matches_checked}. `matches` lists other pages of the same type that are probably the same thing, each {id, title, reason}: reason 'alias' (the slug names one of the page's frontmatter `aliases`), 'normalised' (same slug after lowercasing, umlauts ä→ae/ö→oe/ü→ue/ß→ss and punctuation/`_`/space → `-`; also 'muller-gmbh' vs 'mueller-gmbh') or 'similar' (a near spelling — one letter apart on short slugs, two on long ones). `exists: false` with non-empty matches means the page probably exists already under that id — use and update it instead of creating a duplicate. brain_write_page refuses to create a page with an 'alias' or 'normalised' match unless you pass allow_duplicate:true. Does not read the page body (one file check plus a lookup in the search index); matches come from that index, so a page written in the last few seconds may not be listed yet, and `matches_checked: false` means the index is not built yet and no matches could be looked up.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -745,7 +745,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "brain_get_context",
-            "description": "Return a wiki page plus the pages it links to and pages that link to it (1-hop).",
+            "description": "Return a wiki page plus the pages it links to and pages that link to it (1-hop). If the page has been replaced (frontmatter `superseded_by`), the response carries top-level `superseded_by: <id>` and `notice: \"Superseded by <id>\"` — follow it for current facts. Never copy the notice into a page.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "id": { "type": "string" } },
@@ -782,12 +782,13 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "brain_write_page",
-            "description": "Create or overwrite a wiki page. Caller must include valid YAML frontmatter (id, type, title) followed by the markdown body. The watcher will lint and auto-commit.",
+            "description": "Create or overwrite a wiki page. Caller must include valid YAML frontmatter (id, type, title) followed by the markdown body. Optional frontmatter: `aliases: [..]` (other names of the thing), `sources: [sources/..]` (where the facts come from), `valid_from` / `valid_to` (YYYY-MM-DD) and `superseded_by: <id>` (facts are never overwritten — a replaced page gets `superseded_by` and `valid_to`). Creating a NEW id is refused when another page of the same type probably is the same thing (same slug after normalisation, or one of its aliases — see brain_page_exists); the error names that page: update it instead, or pass allow_duplicate:true if they really are different. Overwriting an existing id is never refused. The watcher will lint and auto-commit.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "id": { "type": "string", "description": "page id, e.g. 'entities/alice'" },
-                    "content": { "type": "string", "description": "full markdown including frontmatter" }
+                    "content": { "type": "string", "description": "full markdown including frontmatter" },
+                    "allow_duplicate": { "type": "boolean", "description": "create the page even though brain_page_exists reports an 'alias' or 'normalised' match. Default false." }
                 },
                 "required": ["id", "content"]
             }
@@ -844,7 +845,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "brain_rename_page",
-            "description": "Give an existing page a new id — use this when a page was created under a WRONG id (typo, wrong slug, wrong type directory). Moves the page, sets its frontmatter `id` (and `type`, if the type directory changes) and rewrites every link to the old id in every page of the vault: `[[old]]` → `[[new]]`, `[[old|Alias]]` → `[[new|Alias]]`, `[Text](old)` → `[Text](new)`. Only exact-id links change (`[[old-2]]` is untouched); links inside code blocks are rewritten too. `new_id` must be `<type>/<slug>` with type one of entities, concepts, sources, topics, and a slug of letters, digits, `.`, `_`, `-` (no spaces or parentheses); it must not exist yet — if it does, the two pages are duplicates: use brain_merge_pages instead. A case-only rename (`Old` → `old`) works. Records one commit (after a checkpoint commit of any pending edits). Returns `{old_id, new_id, rewritten_pages, rewritten_links, commit}`; if `commit` is null with a `note`, the rename is already on disk — do not repeat it.",
+            "description": "Give an existing page a new id — use this when a page was created under a WRONG id (typo, wrong slug, wrong type directory). Moves the page, sets its frontmatter `id` (and `type`, if the type directory changes) and rewrites every link to the old id in every page of the vault: `[[old]]` → `[[new]]`, `[[old|Alias]]` → `[[new|Alias]]`, `[Text](old)` → `[Text](new)`. Only exact-id links change (`[[old-2]]` is untouched); links inside code blocks are rewritten too. Frontmatter `superseded_by: old` and `sources` entries naming `old` are pointed at the new id as well. `new_id` must be `<type>/<slug>` with type one of entities, concepts, sources, topics, and a slug of letters, digits, `.`, `_`, `-` (no spaces or parentheses); it must not exist yet — if it does, the two pages are duplicates: use brain_merge_pages instead. A case-only rename (`Old` → `old`) works. Records one commit (after a checkpoint commit of any pending edits). Returns `{old_id, new_id, rewritten_pages, rewritten_links, commit}`; if `commit` is null with a `note`, the rename is already on disk — do not repeat it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -856,7 +857,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "brain_merge_pages",
-            "description": "Fold a DUPLICATE page into the page that should survive. Appends the body of `from_id` to `into_id` under a `## Merged from <from_id>` heading (target frontmatter and title kept, tags united), redirects every link to `from_id` in the vault to `into_id` (aliases kept), and removes `from_id`. Links between the two pages become plain text so the merged page never links to itself. Review and tidy the merged page afterwards with brain_patch_page — the appended section is a verbatim copy. Records one commit (after a checkpoint commit of any pending edits); the removed page stays recoverable: brain_get_page_history on `from_id`, then brain_restore_page with a sha from before the merge. Returns `{from_id, into_id, rewritten_pages, rewritten_links, commit}` (plus `note` if the commit is still pending).",
+            "description": "Fold a DUPLICATE page into the page that should survive. Appends the body of `from_id` to `into_id` under a `## Merged from <from_id>` heading (target frontmatter and title kept, tags united), redirects every link to `from_id` in the vault to `into_id` (aliases kept) — and every frontmatter `superseded_by` / `sources` entry naming it —, adds `from_id` and its aliases to the target's `aliases`, and removes `from_id`. Links between the two pages become plain text so the merged page never links to itself. Review and tidy the merged page afterwards with brain_patch_page — the appended section is a verbatim copy. Records one commit (after a checkpoint commit of any pending edits); the removed page stays recoverable: brain_get_page_history on `from_id`, then brain_restore_page with a sha from before the merge. Returns `{from_id, into_id, rewritten_pages, rewritten_links, commit}` (plus `note` if the commit is still pending).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -868,7 +869,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "brain_delete_page",
-            "description": "Delete a page that should not exist at all (junk, test page, empty stub). Not for a wrong id — use brain_rename_page — and not for a duplicate — use brain_merge_pages. REFUSES while other pages link to it and lists those pages. With `force: true` it deletes anyway and turns every link to it into plain text (`[[id|Alias]]` → `Alias`, `[[id]]` → the page title). Records one commit (after a checkpoint commit of any pending edits), so the content is never lost: brain_get_page_history on the deleted id, then brain_restore_page with a sha from before the delete. Returns `{deleted, defused_in, defused_links, commit}` (plus `note` if the commit is still pending).",
+            "description": "Delete a page that should not exist at all (junk, test page, empty stub). Not for a wrong id — use brain_rename_page — and not for a duplicate — use brain_merge_pages. REFUSES while other pages link to it — or name it in frontmatter `superseded_by` / `sources` — and lists those pages. With `force: true` it deletes anyway, turns every link to it into plain text (`[[id|Alias]]` → `Alias`, `[[id]]` → the page title) and removes those `superseded_by` lines / `sources` entries. Records one commit (after a checkpoint commit of any pending edits), so the content is never lost: brain_get_page_history on the deleted id, then brain_restore_page with a sha from before the delete. Returns `{deleted, defused_in, defused_links, commit}` (plus `note` if the commit is still pending).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -880,7 +881,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "brain_write_batch",
-            "description": "Atomic multi-page write. Pass `pages: [{id, content}, ...]` — all pages are parsed and normalised first (phase 1; if any one fails to parse, nothing is written), then all are written to disk (phase 2), then lint runs ONCE over the whole vault (phase 3) and the response is scoped to the union of paths in the batch. Use this when several pages reference each other and would cascade broken-link errors if written one-by-one. Response: `{wrote: [{id, previous_size_bytes, new_size_bytes, warnings}]}`. Errors abort with a structured message naming the offending id. Commit is delegated to the watcher (same as brain_write_page).",
+            "description": "Atomic multi-page write. Pass `pages: [{id, content}, ...]` — all pages are parsed and normalised first (phase 1; if any one fails to parse, nothing is written), then all are written to disk (phase 2), then lint runs ONCE over the whole vault (phase 3) and the response is scoped to the union of paths in the batch. Use this when several pages reference each other and would cascade broken-link errors if written one-by-one. Response: `{wrote: [{id, previous_size_bytes, new_size_bytes, warnings}]}`. Errors abort with a structured message naming the offending id. Like brain_write_page, creating a NEW id that probably duplicates an existing page (or an earlier entry of the same batch) is refused before anything is written, unless the entry — or the whole call — sets allow_duplicate:true. Commit is delegated to the watcher (same as brain_write_page).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -890,12 +891,14 @@ fn tool_descriptors() -> Vec<Value> {
                             "type": "object",
                             "properties": {
                                 "id": { "type": "string" },
-                                "content": { "type": "string" }
+                                "content": { "type": "string" },
+                                "allow_duplicate": { "type": "boolean" }
                             },
                             "required": ["id", "content"]
                         },
                         "minItems": 1
-                    }
+                    },
+                    "allow_duplicate": { "type": "boolean", "description": "allow_duplicate for every entry. Default false." }
                 },
                 "required": ["pages"]
             }
@@ -941,7 +944,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "brain_lint_report",
-            "description": "Return the current lint state of the wiki as { errors, warnings } — both are arrays of { path, kind, message }. Errors block auto-commits, warnings don't. Common warning kinds you should fix in place via brain_write_page: 'unregistered-type' (frontmatter type isn't one of entity/concept/source/topic — usually a plural slipped in), 'missing-title', 'non-canonical-wiki-link'. Common error kinds: 'frontmatter' (malformed YAML), 'duplicate-id' (two files share an id), 'broken-link' (wiki link points at a missing page; `[[id#heading]]` resolves to `id`). Hygiene warnings (advice, never block commits): 'orphan' (no other page links here and the file is unchanged for 90+ days — link it from a related page, merge it or delete it), 'duplicate-candidate' (two pages of the same type are semantically near-identical, score in the message — fold one into the other with brain_merge_pages if they describe the same thing). An optional `notes` array carries info that is not a page finding (e.g. duplicate detection skipped because the embedding model is missing). Use this when the user asks you to clean up the wiki: loop through the report, fix each entry, then call again until clean.",
+            "description": "Return the current lint state of the wiki as { errors, warnings } — both are arrays of { path, kind, message }. Errors block auto-commits, warnings don't. Common warning kinds you should fix in place via brain_write_page: 'unregistered-type' (frontmatter type isn't one of entity/concept/source/topic — usually a plural slipped in), 'missing-title', 'non-canonical-wiki-link'. Common error kinds: 'frontmatter' (malformed YAML), 'duplicate-id' (two files share an id), 'broken-link' (wiki link points at a missing page; `[[id#heading]]` resolves to `id`). Hygiene warnings (advice, never block commits): 'orphan' (no other page links here and the file is unchanged for 90+ days — link it from a related page, merge it or delete it), 'duplicate-candidate' (two pages of the same type are semantically near-identical, score in the message — fold one into the other with brain_merge_pages if they describe the same thing), 'alias-collision' (two pages of one type share a name via an alias or the same slug — merge them, fix the alias, or add `distinct_from: [<other id>]` if they are different things), 'missing-sources' (an entity/concept page without `sources`), 'broken-source' (a `sources` entry without a page), 'invalid-date' (`valid_from`/`valid_to` not YYYY-MM-DD, or from after to), 'expired-but-linked' (`valid_to` has passed but current pages still link here — point them at the successor). Errors 'dangling-supersede' (`superseded_by` names a page that does not exist) and 'supersede-cycle' (pages supersede each other or themselves). An optional `notes` array carries info that is not a page finding (e.g. duplicate detection skipped because the embedding model is missing). Use this when the user asks you to clean up the wiki: loop through the report, fix each entry, then call again until clean.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -949,7 +952,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "brain_query",
-            "description": "Dataview-style structured query against page metadata. Supports fields id, type, title, tag, created, updated; operators `:` (eq), `:>`, `:<`; AND, OR, NOT; quoted values for spaces. Examples: `type:source AND tag:customer AND updated:>2026-04-01`, `tag:nis2 OR tag:dora`, `NOT type:source AND title:\"NLSpec\"`. Use this for filtered listings; use brain_search for free-text search.",
+            "description": "Dataview-style structured query against page metadata. Supports fields id, type, title, tag, created, updated; operators `:` (eq), `:>`, `:<`; AND, OR, NOT; quoted values for spaces. Validity: by default (`valid:now`) pages whose `valid_to` has passed or that have `superseded_by` are left out; add `valid:all` to include them or `valid:expired` to list only them. Order: newest `updated` first; add `sort:salience` (top-level, with AND) to list the most-read pages first. Each hit has {id, type, path, title, updated_at, reads, search_hits, last_read_at} plus valid_from/valid_to/superseded_by when set. Examples: `type:source AND tag:customer AND updated:>2026-04-01`, `tag:nis2 OR tag:dora`, `NOT type:source AND title:\"NLSpec\"`, `type:entity AND valid:all AND sort:salience`. Use this for filtered listings; use brain_search for free-text search.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1026,13 +1029,20 @@ fn call_tool(
                 // Empty hybrid result or any DB error → brute-force walk.
                 _ => search::search_brute_force(vault, q).map_err(|e| e.to_string())?,
             };
+            record_search_hits(
+                db,
+                vault,
+                hits.iter().take(SALIENCE_SEARCH_TOP).map(|h| h.id.clone()).collect(),
+            );
             Ok(serde_json::to_string_pretty(&hits).unwrap_or_default())
         }
         "brain_get_page" => {
             let id = args.get("id").and_then(Value::as_str).unwrap_or("");
             check_page_id(id)?;
             let page = tree::read_page(vault, id).map_err(|e| e.to_string())?;
-            Ok(serde_json::to_string_pretty(&page).unwrap_or_default())
+            record_reads(db, vault, vec![id.to_string()]);
+            let (payload, _) = page_payload(page);
+            Ok(serde_json::to_string_pretty(&payload).unwrap_or_default())
         }
         "brain_get_pages" => {
             let ids = args
@@ -1048,6 +1058,7 @@ fn call_tool(
             // Both surface as `found: false` plus an `error` string,
             // so the agent can decide what to do without losing the
             // results for the *other* ids in the same call.
+            let mut read_ids: Vec<String> = Vec::new();
             let pages: Vec<Value> = ids
                 .iter()
                 .map(|raw| {
@@ -1062,11 +1073,14 @@ fn call_tool(
                         });
                     }
                     match tree::read_page(vault, id) {
-                        Ok(page) => json!({
-                            "id": id,
-                            "found": true,
-                            "page": page,
-                        }),
+                        Ok(page) => {
+                            read_ids.push(id.to_string());
+                            json!({
+                                "id": id,
+                                "found": true,
+                                "page": page_payload(page).0,
+                            })
+                        }
                         Err(e) => json!({
                             "id": id,
                             "found": false,
@@ -1075,6 +1089,10 @@ fn call_tool(
                     }
                 })
                 .collect();
+            // One read per distinct page, however often it was requested.
+            let mut seen = std::collections::HashSet::new();
+            read_ids.retain(|id| seen.insert(id.clone()));
+            record_reads(db, vault, read_ids);
             Ok(serde_json::to_string_pretty(&json!({ "pages": pages })).unwrap_or_default())
         }
         "brain_page_exists" => {
@@ -1098,9 +1116,23 @@ fn call_tool(
             check_page_id(id)?;
             let target = crate::wiki::encryption::page_path(vault, id).map_err(|e| e.to_string())?;
             let exists = target.is_file();
+            // A2: other pages that are probably the same thing (alias,
+            // normalised slug, near-identical slug). From the index, best
+            // effort and never building it: without a usable index there
+            // are no matches and `matches_checked` is false. Matches whose
+            // file is gone (stale index rows) are dropped.
+            let entries = load_name_entries(db, vault);
+            let matches_checked = entries.is_some();
+            let matches = live_matches(
+                vault,
+                duplicates::find_matches(id, &entries.unwrap_or_default()),
+                &std::collections::HashSet::new(),
+            );
             Ok(serde_json::to_string(&json!({
                 "id": id,
                 "exists": exists,
+                "matches": matches,
+                "matches_checked": matches_checked,
             }))
             .unwrap_or_default())
         }
@@ -1114,12 +1146,18 @@ fn call_tool(
             // re-parse and pull wiki links directly from the body.
             let outbound = page::extract_wiki_links(&page.body);
             let backlinks = search::backlinks(vault, id).map_err(|e| e.to_string())?;
-            Ok(serde_json::to_string_pretty(&json!({
+            record_reads(db, vault, vec![id.to_string()]);
+            let (page, superseded_by) = page_payload(page);
+            let mut payload = json!({
                 "page": page,
                 "outbound": outbound,
                 "backlinks": backlinks,
-            }))
-            .unwrap_or_default())
+            });
+            if let Some(successor) = superseded_by {
+                payload["notice"] = json!(superseded_notice(&successor));
+                payload["superseded_by"] = json!(successor);
+            }
+            Ok(serde_json::to_string_pretty(&payload).unwrap_or_default())
         }
         "brain_list_pages" => list_pages_dispatch(&args, vault, db),
         "brain_write_page" => {
@@ -1133,19 +1171,37 @@ fn call_tool(
                 .and_then(Value::as_str)
                 .ok_or_else(|| "missing 'content'".to_string())?;
             let parsed = page::parse(content).map_err(|e| format!("invalid page content: {e}"))?;
+            let allow_duplicate = allow_duplicate_arg(&args)?;
+            // A2: refuse to CREATE a page that probably exists already
+            // under another id. Overwriting an existing id is never blocked.
+            let target = crate::wiki::encryption::page_path(vault, id).map_err(|e| e.to_string())?;
+            let mut matches_checked = true;
+            if !allow_duplicate && !target.is_file() {
+                match load_name_entries(db, vault) {
+                    Some(entries) => {
+                        let pending = std::collections::HashSet::new();
+                        if let Some(refusal) = creation_refusal(vault, id, &entries, &pending) {
+                            return Err(refusal);
+                        }
+                    }
+                    None => matches_checked = false,
+                }
+            }
+            // A copied-back superseded notice of an older read payload
+            // never reaches the file.
+            let body = strip_superseded_notice(&parsed.body);
             // Auto-normalize markdown links to canonical [[wiki-link]]
             // form before write. LLMs default to standard markdown
             // syntax `[Dan](entities/dan-shapiro)` — without this the
             // graph view sees no edges and refactors are fragile. Only
             // the body is rewritten; the YAML frontmatter is kept
             // verbatim and we re-stitch the file.
-            let normalized_body = page::normalize_internal_links(&parsed.body);
+            let normalized_body = page::normalize_internal_links(body);
             let normalized_content = if normalized_body == parsed.body {
                 content.to_string()
             } else {
                 rebuild_page_file(content, &normalized_body)
             };
-            let target = crate::wiki::encryption::page_path(vault, id).map_err(|e| e.to_string())?;
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
@@ -1208,13 +1264,17 @@ fn call_tool(
             // change set. Letting the watcher own commits cleans up
             // the wiki_history view and is the prerequisite for the
             // upcoming `brain_write_batch` atomic-multi-write tool.
-            Ok(serde_json::to_string(&json!({
+            let mut response = json!({
                 "wrote": id,
                 "previous_size_bytes": previous_size_bytes,
                 "new_size_bytes": new_size_bytes,
                 "warnings": page_warnings,
-            }))
-            .unwrap_or_default())
+            });
+            if !matches_checked {
+                // The duplicate check could not run (index not built yet).
+                response["matches_checked"] = json!(false);
+            }
+            Ok(serde_json::to_string(&response).unwrap_or_default())
         }
         "brain_patch_page" => {
             let id = args
@@ -1313,7 +1373,7 @@ fn call_tool(
             let id = required_str(&args, "id")?;
             let new_id = required_str(&args, "new_id")?;
             let outcome = refactor::rename_page(vault, id, new_id).map_err(|e| e.to_string())?;
-            forget_in_index(db, vault, &outcome.old_id);
+            forget_in_index(db, vault, &outcome.old_id, Some(&outcome.new_id));
             Ok(serde_json::to_string(&outcome).unwrap_or_default())
         }
         "brain_merge_pages" => {
@@ -1321,7 +1381,7 @@ fn call_tool(
             let into_id = required_str(&args, "into_id")?;
             let outcome =
                 refactor::merge_pages(vault, from_id, into_id).map_err(|e| e.to_string())?;
-            forget_in_index(db, vault, &outcome.from_id);
+            forget_in_index(db, vault, &outcome.from_id, Some(&outcome.into_id));
             Ok(serde_json::to_string(&outcome).unwrap_or_default())
         }
         "brain_delete_page" => {
@@ -1332,7 +1392,7 @@ fn call_tool(
                 Some(_) => return Err("force must be a boolean (true or false)".to_string()),
             };
             let outcome = refactor::delete_page(vault, id, force).map_err(|e| e.to_string())?;
-            forget_in_index(db, vault, &outcome.deleted);
+            forget_in_index(db, vault, &outcome.deleted, None);
             Ok(serde_json::to_string(&outcome).unwrap_or_default())
         }
         "brain_write_batch" => {
@@ -1359,6 +1419,13 @@ fn call_tool(
                 previous_size_bytes: i64,
             }
             let mut prepared: Vec<Prepared> = Vec::with_capacity(pages.len());
+            let allow_all = allow_duplicate_arg(&args)?;
+            // A2 duplicate check: index entries (loaded once, only if some
+            // entry needs the check) plus the batch's earlier entries.
+            let mut index_names: Option<Option<Vec<duplicates::NameEntry>>> = None;
+            let mut batch_names: Vec<duplicates::NameEntry> = Vec::new();
+            let mut batch_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut matches_checked = true;
             for (idx, entry) in pages.iter().enumerate() {
                 let id = entry
                     .get("id")
@@ -1371,13 +1438,38 @@ fn call_tool(
                     .ok_or_else(|| format!("pages[{idx}]: missing 'content'"))?;
                 let parsed = page::parse(content)
                     .map_err(|e| format!("pages[{idx}] ({id}): invalid content: {e}"))?;
-                let normalized_body = page::normalize_internal_links(&parsed.body);
+                let allow_duplicate =
+                    allow_all || allow_duplicate_arg(entry).map_err(|e| format!("pages[{idx}]: {e}"))?;
+                let target = crate::wiki::encryption::page_path(vault, id).map_err(|e| e.to_string())?;
+                if !allow_duplicate && !target.is_file() {
+                    let index = index_names.get_or_insert_with(|| load_name_entries(db, vault));
+                    if index.is_none() {
+                        matches_checked = false;
+                    }
+                    let candidates: Vec<duplicates::NameEntry> = index
+                        .iter()
+                        .flatten()
+                        .chain(&batch_names)
+                        .cloned()
+                        .collect();
+                    if let Some(refusal) = creation_refusal(vault, id, &candidates, &batch_ids) {
+                        return Err(format!("pages[{idx}] ({id}): {refusal}"));
+                    }
+                }
+                batch_names.push(duplicates::NameEntry {
+                    id: id.to_string(),
+                    title: parsed.frontmatter.title.clone(),
+                    aliases: parsed.frontmatter.aliases.clone(),
+                    distinct_from: parsed.frontmatter.distinct_from.clone(),
+                });
+                batch_ids.insert(id.to_string());
+                let normalized_body =
+                    page::normalize_internal_links(strip_superseded_notice(&parsed.body));
                 let normalized_content = if normalized_body == parsed.body {
                     content.to_string()
                 } else {
                     rebuild_page_file(content, &normalized_body)
                 };
-                let target = crate::wiki::encryption::page_path(vault, id).map_err(|e| e.to_string())?;
                 let previous_size_bytes = std::fs::metadata(&target)
                     .map(|m| m.len() as i64)
                     .unwrap_or(0);
@@ -1448,7 +1540,11 @@ fn call_tool(
                     })
                 })
                 .collect();
-            Ok(serde_json::to_string_pretty(&json!({ "wrote": results })).unwrap_or_default())
+            let mut response = json!({ "wrote": results });
+            if !matches_checked {
+                response["matches_checked"] = json!(false);
+            }
+            Ok(serde_json::to_string_pretty(&response).unwrap_or_default())
         }
         "brain_write_raw_file" => {
             let connector = args
@@ -1824,6 +1920,172 @@ fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
     }
 }
 
+/// Optional `allow_duplicate` boolean argument (A2), default false.
+fn allow_duplicate_arg(args: &Value) -> Result<bool, String> {
+    match args.get("allow_duplicate") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err("allow_duplicate must be a boolean (true or false)".to_string()),
+    }
+}
+
+/// Timeout of the best-effort salience counter writes (H3).
+const COUNTER_DB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Run `f` on the index ONLY when it is already built — the side jobs of
+/// read and write tools (salience counters, the duplicate check) must
+/// never trigger the first-open index build that [`db_op`] performs (it
+/// may embed the whole vault). With no handle yet, a temporary connection
+/// is opened and NOT kept, so the first real index tool still builds the
+/// index. `None` when the index is empty or unreachable, on an error or
+/// on a timeout. Never drops the shared handle: a wedged disk is detected
+/// and handled by the next regular `db_op`.
+fn db_op_if_indexed<F, T>(
+    db: &Option<crate::db::DbHandle>,
+    vault: &std::path::Path,
+    timeout: std::time::Duration,
+    f: F,
+) -> Option<T>
+where
+    F: FnOnce(&rusqlite::Connection) -> crate::db::DbResult<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let handle = match db {
+        Some(handle) => handle.clone(),
+        None => crate::db::DbHandle::open(vault).ok()?,
+    };
+    let guarded = move |conn: &rusqlite::Connection| -> crate::db::DbResult<Option<T>> {
+        let indexed: bool =
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM pages)", [], |r| r.get(0))?;
+        if !indexed {
+            return Ok(None);
+        }
+        f(conn).map(Some)
+    };
+    match handle.with_timeout(timeout, guarded) {
+        Ok(Ok(value)) => value,
+        Ok(Err(err)) => {
+            tracing::debug!(%err, "index side job failed");
+            None
+        }
+        Err(crate::db::DbTimeout) => {
+            tracing::debug!("index side job timed out");
+            None
+        }
+    }
+}
+
+/// Ids, titles and aliases of every indexed page, for the A2 duplicate
+/// check. `None` when the check cannot run (index empty — not built yet —
+/// or unreadable); callers then skip it and say so (`matches_checked:
+/// false`). A write is never refused because of the index.
+fn load_name_entries(
+    db: &Option<crate::db::DbHandle>,
+    vault: &std::path::Path,
+) -> Option<Vec<duplicates::NameEntry>> {
+    db_op_if_indexed(db, vault, DB_OP_TIMEOUT, duplicates::load_entries)
+}
+
+/// Whether the page `id` is on disk. A stale index row (page deleted or
+/// renamed outside BRAIN) must not count as an existing page.
+fn page_file_exists(vault: &std::path::Path, id: &str) -> bool {
+    crate::wiki::encryption::page_path(vault, id).is_ok_and(|p| p.is_file())
+}
+
+/// `matches` without pages whose file no longer exists, except ids in
+/// `pending` (earlier entries of the same batch, not written yet).
+fn live_matches(
+    vault: &std::path::Path,
+    matches: Vec<duplicates::DuplicateMatch>,
+    pending: &std::collections::HashSet<String>,
+) -> Vec<duplicates::DuplicateMatch> {
+    matches
+        .into_iter()
+        .filter(|m| pending.contains(&m.id) || page_file_exists(vault, &m.id))
+        .collect()
+}
+
+/// The refusal text when creating `id` would probably duplicate one of
+/// `entries` (an `alias` or `normalised` match whose page exists), else
+/// `None`.
+fn creation_refusal(
+    vault: &std::path::Path,
+    id: &str,
+    entries: &[duplicates::NameEntry],
+    pending: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let blocking: Vec<duplicates::DuplicateMatch> = duplicates::find_matches(id, entries)
+        .into_iter()
+        .filter(|m| m.reason.blocks_create())
+        .collect();
+    live_matches(vault, blocking, pending)
+        .first()
+        .map(duplicates::refusal_message)
+}
+
+/// `brain_search` counts a search hit (H3) for this many top results.
+const SALIENCE_SEARCH_TOP: usize = 10;
+
+/// H3 salience: count one read for each id. Best effort: skipped while
+/// the index is not built, bounded by [`COUNTER_DB_TIMEOUT`], never fails
+/// the tool.
+fn record_reads(db: &Option<crate::db::DbHandle>, vault: &std::path::Path, ids: Vec<String>) {
+    if ids.is_empty() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let _ = db_op_if_indexed(db, vault, COUNTER_DB_TIMEOUT, move |conn| {
+        crate::db::pages_index::record_reads(conn, &ids, now)
+    });
+}
+
+/// H3 salience: count one search hit for each id. Best effort, like
+/// [`record_reads`].
+fn record_search_hits(db: &Option<crate::db::DbHandle>, vault: &std::path::Path, ids: Vec<String>) {
+    if ids.is_empty() {
+        return;
+    }
+    let _ = db_op_if_indexed(db, vault, COUNTER_DB_TIMEOUT, move |conn| {
+        crate::db::pages_index::record_search_hits(conn, &ids)
+    });
+}
+
+/// The MCP payload of a page read: the page view verbatim, plus — when
+/// its frontmatter has `superseded_by` (Slice C) — the fields
+/// `superseded_by: <id>` and `notice: "Superseded by <id>"`. The body is
+/// never changed (an agent would write an injected line back). Also
+/// returns the successor id.
+fn page_payload(page: tree::PageView) -> (Value, Option<String>) {
+    let successor = serde_json::from_str::<Value>(&page.frontmatter)
+        .ok()
+        .and_then(|fm| fm.get("superseded_by").and_then(Value::as_str).map(str::to_string));
+    let mut payload = serde_json::to_value(&page).unwrap_or_else(|_| json!({}));
+    if let Some(s) = &successor {
+        payload["superseded_by"] = json!(s);
+        payload["notice"] = json!(superseded_notice(s));
+    }
+    (payload, successor)
+}
+
+fn superseded_notice(successor: &str) -> String {
+    format!("Superseded by {successor}")
+}
+
+/// `body` without a leading `> Superseded by [[…]]` line (and the blank
+/// lines after it). Older BRAIN versions put that line into the read
+/// payload; an agent that copied it back must not persist it.
+fn strip_superseded_notice(body: &str) -> &str {
+    let trimmed = body.trim_start_matches(['\r', '\n']);
+    if !trimmed.starts_with("> Superseded by [[") {
+        return body;
+    }
+    let line_end = trimmed.find('\n').map(|i| i + 1).unwrap_or(trimmed.len());
+    if !trimmed[..line_end].trim_end().ends_with("]]") {
+        return body;
+    }
+    trimmed[line_end..].trim_start_matches(['\r', '\n'])
+}
+
 /// The shared page-id guard ([`refactor::validate_page_id`]) for every
 /// tool that turns an id into a path: relative `<type>/<slug>` under the
 /// wiki, no drive letters, `..`, backslashes or control characters.
@@ -1861,13 +2123,20 @@ fn check_relative_path(label: &str, rel: &str) -> Result<(), String> {
 /// refactor itself is already committed — an index hiccup (busy GUI
 /// writer, hung disk) is logged, never surfaced as a tool failure; the
 /// next full rebuild (GUI watcher, or the next mount) prunes them anyway.
+/// `carry_to` (rename / merge) first moves the page's salience counters
+/// (`page_access`, H3) to the surviving id; without it they go with the page.
 fn forget_in_index(
     db: &mut Option<crate::db::DbHandle>,
     vault: &std::path::Path,
     id: &str,
+    carry_to: Option<&str>,
 ) {
     let ids = vec![id.to_string()];
+    let carry_to = carry_to.map(str::to_string);
     if let Err(err) = db_op(db, vault, "forget refactored page", move |conn| {
+        if let Some(to) = &carry_to {
+            crate::db::pages_index::carry_page_access(conn, &ids[0], to)?;
+        }
         crate::db::pages_index::forget_pages(conn, &ids)
     }) {
         tracing::warn!(%err, "could not drop a refactored page id from the index");
@@ -3678,5 +3947,560 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains(".."));
+    }
+}
+
+/// A2 (aliases + duplicate check), C (validity / provenance) and H3
+/// (salience) through the MCP tools.
+#[cfg(test)]
+mod knowledge_tests {
+    use super::*;
+    use crate::db::DbHandle;
+    use crate::vault::layout::{ensure_skeleton, wiki_dir};
+    use tempfile::TempDir;
+
+    fn vault() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        let marker = crate::vault::marker::VaultMarker::new("test");
+        crate::vault::marker::write_marker(tmp.path(), &marker).unwrap();
+        tmp
+    }
+
+    /// Page text with `extra` frontmatter lines (each ending in a newline).
+    fn page_text(id: &str, extra: &str, body: &str) -> String {
+        let (sub, slug) = id.split_once('/').unwrap();
+        let kind = match sub {
+            "concepts" => "concept",
+            "sources" => "source",
+            "topics" => "topic",
+            _ => "entity",
+        };
+        format!("---\nid: {id}\ntype: {kind}\ntitle: {slug}\n{extra}---\n\n{body}\n")
+    }
+
+    fn page_file(vault: &std::path::Path, id: &str) -> std::path::PathBuf {
+        let (sub, slug) = id.split_once('/').unwrap();
+        wiki_dir(vault).join(sub).join(format!("{slug}.md"))
+    }
+
+    fn put(vault: &std::path::Path, id: &str, extra: &str, body: &str) {
+        let path = page_file(vault, id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, page_text(id, extra, body)).unwrap();
+    }
+
+    fn call(
+        vault: &std::path::Path,
+        db: &mut Option<DbHandle>,
+        name: &str,
+        arguments: Value,
+    ) -> Result<String, String> {
+        call_tool(&json!({ "name": name, "arguments": arguments }), vault, db)
+    }
+
+    fn call_json(
+        vault: &std::path::Path,
+        db: &mut Option<DbHandle>,
+        name: &str,
+        arguments: Value,
+    ) -> Value {
+        let out = call(vault, db, name, arguments).unwrap_or_else(|e| panic!("{name} failed: {e}"));
+        serde_json::from_str(&out).unwrap()
+    }
+
+    /// A handle on the vault's index, built from the pages on disk — the
+    /// normal state while BRAIN runs (the GUI keeps the index current).
+    fn indexed(vault: &std::path::Path) -> Option<DbHandle> {
+        let db = DbHandle::open(vault).unwrap();
+        crate::db::pages_index::rebuild(&db, vault).unwrap();
+        Some(db)
+    }
+
+    fn indexed_page_count(vault: &std::path::Path) -> i64 {
+        DbHandle::open(vault)
+            .unwrap()
+            .with(|c| Ok(c.query_row("SELECT count(*) FROM pages", [], |r| r.get(0))?))
+            .unwrap()
+    }
+
+    /// (reads, search_hits) of a page, (0, 0) without a row.
+    fn access(db: &Option<DbHandle>, id: &str) -> (i64, i64) {
+        let id = id.to_string();
+        db.as_ref()
+            .unwrap()
+            .with(move |c| {
+                Ok(c
+                    .query_row(
+                        "SELECT reads, search_hits FROM page_access WHERE page_id = ?1",
+                        [&id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .unwrap_or((0, 0)))
+            })
+            .unwrap()
+    }
+
+    // ---- A2 -------------------------------------------------------------
+
+    #[test]
+    fn page_exists_reports_a_normalised_match_for_a_differently_spelled_new_id() {
+        let tmp = vault();
+        put(tmp.path(), "entities/mueller-gmbh", "", "Body.");
+        let out = call_json(
+            tmp.path(),
+            &mut indexed(tmp.path()),
+            "brain_page_exists",
+            json!({ "id": "entities/Mueller_GmbH" }),
+        );
+        assert_eq!(
+            (out["exists"].clone(), out["matches"].clone()),
+            (
+                json!(false),
+                json!([{ "id": "entities/mueller-gmbh", "title": "mueller-gmbh", "reason": "normalised" }])
+            )
+        );
+    }
+
+    #[test]
+    fn page_exists_reports_an_alias_match() {
+        let tmp = vault();
+        put(tmp.path(), "entities/acme", "aliases: [ACME Corporation]\n", "Body.");
+        let out = call_json(
+            tmp.path(),
+            &mut indexed(tmp.path()),
+            "brain_page_exists",
+            json!({ "id": "entities/acme-corporation" }),
+        );
+        assert_eq!(out["matches"][0]["reason"], json!("alias"));
+    }
+
+    #[test]
+    fn page_exists_reports_a_similar_match() {
+        let tmp = vault();
+        put(tmp.path(), "entities/dan-shapiro", "", "Body.");
+        let out = call_json(
+            tmp.path(),
+            &mut indexed(tmp.path()),
+            "brain_page_exists",
+            json!({ "id": "entities/dan-shapio" }),
+        );
+        assert_eq!(out["matches"][0]["reason"], json!("similar"));
+    }
+
+    #[test]
+    fn write_page_refuses_to_create_a_page_whose_slug_normalises_to_an_existing_one() {
+        let tmp = vault();
+        put(tmp.path(), "entities/mueller-gmbh", "", "Body.");
+        let err = call(
+            tmp.path(),
+            &mut indexed(tmp.path()),
+            "brain_write_page",
+            json!({ "id": "entities/muller-gmbh", "content": page_text("entities/muller-gmbh", "", "Dup.") }),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("probably exists already: entities/mueller-gmbh \"mueller-gmbh\" (normalised)"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_refused_create_writes_no_file() {
+        let tmp = vault();
+        put(tmp.path(), "entities/mueller-gmbh", "", "Body.");
+        let _ = call(
+            tmp.path(),
+            &mut indexed(tmp.path()),
+            "brain_write_page",
+            json!({ "id": "entities/muller-gmbh", "content": page_text("entities/muller-gmbh", "", "Dup.") }),
+        );
+        assert!(!page_file(tmp.path(), "entities/muller-gmbh").exists());
+    }
+
+    #[test]
+    fn write_page_creates_the_duplicate_when_allow_duplicate_is_true() {
+        let tmp = vault();
+        put(tmp.path(), "entities/mueller-gmbh", "", "Body.");
+        let result = call(
+            tmp.path(),
+            &mut indexed(tmp.path()),
+            "brain_write_page",
+            json!({
+                "id": "entities/muller-gmbh",
+                "content": page_text("entities/muller-gmbh", "", "Different company."),
+                "allow_duplicate": true
+            }),
+        );
+        assert!(result.is_ok(), "got: {result:?}");
+    }
+
+    #[test]
+    fn write_page_refuses_to_create_a_page_named_like_an_alias() {
+        let tmp = vault();
+        put(tmp.path(), "entities/acme", "aliases: [ACME Corporation]\n", "Body.");
+        let err = call(
+            tmp.path(),
+            &mut indexed(tmp.path()),
+            "brain_write_page",
+            json!({
+                "id": "entities/acme-corporation",
+                "content": page_text("entities/acme-corporation", "", "Dup.")
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("entities/acme \"acme\" (alias)"), "got: {err}");
+    }
+
+    #[test]
+    fn write_page_never_refuses_to_overwrite_an_existing_id() {
+        let tmp = vault();
+        put(tmp.path(), "entities/mueller-gmbh", "", "Body.");
+        put(tmp.path(), "entities/muller-gmbh", "", "Older duplicate.");
+        let result = call(
+            tmp.path(),
+            &mut indexed(tmp.path()),
+            "brain_write_page",
+            json!({ "id": "entities/muller-gmbh", "content": page_text("entities/muller-gmbh", "", "Updated.") }),
+        );
+        assert!(result.is_ok(), "got: {result:?}");
+    }
+
+    #[test]
+    fn write_page_does_not_refuse_a_merely_similar_slug() {
+        let tmp = vault();
+        put(tmp.path(), "entities/dan-shapiro", "", "Body.");
+        let result = call(
+            tmp.path(),
+            &mut indexed(tmp.path()),
+            "brain_write_page",
+            json!({ "id": "entities/dan-shapio", "content": page_text("entities/dan-shapio", "", "Typo page.") }),
+        );
+        assert!(result.is_ok(), "got: {result:?}");
+    }
+
+    #[test]
+    fn write_page_rejects_a_non_boolean_allow_duplicate() {
+        let tmp = vault();
+        let err = call(
+            tmp.path(),
+            &mut indexed(tmp.path()),
+            "brain_write_page",
+            json!({ "id": "entities/x", "content": page_text("entities/x", "", "x"), "allow_duplicate": "yes" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("allow_duplicate must be a boolean"), "got: {err}");
+    }
+
+    #[test]
+    fn write_batch_refuses_an_entry_that_duplicates_an_existing_page() {
+        let tmp = vault();
+        put(tmp.path(), "entities/mueller-gmbh", "", "Body.");
+        let err = call(
+            tmp.path(),
+            &mut indexed(tmp.path()),
+            "brain_write_batch",
+            json!({ "pages": [
+                { "id": "entities/fresh", "content": page_text("entities/fresh", "", "New.") },
+                { "id": "entities/muller-gmbh", "content": page_text("entities/muller-gmbh", "", "Dup.") }
+            ] }),
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with(
+                "pages[1] (entities/muller-gmbh): a page for this probably exists already: entities/mueller-gmbh"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_refused_batch_writes_none_of_its_pages() {
+        let tmp = vault();
+        put(tmp.path(), "entities/mueller-gmbh", "", "Body.");
+        let _ = call(
+            tmp.path(),
+            &mut indexed(tmp.path()),
+            "brain_write_batch",
+            json!({ "pages": [
+                { "id": "entities/fresh", "content": page_text("entities/fresh", "", "New.") },
+                { "id": "entities/muller-gmbh", "content": page_text("entities/muller-gmbh", "", "Dup.") }
+            ] }),
+        );
+        assert!(!page_file(tmp.path(), "entities/fresh").exists());
+    }
+
+    #[test]
+    fn write_batch_refuses_an_entry_that_duplicates_an_earlier_entry_of_the_batch() {
+        let tmp = vault();
+        let err = call(
+            tmp.path(),
+            &mut indexed(tmp.path()),
+            "brain_write_batch",
+            json!({ "pages": [
+                { "id": "entities/mueller-gmbh", "content": page_text("entities/mueller-gmbh", "", "One.") },
+                { "id": "entities/Mueller_GmbH", "content": page_text("entities/Mueller_GmbH", "", "Two.") }
+            ] }),
+        )
+        .unwrap_err();
+        assert!(err.starts_with("pages[1] (entities/Mueller_GmbH)"), "got: {err}");
+    }
+
+    #[test]
+    fn a_batch_entry_with_allow_duplicate_is_written() {
+        let tmp = vault();
+        put(tmp.path(), "entities/mueller-gmbh", "", "Body.");
+        let result = call(
+            tmp.path(),
+            &mut indexed(tmp.path()),
+            "brain_write_batch",
+            json!({ "pages": [{
+                "id": "entities/muller-gmbh",
+                "content": page_text("entities/muller-gmbh", "", "Other."),
+                "allow_duplicate": true
+            }] }),
+        );
+        assert!(result.is_ok(), "got: {result:?}");
+    }
+
+    // ---- C ----------------------------------------------------------------
+
+    fn superseded_vault() -> TempDir {
+        let tmp = vault();
+        put(
+            tmp.path(),
+            "entities/a",
+            "valid_to: 2025-12-31\nsuperseded_by: entities/b\nsources: [sources/s]\n",
+            "Old facts.",
+        );
+        put(tmp.path(), "entities/b", "sources: [sources/s]\n", "New facts.");
+        put(tmp.path(), "sources/s", "", "Source.");
+        tmp
+    }
+
+    #[test]
+    fn get_context_of_a_superseded_page_names_the_successor_at_the_top_level() {
+        let tmp = superseded_vault();
+        let out = call_json(tmp.path(), &mut indexed(tmp.path()), "brain_get_context", json!({ "id": "entities/a" }));
+        assert_eq!(out["superseded_by"], json!("entities/b"));
+    }
+
+    #[test]
+    fn get_context_of_a_superseded_page_carries_a_notice_field() {
+        let tmp = superseded_vault();
+        let out = call_json(tmp.path(), &mut indexed(tmp.path()), "brain_get_context", json!({ "id": "entities/a" }));
+        assert_eq!(out["notice"], json!("Superseded by entities/b"));
+    }
+
+    #[test]
+    fn get_context_of_a_superseded_page_returns_the_body_verbatim() {
+        let tmp = superseded_vault();
+        let out = call_json(tmp.path(), &mut indexed(tmp.path()), "brain_get_context", json!({ "id": "entities/a" }));
+        assert_eq!(out["page"]["body"], json!("Old facts.\n"));
+    }
+
+    #[test]
+    fn write_page_drops_a_copied_back_superseded_line_from_the_body() {
+        let tmp = superseded_vault();
+        call(
+            tmp.path(),
+            &mut indexed(tmp.path()),
+            "brain_write_page",
+            json!({
+                "id": "entities/b",
+                "content": page_text("entities/b", "sources: [sources/s]\n", "> Superseded by [[entities/c]]\n\nNew facts.")
+            }),
+        )
+        .unwrap();
+        let written = std::fs::read_to_string(page_file(tmp.path(), "entities/b")).unwrap();
+        assert!(!written.contains("Superseded by"), "got: {written}");
+    }
+
+    #[test]
+    fn get_context_of_a_current_page_has_no_superseded_field() {
+        let tmp = superseded_vault();
+        let out = call_json(tmp.path(), &mut indexed(tmp.path()), "brain_get_context", json!({ "id": "entities/b" }));
+        assert!(out.get("superseded_by").is_none(), "got: {out}");
+    }
+
+    #[test]
+    fn get_context_does_not_list_the_superseded_line_as_an_outbound_link() {
+        let tmp = superseded_vault();
+        let out = call_json(tmp.path(), &mut indexed(tmp.path()), "brain_get_context", json!({ "id": "entities/a" }));
+        assert_eq!(out["outbound"], json!([]));
+    }
+
+    #[test]
+    fn get_page_of_a_superseded_page_names_the_successor() {
+        let tmp = superseded_vault();
+        let out = call_json(tmp.path(), &mut indexed(tmp.path()), "brain_get_page", json!({ "id": "entities/a" }));
+        assert_eq!(out["superseded_by"], json!("entities/b"));
+    }
+
+    #[test]
+    fn reading_a_superseded_page_leaves_its_file_unchanged() {
+        let tmp = superseded_vault();
+        let before = std::fs::read_to_string(page_file(tmp.path(), "entities/a")).unwrap();
+        call_json(tmp.path(), &mut indexed(tmp.path()), "brain_get_page", json!({ "id": "entities/a" }));
+        let after = std::fs::read_to_string(page_file(tmp.path(), "entities/a")).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn brain_query_leaves_out_a_superseded_page_by_default() {
+        let tmp = superseded_vault();
+        let out = call_json(tmp.path(), &mut indexed(tmp.path()), "brain_query", json!({ "query": "type:entity" }));
+        let ids: Vec<&str> = out
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["entities/b"]);
+    }
+
+    // ---- H3 ---------------------------------------------------------------
+
+    #[test]
+    fn get_page_counts_one_read_per_call() {
+        let tmp = vault();
+        put(tmp.path(), "entities/alice", "", "Body.");
+        let mut db = indexed(tmp.path());
+        for _ in 0..3 {
+            call_json(tmp.path(), &mut db, "brain_get_page", json!({ "id": "entities/alice" }));
+        }
+        assert_eq!(access(&db, "entities/alice").0, 3);
+    }
+
+    #[test]
+    fn get_pages_counts_a_read_only_for_pages_that_were_found() {
+        let tmp = vault();
+        put(tmp.path(), "entities/alice", "", "Body.");
+        let mut db = indexed(tmp.path());
+        call_json(
+            tmp.path(),
+            &mut db,
+            "brain_get_pages",
+            json!({ "ids": ["entities/alice", "entities/missing"] }),
+        );
+        assert_eq!(
+            (access(&db, "entities/alice").0, access(&db, "entities/missing").0),
+            (1, 0)
+        );
+    }
+
+    #[test]
+    fn get_context_counts_a_read_of_the_page() {
+        let tmp = vault();
+        put(tmp.path(), "entities/alice", "", "Body.");
+        let mut db = indexed(tmp.path());
+        call_json(tmp.path(), &mut db, "brain_get_context", json!({ "id": "entities/alice" }));
+        assert_eq!(access(&db, "entities/alice").0, 1);
+    }
+
+    #[test]
+    fn search_counts_a_search_hit_for_a_returned_page() {
+        let tmp = vault();
+        put(tmp.path(), "concepts/zebrafish", "", "The zebrafish genome.");
+        let mut db = indexed(tmp.path());
+        call(tmp.path(), &mut db, "brain_search", json!({ "query": "zebrafish" })).unwrap();
+        assert_eq!(access(&db, "concepts/zebrafish").1, 1);
+    }
+
+    #[test]
+    fn renaming_a_page_carries_its_read_count_to_the_new_id() {
+        let tmp = vault();
+        let wiki = wiki_dir(tmp.path());
+        crate::wiki::git::init_repo(&wiki).unwrap();
+        put(tmp.path(), "entities/old", "", "Body.");
+        crate::wiki::git::commit_all(&wiki, "baseline").unwrap();
+        let mut db = indexed(tmp.path());
+        call_json(tmp.path(), &mut db, "brain_get_page", json!({ "id": "entities/old" }));
+        call(
+            tmp.path(),
+            &mut db,
+            "brain_rename_page",
+            json!({ "id": "entities/old", "new_id": "entities/new" }),
+        )
+        .unwrap();
+        assert_eq!(
+            (access(&db, "entities/old").0, access(&db, "entities/new").0),
+            (0, 1)
+        );
+    }
+
+    // ---- review fixes: index side jobs never build the index (S1), stale
+    // rows never block (S4), get_pages dedupe ------------------------------
+
+    #[test]
+    fn get_page_on_an_unbuilt_index_does_not_build_it() {
+        let tmp = vault();
+        put(tmp.path(), "entities/alice", "", "Body.");
+        let mut db = None;
+        call_json(tmp.path(), &mut db, "brain_get_page", json!({ "id": "entities/alice" }));
+        assert_eq!((db.is_none(), indexed_page_count(tmp.path())), (true, 0));
+    }
+
+    #[test]
+    fn page_exists_on_an_unbuilt_index_says_matches_were_not_checked() {
+        let tmp = vault();
+        put(tmp.path(), "entities/mueller-gmbh", "", "Body.");
+        let out = call_json(tmp.path(), &mut None, "brain_page_exists", json!({ "id": "entities/muller-gmbh" }));
+        assert_eq!(out["matches_checked"], json!(false));
+    }
+
+    #[test]
+    fn write_page_on_an_unbuilt_index_says_matches_were_not_checked() {
+        let tmp = vault();
+        put(tmp.path(), "entities/mueller-gmbh", "", "Body.");
+        let out = call_json(
+            tmp.path(),
+            &mut None,
+            "brain_write_page",
+            json!({ "id": "entities/muller-gmbh", "content": page_text("entities/muller-gmbh", "", "x") }),
+        );
+        assert_eq!(out["matches_checked"], json!(false));
+    }
+
+    #[test]
+    fn a_stale_index_row_of_a_deleted_page_does_not_block_creation() {
+        let tmp = vault();
+        put(tmp.path(), "entities/mueller-gmbh", "", "Body.");
+        let mut db = indexed(tmp.path());
+        std::fs::remove_file(page_file(tmp.path(), "entities/mueller-gmbh")).unwrap();
+        let result = call(
+            tmp.path(),
+            &mut db,
+            "brain_write_page",
+            json!({ "id": "entities/muller-gmbh", "content": page_text("entities/muller-gmbh", "", "x") }),
+        );
+        assert!(result.is_ok(), "got: {result:?}");
+    }
+
+    #[test]
+    fn write_page_does_not_block_michal_next_to_michael() {
+        let tmp = vault();
+        put(tmp.path(), "entities/michael", "", "Body.");
+        let result = call(
+            tmp.path(),
+            &mut indexed(tmp.path()),
+            "brain_write_page",
+            json!({ "id": "entities/michal", "content": page_text("entities/michal", "", "Another person.") }),
+        );
+        assert!(result.is_ok(), "got: {result:?}");
+    }
+
+    #[test]
+    fn get_pages_counts_one_read_for_an_id_requested_twice() {
+        let tmp = vault();
+        put(tmp.path(), "entities/alice", "", "Body.");
+        let mut db = indexed(tmp.path());
+        call_json(
+            tmp.path(),
+            &mut db,
+            "brain_get_pages",
+            json!({ "ids": ["entities/alice", "entities/alice"] }),
+        );
+        assert_eq!(access(&db, "entities/alice").0, 1);
     }
 }

@@ -185,6 +185,22 @@ impl Parser {
             Some(Token::QuotedWord(w)) => w,
             _ => return Err(QueryError::MissingValue),
         };
+        let allowed: &[&str] = match field {
+            Field::Valid => &["now", "all", "expired"],
+            Field::Sort => &["updated", "salience"],
+            _ => &[],
+        };
+        if !allowed.is_empty() {
+            let value = value.to_ascii_lowercase();
+            let name = if field == Field::Valid { "valid" } else { "sort" };
+            if op != Op::Eq || !allowed.contains(&value.as_str()) {
+                return Err(QueryError::InvalidValue(format!(
+                    "{name}: takes `:` and one of {}",
+                    allowed.join(", ")
+                )));
+            }
+            return Ok(Expr::Clause(Clause { field, op, value }));
+        }
         Ok(Expr::Clause(Clause { field, op, value }))
     }
 }
@@ -275,6 +291,30 @@ mod tests {
     fn rejects_empty_query() {
         let err = parse("   ").unwrap_err();
         assert_eq!(err, QueryError::EmptyQuery);
+    }
+
+    #[test]
+    fn parses_valid_and_sort_clauses_case_insensitively() {
+        let expr = parse("valid:ALL AND sort:Salience").unwrap();
+        assert_eq!(
+            expr,
+            Expr::And(
+                Box::new(Expr::Clause(Clause { field: Field::Valid, op: Op::Eq, value: "all".into() })),
+                Box::new(Expr::Clause(Clause { field: Field::Sort, op: Op::Eq, value: "salience".into() })),
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_an_unknown_validity_value() {
+        let err = parse("valid:sometimes").unwrap_err();
+        assert!(matches!(err, QueryError::InvalidValue(_)));
+    }
+
+    #[test]
+    fn rejects_a_comparison_operator_on_sort() {
+        let err = parse("sort:>salience").unwrap_err();
+        assert!(matches!(err, QueryError::InvalidValue(_)));
     }
 
     #[test]
