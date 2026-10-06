@@ -19,15 +19,20 @@ pub fn unclean_shutdown_pending(
     Ok(UncleanFlag::is_set(&vault))
 }
 
+/// Async (off the main thread): besides the git/SQLite checks the report
+/// includes the wiki hygiene lint, whose duplicate rule compares every
+/// pair of page vectors.
 #[tauri::command]
-pub fn run_integrity_check(
-    state: State<Arc<crate::state::AppState>>,
+pub async fn run_integrity_check(
+    state: State<'_, Arc<crate::state::AppState>>,
 ) -> BrainResult<IntegrityReport> {
     let vault = state.vault_path().ok_or_else(|| {
         BrainError::Internal("no vault is currently mounted".into())
     })?;
     let db = state.db();
-    Ok(integrity::check(&vault, db.as_ref()))
+    tokio::task::spawn_blocking(move || integrity::check(&vault, db.as_ref()))
+        .await
+        .map_err(|e| BrainError::Internal(format!("integrity check task failed: {e}")))
 }
 
 #[tauri::command]

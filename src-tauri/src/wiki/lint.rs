@@ -1,11 +1,20 @@
 //! Lint pass over the wiki: frontmatter validity, link integrity, ID
 //! uniqueness. Run before each auto-commit. Hard errors block the commit.
+//!
+//! Two entry points:
+//!  - [`lint`] — filesystem only, fast. The watcher's pre-commit gate and
+//!    the write tools' page-scoped checks use it.
+//!  - [`lint_with_index`] — `lint` plus the index-backed hygiene rules of
+//!    [`super::hygiene`] (orphans, duplicate candidates). Slower (it reads
+//!    every chunk vector), never blocks commits; used by
+//!    `brain_lint_report`, the Integrity page and the scheduled audit.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use crate::db::DbHandle;
 use crate::vault::layout::{wiki_dir, WIKI_SUBDIRS};
 
 use regex::Regex;
@@ -28,6 +37,12 @@ pub const KNOWN_TYPES: &[&str] = &["entity", "concept", "source", "topic"];
 pub struct LintReport {
     pub errors: Vec<LintError>,
     pub warnings: Vec<LintWarning>,
+    /// Info-level notes that are not findings about a page — e.g. "a
+    /// check was skipped because the embedding model is missing". Same
+    /// `{path, kind, message}` shape (path may be empty). Omitted from
+    /// the JSON when empty, so the filesystem lint's output is unchanged.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<LintWarning>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -47,6 +62,55 @@ pub struct LintWarning {
 impl LintReport {
     pub fn is_clean(&self) -> bool {
         self.errors.is_empty()
+    }
+}
+
+/// [`lint`] plus the index-backed hygiene rules (`orphan`,
+/// `duplicate-candidate`; see [`super::hygiene`]). All hygiene findings
+/// are warnings. Without a DB handle this is exactly [`lint`]. If the
+/// index cannot be read, the filesystem findings are still returned
+/// together with a note saying the hygiene checks were skipped.
+pub fn lint_with_index(vault: &Path, db: Option<&DbHandle>) -> WikiResult<LintReport> {
+    let mut report = lint(vault)?;
+    let Some(db) = db else {
+        return Ok(report);
+    };
+    let rows = db
+        .with(super::hygiene::load_rows)
+        .map_err(|err| err.to_string());
+    add_hygiene(&mut report, vault, rows);
+    Ok(report)
+}
+
+/// Append the hygiene findings for `rows` (loaded by
+/// [`super::hygiene::load_rows`]) to `report`. When loading failed
+/// (`Err` carries the reason, e.g. an index timeout in the MCP server),
+/// a `hygiene-skipped` note says so instead of silently omitting them.
+pub fn add_hygiene(
+    report: &mut LintReport,
+    vault: &Path,
+    rows: Result<super::hygiene::HygieneRows, String>,
+) {
+    match rows {
+        Ok(rows) => {
+            let findings = super::hygiene::evaluate(
+                &rows,
+                crate::embedding::model_available(vault),
+                chrono::Utc::now().timestamp(),
+            );
+            report.warnings.extend(findings.warnings);
+            report.notes.extend(findings.notes);
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "hygiene lint: cannot read the index");
+            report.notes.push(LintWarning {
+                path: String::new(),
+                kind: "hygiene-skipped".into(),
+                message: format!(
+                    "orphan and duplicate checks were skipped: the search index could not be read ({err})"
+                ),
+            });
+        }
     }
 }
 
@@ -99,7 +163,15 @@ pub fn lint(vault: &Path) -> WikiResult<LintReport> {
     let mut warnings: Vec<LintWarning> = Vec::new();
     for (file, parsed) in &all_pages {
         for link in &parsed.wiki_links {
-            if !known_ids.contains(link) {
+            // `[[id#heading]]` points at a section of `id`: resolve the
+            // page part too. A bare `[[#heading]]` is an in-page anchor.
+            // The raw link still counts first, so an id that itself
+            // contains `#` keeps resolving.
+            let target = link.split('#').next().unwrap_or(link).trim();
+            let resolves = known_ids.contains(link)
+                || target.is_empty()
+                || known_ids.contains(&target.to_string());
+            if !resolves {
                 errors.push(LintError {
                     path: file.to_string_lossy().to_string(),
                     kind: "broken-link".into(),
@@ -187,7 +259,11 @@ pub fn lint(vault: &Path) -> WikiResult<LintReport> {
         }
     }
 
-    Ok(LintReport { errors, warnings })
+    Ok(LintReport {
+        errors,
+        warnings,
+        notes: Vec::new(),
+    })
 }
 
 /// True iff any line of `body` looks like a Markdown table row
@@ -286,6 +362,50 @@ mod tests {
         );
         let report = lint(tmp.path()).unwrap();
         assert!(report.errors.iter().any(|e| e.kind == "broken-link"));
+    }
+
+    #[test]
+    fn lint_resolves_a_link_to_a_heading_of_an_existing_page() {
+        let tmp = make_vault();
+        write_page(
+            tmp.path(),
+            "entities",
+            "alice",
+            &page("entities/alice", "see [[entities/bob#Contract]]"),
+        );
+        write_page(tmp.path(), "entities", "bob", &page("entities/bob", "hi"));
+        let report = lint(tmp.path()).unwrap();
+        assert!(report.is_clean(), "unexpected errors: {:?}", report.errors);
+    }
+
+    #[test]
+    fn lint_resolves_a_link_to_an_existing_id_that_contains_a_hash() {
+        let tmp = make_vault();
+        write_page(tmp.path(), "entities", "alice", &page("entities/alice", "see [[entities/c#]]"));
+        write_page(tmp.path(), "entities", "c-sharp", &page("entities/c#", "hi"));
+        let report = lint(tmp.path()).unwrap();
+        assert!(report.is_clean(), "unexpected errors: {:?}", report.errors);
+    }
+
+    #[test]
+    fn lint_flags_a_heading_link_whose_page_does_not_exist() {
+        let tmp = make_vault();
+        write_page(
+            tmp.path(),
+            "entities",
+            "alice",
+            &page("entities/alice", "see [[entities/missing#Contract]]"),
+        );
+        let report = lint(tmp.path()).unwrap();
+        assert!(report.errors.iter().any(|e| e.kind == "broken-link"));
+    }
+
+    #[test]
+    fn lint_without_index_serialises_no_notes_field() {
+        let tmp = make_vault();
+        write_page(tmp.path(), "entities", "alice", &page("entities/alice", "hi"));
+        let json = serde_json::to_value(lint(tmp.path()).unwrap()).unwrap();
+        assert!(json.get("notes").is_none());
     }
 
     #[test]

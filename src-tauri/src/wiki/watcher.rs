@@ -67,30 +67,10 @@ async fn run_loop<R: Runtime>(
         None,
         move |result: DebounceEventResult| {
             if let Ok(events) = result {
-                // Ignore events under `.git/`. Our own commits rewrite
-                // `.git/index` (and refs/objects), and on an encrypted
-                // vault the index holds ciphertext while the working tree
-                // is plaintext — so git status is perpetually "dirty" and
-                // every commit's index write would re-trigger the watcher,
-                // producing an endless commit loop. Only real page-file
-                // changes (outside `.git/`) should wake the committer.
-                //
-                // Under `00_meta/` only the SYNCED files (AGENTS.md,
-                // CLAUDE.md) count — log.md and index.md are written by
-                // our own commit cycle and would churn events forever.
-                let relevant = events.iter().flat_map(|ev| ev.paths.iter()).any(|p| {
-                    if p.components().any(|c| c.as_os_str() == std::ffi::OsStr::new(".git")) {
-                        return false;
-                    }
-                    if p.starts_with(&meta_root) {
-                        return p
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .map(|n| crate::wiki::encryption::MIRRORED_META_FILES.contains(&n))
-                            .unwrap_or(false);
-                    }
-                    true
-                });
+                let relevant = events
+                    .iter()
+                    .flat_map(|ev| ev.paths.iter())
+                    .any(|p| is_relevant_event_path(&meta_root, p));
                 if relevant {
                     let _ = watcher_tx.try_send(());
                 }
@@ -138,6 +118,32 @@ async fn run_loop<R: Runtime>(
     }
 
     drop(debouncer);
+}
+
+/// Whether a file-system event at `p` should wake the auto-committer.
+///
+/// Events under `.git/` are ignored. Our own commits rewrite `.git/index`
+/// (and refs/objects), and on an encrypted vault the index holds
+/// ciphertext while the working tree is plaintext — so git status is
+/// perpetually "dirty" and every commit's index write would re-trigger
+/// the watcher, producing an endless commit loop. Only real page-file
+/// changes (outside `.git/`) should wake the committer.
+///
+/// Under `00_meta/` only the SYNCED files (AGENTS.md, CLAUDE.md) count —
+/// log.md, index.md and the audit reports under `00_meta/audit/` are
+/// written by BRAIN itself and would churn events forever.
+pub(crate) fn is_relevant_event_path(meta_root: &Path, p: &Path) -> bool {
+    if p.components().any(|c| c.as_os_str() == std::ffi::OsStr::new(".git")) {
+        return false;
+    }
+    if p.starts_with(meta_root) {
+        return p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| crate::wiki::encryption::MIRRORED_META_FILES.contains(&n))
+            .unwrap_or(false);
+    }
+    true
 }
 
 async fn process_idle_window<R: Runtime>(app: &AppHandle<R>, state: &Arc<AppState>, wiki: &Path) {
@@ -308,6 +314,30 @@ fn commit_message(paths: &[String], encrypted: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writing_an_audit_report_does_not_wake_the_auto_committer() {
+        let meta = Path::new("/vault/00_meta");
+        assert!(!is_relevant_event_path(meta, &meta.join("audit").join("2026-10-06.md")));
+    }
+
+    #[test]
+    fn creating_the_audit_directory_does_not_wake_the_auto_committer() {
+        let meta = Path::new("/vault/00_meta");
+        assert!(!is_relevant_event_path(meta, &meta.join("audit")));
+    }
+
+    #[test]
+    fn editing_agents_md_wakes_the_auto_committer() {
+        let meta = Path::new("/vault/00_meta");
+        assert!(is_relevant_event_path(meta, &meta.join("AGENTS.md")));
+    }
+
+    #[test]
+    fn editing_a_wiki_page_wakes_the_auto_committer() {
+        let meta = Path::new("/vault/00_meta");
+        assert!(is_relevant_event_path(meta, Path::new("/vault/02_wiki/entities/a.md")));
+    }
 
     #[test]
     fn commit_message_is_path_free_on_an_encrypted_vault() {

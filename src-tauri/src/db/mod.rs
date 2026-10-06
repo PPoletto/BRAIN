@@ -70,6 +70,12 @@ pub const DB_FILENAME: &str = "brain.db";
 #[derive(Clone)]
 pub struct DbHandle {
     inner: Arc<Mutex<Connection>>,
+    /// Serialises page-index rebuilds on this handle. A rebuild commits in
+    /// batches and releases `inner` between them (so searches are not
+    /// blocked for minutes); this lock keeps two rebuilds from embedding
+    /// the same pages at the same time, and lets the audit wait for a
+    /// running rebuild instead of linting a half-written index.
+    rebuild: Arc<Mutex<()>>,
 }
 
 impl DbHandle {
@@ -97,7 +103,18 @@ impl DbHandle {
         migrations::apply(&conn)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(conn)),
+            rebuild: Arc::new(Mutex::new(())),
         })
+    }
+
+    /// Hold this while rebuilding the page index (or while reading the
+    /// index for the audit, to wait out a running rebuild). A panic in an
+    /// earlier holder (e.g. an embedder failure) does not poison it for
+    /// good: the guarded data is `()`, so the lock is simply taken over.
+    pub fn rebuild_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.rebuild
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub fn with<F, T>(&self, f: F) -> DbResult<T>

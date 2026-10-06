@@ -28,6 +28,33 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   names and history messages as before. Use
   "Update vault templates" in Settings to give your agent the updated
   instructions for these tools.
+- **Wiki hygiene checks.** The lint report (`brain_lint_report`) now also
+  flags pages that probably need attention — as advice only, they never
+  block saving:
+  - *Possible duplicates*: two pages of the same type whose content is
+    nearly the same, with a similarity score. Needs the index to be built
+    with the semantic model; otherwise the report says the check was
+    skipped and why. Very large page types (over 2,000 pages) are
+    skipped with a note.
+  - *Orphan pages*: no other page links to them and they have not
+    changed for more than 90 days (the date is shown).
+
+  Links to a heading of a page (`[[page#Heading]]`) are now accepted as
+  links to that page instead of being reported as broken, and count as
+  links to that page in the graph and in backlinks.
+- **Downloading the semantic model re-indexes the vault with it.** After
+  the model download finishes, BRAIN marks the open vault's index for a
+  full re-index, so the existing pages get semantic vectors (in the
+  background, resumable) instead of keeping the simple fallback ones.
+- **Daily wiki audit.** While a vault is mounted, BRAIN checks the wiki
+  shortly after mounting and then once a day, and writes the findings to
+  `00_meta/audit/<date>.md` (one file per day, never synced). Your agent
+  is asked to work through the newest audit at the start of a
+  maintenance session — use "Update vault templates" in Settings to give
+  it the new instructions. Findings do not pop up as notifications; they
+  are listed in the audit file and on the Integrity page. A running audit
+  never prevents ejecting the vault, and reports older than 30 days are
+  deleted automatically.
 
 ### Changed
 
@@ -44,9 +71,26 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   mounted after updating, BRAIN re-indexes every page once so existing
   pages get the new context. With the semantic model active this can
   keep BRAIN busy for a few minutes on a large vault; the status bar
-  shows "Rebuilding the index" while it runs, and searches started in
-  the meantime may wait until it is done. Later mounts only re-index
-  pages you changed, as before.
+  shows the progress (e.g. "Preparing the vault (index + MCP)
+  (120/843)") while it runs. Later mounts only re-index pages you
+  changed, as before.
+- **Searching in the app keeps working during a re-index.** The index is
+  now rebuilt in steps of 50 pages instead of in one go, and the slow part
+  (computing the semantic vectors) no longer locks the index. Searches in
+  the app run between steps instead of waiting minutes for the whole
+  re-index. If a re-index is interrupted (BRAIN closed, disk unplugged),
+  the next one continues where it stopped instead of starting over.
+  "Rebuild index" in Settings shows the same progress. Not changed yet:
+  when Claude/Codex start BRAIN's MCP server on a vault whose index is
+  still empty, that server builds the index itself before it answers its
+  first request.
+- **MCP log names the client's protocol version.** The MCP server now
+  logs one line per session with the protocol version, client name and
+  client version the connecting app declared, and answers a
+  `server/discover` probe (new in MCP 2026-07-28) with a clear "not yet
+  supported — please use the initialize handshake" error instead of a
+  generic "method not found". Current clients are unaffected; a client
+  that switches to the new protocol now leaves a diagnosable log line.
 
 ## [0.3.4] — 2026-10-06
 

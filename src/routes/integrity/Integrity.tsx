@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 
+import type { LintIssue, LintReport } from "../../lib/events";
+
 type CheckResult =
   | { kind: "Ok"; detail: string }
   | { kind: "Warn"; detail: string }
@@ -20,6 +22,23 @@ type IntegrityReport = {
   db: CheckResult;
   pages: CheckResult;
   suggestions: RecoveryAction[];
+  /// Wiki lint incl. hygiene rules — informational, never affects `clean`.
+  hygiene: LintReport | null;
+};
+
+/// Human labels for lint kinds; unknown kinds fall back to the raw kind.
+const LINT_KIND_LABELS: Record<string, string> = {
+  "broken-link": "Broken links",
+  "duplicate-id": "Duplicate ids",
+  frontmatter: "Malformed frontmatter",
+  "unregistered-type": "Unregistered page types",
+  "missing-title": "Missing titles",
+  "non-canonical-wiki-link": "Non-canonical links",
+  "wikilink-pipe-in-table-cell": "Aliased links in tables",
+  orphan: "Orphan pages (no inbound links, unchanged 90+ days)",
+  "duplicate-candidate": "Possible duplicates",
+  "duplicate-detection-skipped": "Duplicate detection skipped",
+  "hygiene-skipped": "Hygiene checks skipped",
 };
 
 export function Integrity() {
@@ -125,6 +144,8 @@ export function Integrity() {
             <CheckRow title="Pages-table ↔ filesystem" result={report.pages} />
           </ul>
 
+          {report.hygiene && <HygieneSection report={report.hygiene} />}
+
           {report.suggestions.length > 0 && (
             <section className="mb-6">
               <h2 className="text-lg font-medium mb-2">Recovery actions</h2>
@@ -172,6 +193,56 @@ export function Integrity() {
         </button>
       </div>
     </div>
+  );
+}
+
+/// Last two path segments ("entities/alice.md") — enough to find the page.
+function shortPath(path: string): string {
+  return path.split(/[\\/]/).slice(-2).join("/");
+}
+
+function HygieneSection({ report }: { report: LintReport }) {
+  const issues: LintIssue[] = [
+    ...report.errors,
+    ...report.warnings,
+    ...(report.notes ?? []),
+  ];
+  const byKind = new Map<string, LintIssue[]>();
+  for (const issue of issues) {
+    byKind.set(issue.kind, [...(byKind.get(issue.kind) ?? []), issue]);
+  }
+  return (
+    <section className="mb-6">
+      <h2 className="text-lg font-medium mb-2">Wiki hygiene</h2>
+      {byKind.size === 0 ? (
+        <p className="text-sm text-neutral-500">No findings.</p>
+      ) : (
+        <ul className="space-y-2">
+          {[...byKind.entries()].map(([kind, items]) => (
+            <li
+              key={kind}
+              className="rounded-md border border-neutral-800 bg-neutral-900 p-3 text-sm"
+            >
+              <details>
+                <summary className="cursor-pointer font-medium">
+                  {LINT_KIND_LABELS[kind] ?? kind} ({items.length})
+                </summary>
+                <ul className="mt-2 space-y-1 text-xs text-neutral-400">
+                  {items.map((item, i) => (
+                    <li key={`${item.path}-${i}`}>
+                      {item.path && (
+                        <span className="text-neutral-300">{shortPath(item.path)} — </span>
+                      )}
+                      {item.message}
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
   );
 }
 

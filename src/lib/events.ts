@@ -25,7 +25,12 @@ export async function onOnboardingProgress(
 }
 
 export type LintIssue = { path: string; kind: string; message: string };
-export type LintReport = { errors: LintIssue[]; warnings: LintIssue[] };
+export type LintReport = {
+  errors: LintIssue[];
+  warnings: LintIssue[];
+  /// Info notes (e.g. a check was skipped); only present when non-empty.
+  notes?: LintIssue[];
+};
 
 /// Listen for lint output emitted after each auto-commit attempt.
 /// The watcher only emits this event when a lint pass produced

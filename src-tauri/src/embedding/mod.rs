@@ -293,6 +293,14 @@ fn hashed_fallback() -> Arc<dyn Embedder> {
     Arc::new(hashed::HashedEmbedder::new())
 }
 
+/// True when the complete bge-m3 model is on disk for `vault`, i.e. the
+/// index holds (or will hold after the next re-index) real semantic
+/// vectors rather than the hashed fallback's. Checks file presence only —
+/// never loads the 2.2 GB weights.
+pub fn model_available(vault: &Path) -> bool {
+    has_full_model(&bge_m3_dir(vault))
+}
+
 fn has_full_model(dir: &Path) -> bool {
     // BAAI/bge-m3 ships `pytorch_model.bin`, not `model.safetensors` — see
     // `embedding::download::MODEL_FILES`.

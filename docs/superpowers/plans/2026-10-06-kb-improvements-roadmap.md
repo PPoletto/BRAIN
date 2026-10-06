@@ -73,10 +73,20 @@ die Claude-Desktop-Logs zeigen, dass die Clients sie **aktuell noch senden**.
 - 0.2 Client-Verhalten feststellen: welche Protokollversion senden Claude Code, Claude
   Desktop (Store-Build) und Codex heute? (Aus den MCP-Logs ablesbar; ggf. die erste Anfrage
   im Server mit Version loggen.)
-- 0.3 **Dual-Version**: der Server beantwortet weiterhin `initialize`/`ping` (alt) **und**
-  `server/discover` + versionierte Einzelanfragen (neu), Auswahl pro Anfrage anhand der
-  mitgesendeten Protokollversion. `brain_ping` als Tool bleibt (Tool, kein Protokoll-Ping).
-  Kein Umbau auf HTTP — stdio bleibt.
+- 0.3 **Dual-Version** (Details und Korrekturen: `docs/research/2026-10-mcp-spec-2026-07-28-gap.md`):
+  der Server beantwortet weiterhin `initialize`/`ping` (alt) **und** `server/discover` +
+  versionierte Einzelanfragen (neu, Version/Capabilities in `params._meta`), Auswahl pro
+  Anfrage. **Nutzerentscheidung 06.10.: Versionen gleich mit anheben** — der Legacy-Pfad
+  antwortet nicht mehr starr mit `2024-11-05`, sondern verhandelt nach altem Schema: die vom
+  Client gewünschte Version, wenn wir sie unterstützen (`2024-11-05`, `2025-03-26`,
+  `2025-06-18`, `2025-11-25`), sonst unsere höchste alte (`2025-11-25`); die Features der
+  neueren alten Versionen, die ein stdio-Tool-Server sinnvoll nutzt (`outputSchema` +
+  `structuredContent` seit 2025-06-18, Tool-`title`/Annotations), kommen mit Slice D.
+  Defaults für den neuen Pfad: `resultType: "complete"` auf jedem Ergebnis, `ttlMs` 1 h auf
+  `tools/list`/`server/discover`, `serverInfo` in `_meta`, fehlende `clientCapabilities` →
+  `-32602`; unbekanntes Tool → `-32602` (spec-konform statt `isError`), „kein Vault" raus
+  aus dem `-32000`-Bereich. `brain_ping` als Tool bleibt. Kein SDK-Wechsel (rmcp), kein
+  HTTP — stdio bleibt.
 - 0.4 Tests: je ein Handshake-Test alt und neu; `tools/list` liefert die neuen Pflichtfelder,
   wenn die neue Version verhandelt wurde.
 
@@ -221,8 +231,10 @@ Agent beim Anlegen einer Seite automatisch eine Beispielfrage dazu eintragen?
 - `brain_search` concise für 10 Treffer < 1.500 Zeichen; detailed enthält Snippets.
 - Alte Tool-Namen liefern einen Fehler mit dem neuen Namen (eine Übergangsversion lang).
 
-**Aufwand:** S–M. **Risiko:** gering technisch, **Breaking** für Agenten-Gewohnheiten →
-eigenes Release (Minor-Bump), CHANGELOG mit Mapping alt → neu.
+**Aufwand:** S–M. **Risiko:** gering technisch. **Nutzerentscheidung (06.10.): keine
+Übergangsfrist** — alte Tool-Namen antworten mit einem Fehler, der den neuen Namen nennt;
+Agenten lesen `tools/list` ohnehin pro Sitzung. AGENTS.md und SKILL.md ziehen im selben
+Release mit. CHANGELOG mit Mapping alt → neu.
 
 ---
 
@@ -267,6 +279,57 @@ Reranker ist optional und austauschbar, da er keine Vektoren persistiert).
 
 ---
 
+## Slice H — Konsolidierung („Träumen"): geplantes Ordnen des Wikis
+
+**Bezug:** Nutzerwunsch (06.10.): „wie ein Gehirn, das träumt und Gedanken ordnet";
+Deep-Research Befund 2 (Preprint 2604.12034: TRIAGE/DECAY/CONTEXTUALIZE/CONSOLIDATE/AUDIT),
+Lettas „Sleep-Time Compute". Leitidee: **BRAIN hat kein LLM** (C-04/C-08) — also
+Arbeitsteilung: BRAIN erledigt nachts das mechanische Ordnen und bereitet eine Traumqueue
+vor (Tiefschlaf); ein geplanter Agenten-Lauf über MCP erledigt das inhaltliche Ordnen
+(REM) nach festen Regeln.
+
+**Umfang**
+- H1 **Traumqueue** (`00_meta/dream-queue.md`, täglich, erweitert A5): priorisierte
+  Arbeitsliste aus Audit-Funden (Dubletten, Waisen, tote Links) plus neuen Signalen:
+  (a) `summary` veraltet (Body-Hash geändert seit `summary` geschrieben → `summary_hash`
+  im Frontmatter oder in der DB), (b) Hubs ohne `summary` (≥ 5 eingehende Links), (c)
+  Decay-Kandidaten (nie gelesen laut H3, keine eingehenden Links, > 90 Tage) — immer als
+  Vorschlag „ablösen/archivieren", nie als Löschung. Dazu DB-Hausarbeit: FTS `optimize`,
+  Seiten-Mittelwertvektoren vorberechnen (`page_vectors`-Tabelle, dient Dubletten-Lint und
+  später „ähnliche Seiten"), `VACUUM` bei Bedarf.
+- H2 **Traum-Protokoll**: MCP-Prompt-Template `dream` (Slice D4) — „lies die Queue,
+  arbeite die Top-N ab (merge/rename/patch/summary), schreibe `00_meta/dream-log.md`";
+  AGENTS.md-Abschnitt mit harten Regeln: max N Änderungen pro Lauf (Standard 10), nie
+  verlinkte Seiten löschen, Ablösen statt Überschreiben (`superseded_by`),
+  Minderheitshypothesen behalten (Preprint: Verfestigung), jeder Lauf hinterlässt ein
+  lesbares Log, alles per `brain_restore_page` rückholbar. **Auslösung (Nutzerentscheidung
+  06.10.): kein Zeitplan.** Der Nutzer triggert die REM-Phase bei Gelegenheit selbst — im
+  Client per Prompt-Template `dream` oder schlicht „träum mal" an den Agenten, der dann
+  `brain_dream_queue` liest; wer automatisieren will, kann es (z. B. `/schedule`), BRAIN
+  setzt es nicht voraus. Damit die Queue jederzeit frisch ist, erzeugt BRAIN sie nicht nur
+  nachts, sondern auch **on demand**: Tool `brain_dream_queue` (gibt die aktuelle Queue
+  zurück, rechnet sie neu, wenn älter als 1 h) — so braucht ein spontaner Traum keinen
+  vorherigen Tiefschlaf-Lauf.
+- H3 **Salienz**: Tabelle `page_access(page_id, reads, last_read_at, search_hits)`;
+  Hooks in `brain_get_page(s)`, `brain_get_context` (reads) und `brain_search` (Treffer in
+  Top-10). `brain_query` erhält `sort:salience`; Audit/Traumqueue nutzen sie. Keine
+  Zeitstempel ins Frontmatter (würde Commits erzeugen) — nur DB, lokal, nicht gesynct.
+- H4 (später, optional) lokaler LLM-Provider (Ollama) ausschließlich für
+  `summary`-Erzeugung innerhalb von BRAIN, Flag-gesteuert; erst wenn H2 im Alltag läuft.
+
+**Akzeptanzkriterien**
+- Nach einem Mount + 24 h existieren `00_meta/audit/<datum>.md` und `dream-queue.md`; die
+  Queue nennt pro Eintrag Typ, Seiten-ids, Grund und die empfohlene Operation.
+- Eine Seite, die der Agent dreimal liest, hat `reads = 3` in `page_access`; `brain_query
+  sort:salience` sortiert sie nach vorn.
+- Ein simulierter Traum-Lauf (Test: Queue mit einem Dubletten-Paar → `brain_merge_pages`)
+  reduziert die Queue beim nächsten Tiefschlaf um genau diesen Eintrag.
+
+**Aufwand:** H1 S–M, H2 S, H3 S. **Risiko:** gering (alles additiv, nichts löscht).
+**Release:** 0.3.5 (H1–H3), H4 offen.
+
+---
+
 ## Slice G — Infrastruktur-Optionen (nur bei Bedarf)
 
 - G1 **Graph-Nachbarn im Retrieval** (Recherche B7, HippoRAG-light): Treffer um direkte
@@ -284,11 +347,19 @@ Reranker ist optional und austauschbar, da er keine Vektoren persistiert).
 
 | Release | Inhalt | Begründung |
 |---|---|---|
-| **0.3.5** | Contextual Chunking (committed) + Slice A (Hygiene) + G4 Batch-Rebuild + Slice 0.1–0.2 (Spec-Abgleich, Client-Versionen loggen) | Behebt die heute spürbaren Schmerzen: Suche-Qualität, Rename/Delete-Lücke, Blockieren beim Re-Index; Protokoll-Risiko wird sichtbar |
-| **0.3.6** | Slice B (Eval + `summary`) + Slice C (Gültigkeit/Provenienz) + Slice 0.3 (Dual-Version-MCP) | Macht Qualität messbar und das Wiki zeitlich korrekt; Server spricht alte und neue Spec |
-| **0.4.0** | Slice D (MCP straffen, Breaking) | Eigenes Minor-Release mit Migrations-Mapping |
-| **0.4.x** | Slice E (Reranker, gated) + Slice F (Viewer) | Erst nach Messung bzw. wenn der menschliche Nutzer es braucht |
-| offen | Slice G | nur bei konkretem Bedarf |
+**Nutzerentscheidung 06.10.: eine große Version statt mehrerer kleiner.**
+
+| Release | Inhalt | Begründung |
+|---|---|---|
+| **0.3.5** | Contextual Chunking + Rename/Delete/Merge (committed) · **Slice 0** (Spec-Abgleich, Versions-Logging, Dual-Version-Server) · **Slice A** (Aliases/Dublettenprüfung, Hygiene-Lint, Audit-Report, Index-Konsistenz) · **Slice B** (Eval + `summary`) · **Slice C** (Gültigkeit/Provenienz) · **Slice D** (MCP straffen, ohne Übergangsfrist) · **Slice H1–H3** (Traumqueue, Traum-Protokoll, Salienz) · **G4** Batch-Rebuild | Alles, was ohne Messdaten gebaut werden kann; Agenten lesen `tools/list` pro Sitzung, daher kein Alias-Zwischenschritt |
+| **0.3.6** | Slice E (Reranker, gated durch Eval-Zahlen aus B1) + Slice F (Viewer: ähnliche Seiten, Tabellen) + H4 (lokaler LLM-Provider, optional) | Erst nach Messung bzw. Alltagserfahrung mit dem Traum-Protokoll |
+| offen | Slice G (Graph-Nachbarn, geteilter Daemon, Quantisierung) | nur bei konkretem Bedarf |
+
+**Umsetzungswellen für 0.3.5** (sequenziell, weil `mcp/server.rs` von fast allem berührt wird):
+1. Welle 1 (läuft): A3 + A5 + G4 · Slice 0.1–0.2 + Design 0.3
+2. Welle 2: A2 Aliases/Dublettenprüfung · Slice B (`brain eval`, `summary`) · Slice C · H3 Salienz · H1 Traumqueue
+3. Welle 3: Slice D (Tools straffen, Prompts inkl. `dream`, Resources, SKILL.md) · Slice 0.3 Dual-Version · H2 Traum-Protokoll in AGENTS.md
+4. Review je Welle, dann CHANGELOG konsolidieren, Version 0.3.5, Tag, Release.
 
 ## Nicht in diesem Plan (bewusst)
 

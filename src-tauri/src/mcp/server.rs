@@ -200,6 +200,12 @@ pub fn run_stdio() -> std::io::Result<()> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
+    // One log line per process naming the protocol version + client the
+    // peer declared (see `client_declaration`). Flips to true after the
+    // first declaring request, so the extra `Value` parse below runs for
+    // at most the first few lines — never for the bulk of tool calls.
+    let mut client_declaration_logged = false;
+
     for line in stdin.lock().lines() {
         // Every exit path says why on stderr. Silent exits were exactly
         // what made intermittent disconnects undiagnosable in the wild.
@@ -212,6 +218,18 @@ pub fn run_stdio() -> std::io::Result<()> {
         };
         if line.trim().is_empty() {
             continue;
+        }
+        // Cheap substring pre-filter: both the legacy `initialize` params
+        // and the 2026-07-28 `_meta` key contain "protocolVersion".
+        if !client_declaration_logged && line.contains("protocolVersion") {
+            if let Some(decl) = serde_json::from_str::<Value>(&line)
+                .ok()
+                .as_ref()
+                .and_then(client_declaration)
+            {
+                decl.log();
+                client_declaration_logged = true;
+            }
         }
         // NO pre-flight DB/vault probe here (removed in 0.2.20). The
         // v0.2.19 version ran `is_vault` + a `SELECT 1` liveness probe
@@ -349,8 +367,106 @@ fn handle_request(
             }
         }
         "ping" => ok_response(&id, json!({})),
+        "server/discover" => {
+            tracing::info!(
+                "mcp: client probed server/discover (MCP 2026-07-28) — answering -32601 so a \
+                 dual-era client falls back to the initialize handshake"
+            );
+            error_response(&id, -32601, &server_discover_unsupported_message(), None)
+        }
         _ => error_response(&id, -32601, &format!("method not found: {}", req.method), None),
     }
+}
+
+/// The 2026-07-28 MCP revision ("stateless") added `server/discover`. We
+/// still speak the legacy, `initialize`-based revision, so we answer the
+/// probe with a plain `-32601`. Per the 2026-07-28 stdio binding
+/// ("Backward Compatibility"), a dual-era client treats any error that is
+/// NOT a recognised modern error (e.g. `-32022` UnsupportedProtocolVersion)
+/// as "legacy server" and falls back to `initialize` — so this code must
+/// stay a non-modern one. The message only makes the failure diagnosable
+/// for a modern-only client and in its log.
+fn server_discover_unsupported_message() -> String {
+    format!(
+        "server/discover (MCP 2026-07-28) not yet supported — this server speaks \
+         {PROTOCOL_VERSION}; please use the initialize handshake"
+    )
+}
+
+/// What a client declared about itself on the wire: the protocol version
+/// it speaks and its `clientInfo`. Logged once per process so a client
+/// switching protocol revisions shows up in the MCP log instead of as a
+/// silent failure.
+#[derive(Debug, PartialEq)]
+struct ClientDeclaration {
+    /// `"initialize"` (legacy handshake) or `"per-request"` (2026-07-28
+    /// stateless style, version carried on an ordinary request).
+    style: &'static str,
+    method: String,
+    protocol_version: String,
+    client_name: String,
+    client_version: String,
+}
+
+impl ClientDeclaration {
+    fn log(&self) {
+        tracing::info!(
+            style = self.style,
+            method = %self.method,
+            client_protocol_version = %self.protocol_version,
+            client_name = %self.client_name,
+            client_version = %self.client_version,
+            server_protocol_version = PROTOCOL_VERSION,
+            "mcp: client declared its protocol version"
+        );
+    }
+}
+
+/// Extracts the client's declared protocol version + identity from a raw
+/// JSON-RPC envelope. Null-safe: missing fields become `"<none>"`.
+///
+/// - `initialize` (legacy): `params.protocolVersion`, `params.clientInfo`.
+///   Always yields a declaration, even with empty params.
+/// - any other request (2026-07-28 style): the spec location is
+///   `params._meta["io.modelcontextprotocol/protocolVersion"]` (+
+///   `…/clientInfo`); `params.protocolVersion` and a top-level
+///   `protocolVersion` are accepted too, for non-conforming clients.
+///   Yields `None` when no version is present anywhere.
+fn client_declaration(envelope: &Value) -> Option<ClientDeclaration> {
+    const META_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+    const META_CLIENT: &str = "io.modelcontextprotocol/clientInfo";
+    let method = envelope.get("method").and_then(Value::as_str)?;
+    let params = envelope.get("params");
+    let meta = params.and_then(|p| p.get("_meta"));
+    let text = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| "<none>".to_string())
+    };
+    let (style, version, client_info) = if method == "initialize" {
+        (
+            "initialize",
+            params.and_then(|p| p.get("protocolVersion")),
+            params.and_then(|p| p.get("clientInfo")),
+        )
+    } else {
+        let version = meta
+            .and_then(|m| m.get(META_VERSION))
+            .or_else(|| params.and_then(|p| p.get("protocolVersion")))
+            .or_else(|| envelope.get("protocolVersion"))?;
+        let client_info = meta
+            .and_then(|m| m.get(META_CLIENT))
+            .or_else(|| params.and_then(|p| p.get("clientInfo")))
+            .or_else(|| envelope.get("clientInfo"));
+        ("per-request", Some(version), client_info)
+    };
+    Some(ClientDeclaration {
+        style,
+        method: method.to_string(),
+        protocol_version: text(version),
+        client_name: text(client_info.and_then(|c| c.get("name"))),
+        client_version: text(client_info.and_then(|c| c.get("version"))),
+    })
 }
 
 /// The `brain_ping` payload. Pure in-memory — server identity, compiled
@@ -825,7 +941,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "brain_lint_report",
-            "description": "Return the current lint state of the wiki as { errors, warnings } — both are arrays of { path, kind, message }. Errors block auto-commits, warnings don't. Common warning kinds you should fix in place via brain_write_page: 'unregistered-type' (frontmatter type isn't one of entity/concept/source/topic — usually a plural slipped in), 'missing-title', 'non-canonical-wiki-link'. Common error kinds: 'frontmatter' (malformed YAML), 'duplicate-id' (two files share an id), 'broken-link' (wiki link points at a missing page). Use this when the user asks you to clean up the wiki: loop through the report, fix each entry, then call again until clean.",
+            "description": "Return the current lint state of the wiki as { errors, warnings } — both are arrays of { path, kind, message }. Errors block auto-commits, warnings don't. Common warning kinds you should fix in place via brain_write_page: 'unregistered-type' (frontmatter type isn't one of entity/concept/source/topic — usually a plural slipped in), 'missing-title', 'non-canonical-wiki-link'. Common error kinds: 'frontmatter' (malformed YAML), 'duplicate-id' (two files share an id), 'broken-link' (wiki link points at a missing page; `[[id#heading]]` resolves to `id`). Hygiene warnings (advice, never block commits): 'orphan' (no other page links here and the file is unchanged for 90+ days — link it from a related page, merge it or delete it), 'duplicate-candidate' (two pages of the same type are semantically near-identical, score in the message — fold one into the other with brain_merge_pages if they describe the same thing). An optional `notes` array carries info that is not a page finding (e.g. duplicate detection skipped because the embedding model is missing). Use this when the user asks you to clean up the wiki: loop through the report, fix each entry, then call again until clean.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -1448,7 +1564,20 @@ fn call_tool(
             // both here lets an agent triage which to fix first — and
             // closes the loop where the user could see a `wiki-lint-
             // error` toast but the LLM had no MCP path to inspect it.
-            let report = lint::lint(vault).map_err(|e| e.to_string())?;
+            // Plus the hygiene warnings (orphan, duplicate-candidate) and
+            // info `notes`; the watcher's pre-commit gate keeps the fast
+            // filesystem-only lint. The index reads go through db_op
+            // (lazy open, timeout, reopen); if they fail, a
+            // `hygiene-skipped` note says why instead of the hygiene
+            // findings silently going missing.
+            let mut report = lint::lint(vault).map_err(|e| e.to_string())?;
+            let rows = db_op(
+                db,
+                vault,
+                "brain_lint_report",
+                crate::wiki::hygiene::load_rows,
+            );
+            lint::add_hygiene(&mut report, vault, rows);
             Ok(serde_json::to_string_pretty(&report).unwrap_or_default())
         }
         other => Err(format!("unknown tool: {other}")),
@@ -1961,6 +2090,86 @@ mod tests {
         };
         let resp = handle_request(&req, None, &mut None);
         assert!(resp.contains("method not found"));
+        assert!(
+            !resp.contains("server/discover"),
+            "a generic unknown method must keep the generic message: {resp}"
+        );
+    }
+
+    #[test]
+    fn server_discover_gets_a_specific_method_not_found_naming_our_protocol_version() {
+        let req = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!("discover-1")),
+            method: "server/discover".into(),
+            params: json!({ "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }}),
+        };
+        let resp: Value = serde_json::from_str(&handle_request(&req, None, &mut None)).unwrap();
+        // -32601 (not a modern code such as -32022): a dual-era client must
+        // read this as "legacy server" and fall back to `initialize`.
+        assert_eq!(resp["error"]["code"], -32601);
+        assert_eq!(resp["id"], "discover-1");
+        let msg = resp["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("server/discover (MCP 2026-07-28) not yet supported"), "{msg}");
+        assert!(msg.contains(PROTOCOL_VERSION), "{msg}");
+        assert!(msg.contains("initialize handshake"), "{msg}");
+    }
+
+    #[test]
+    fn client_declaration_reads_version_and_client_info_from_initialize_params() {
+        let env = json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25",
+            "clientInfo": {"name": "claude-code", "version": "2.1.0"}
+        }});
+        let decl = client_declaration(&env).unwrap();
+        assert_eq!(decl.style, "initialize");
+        assert_eq!(decl.protocol_version, "2025-11-25");
+        assert_eq!(decl.client_name, "claude-code");
+        assert_eq!(decl.client_version, "2.1.0");
+    }
+
+    #[test]
+    fn client_declaration_is_null_safe_for_an_initialize_without_params() {
+        let env = json!({"jsonrpc": "2.0", "id": 0, "method": "initialize"});
+        let decl = client_declaration(&env).unwrap();
+        assert_eq!(decl.protocol_version, "<none>");
+        assert_eq!(decl.client_name, "<none>");
+        assert_eq!(decl.client_version, "<none>");
+    }
+
+    #[test]
+    fn client_declaration_reads_the_2026_07_28_meta_keys_on_an_ordinary_request() {
+        let env = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {"name": "codex", "version": "0.9"},
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        }});
+        let decl = client_declaration(&env).unwrap();
+        assert_eq!(decl.style, "per-request");
+        assert_eq!(decl.method, "tools/list");
+        assert_eq!(decl.protocol_version, "2026-07-28");
+        assert_eq!(decl.client_name, "codex");
+        assert_eq!(decl.client_version, "0.9");
+    }
+
+    #[test]
+    fn client_declaration_accepts_a_top_level_protocol_version_without_client_info() {
+        let env = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "protocolVersion": "2026-07-28", "params": {"name": "brain_ping"}});
+        let decl = client_declaration(&env).unwrap();
+        assert_eq!(decl.protocol_version, "2026-07-28");
+        assert_eq!(decl.client_name, "<none>");
+    }
+
+    #[test]
+    fn client_declaration_is_none_for_a_legacy_request_after_the_handshake() {
+        let env = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}});
+        assert_eq!(client_declaration(&env), None);
     }
 
     #[test]

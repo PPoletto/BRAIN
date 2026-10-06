@@ -219,6 +219,25 @@ pub async fn download_embedding_model(app: AppHandle, path: String) -> BrainResu
     .await
     .map_err(|e| BrainError::Internal(format!("download task panicked: {e}")))??;
 
+    // The index still holds vectors from the hashed fallback. Mark every
+    // page stale so the next re-index (watcher commit or next mount)
+    // re-embeds the vault with the model — resumable, in batches — and
+    // records `index_embedder = bge-m3`, which turns on duplicate
+    // detection. Only for the mounted vault; a vault that is not open yet
+    // gets its first index from the model anyway.
+    if let Some(state) = tauri::Manager::try_state::<Arc<crate::state::AppState>>(&app) {
+        if state.vault_path().as_deref() == Some(p.as_path()) {
+            if let Some(db) = state.db() {
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(err) = db.with(crate::db::pages_index::invalidate_all_pages) {
+                        tracing::warn!(?err, "could not mark the index for re-embedding");
+                    }
+                })
+                .await;
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -465,6 +484,9 @@ fn spawn_bootstrap_background_work(
     vault: PathBuf,
 ) {
     spawn_embedder_warm_up(state.clone(), vault.clone());
+    // Daily wiki audit → 00_meta/audit/<date>.md (first run shortly after
+    // this re-index). Replaces (aborts) the scheduler of a previous mount.
+    state.set_audit_task(Some(crate::wiki::audit::spawn(state.clone(), vault.clone())));
 
     std::thread::spawn(move || {
         const OP: &str = "Preparing the vault (index + MCP)";
@@ -476,7 +498,12 @@ fn spawn_bootstrap_background_work(
         let _guard = OpGuard { state: &state };
 
         if let Some(db) = state.db() {
-            if let Err(err) = crate::db::pages_index::rebuild(&db, &vault) {
+            // Batch progress → "Preparing the vault (index + MCP) (120/843)"
+            // in the tray tooltip while a re-embed runs.
+            let progress = |done: usize, total: usize| state.set_op_progress(OP, done, total);
+            if let Err(err) =
+                crate::db::pages_index::rebuild_with_progress(&db, &vault, Some(&progress))
+            {
                 tracing::warn!(?err, "background rebuild after bootstrap failed");
             }
         }

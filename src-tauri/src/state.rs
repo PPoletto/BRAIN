@@ -1,5 +1,6 @@
 //! Application-wide state held in a shared `Arc<AppState>`.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::RwLock;
 
@@ -7,6 +8,7 @@ use crate::config::ConfigStore;
 use crate::db::DbHandle;
 use crate::mcp::registration::RegistrationReport;
 use crate::onboarding::disks::DiskInfo;
+use crate::wiki::audit::AuditHandle;
 use crate::wiki::auto_sync::AutoSyncHandle;
 use crate::wiki::watcher::WikiWatcher;
 
@@ -31,6 +33,21 @@ impl MountState {
     }
 }
 
+/// Everything the "what's running?" display needs, behind one lock.
+#[derive(Default)]
+struct OpsState {
+    /// Blocking operations (one entry per active op). The length is the
+    /// "N ops active" count — the unmount gate refuses while it is > 0.
+    labels: Vec<String>,
+    /// Non-blocking background tasks (e.g. the daily audit): shown with
+    /// the other labels, but never counted by [`AppState::active_ops`], so
+    /// they do not hold up an unmount.
+    background: Vec<String>,
+    /// `(done, total)` per active op label, shown as a suffix
+    /// ("Rebuilding the index (120/843)").
+    progress: HashMap<String, (usize, usize)>,
+}
+
 pub struct AppState {
     pub config: ConfigStore,
     mount: RwLock<MountState>,
@@ -38,10 +55,10 @@ pub struct AppState {
     db: RwLock<Option<DbHandle>>,
     last_registration: RwLock<Option<RegistrationReport>>,
     disk_cache: RwLock<Option<Vec<DiskInfo>>>,
-    /// Labels of the operations currently in flight (one entry per active
-    /// op). The length is the "N ops active" count; the labels let the
-    /// tray/UI show *what* is running on hover.
-    ops: RwLock<Vec<String>>,
+    /// Operations in flight, their progress and the background tasks —
+    /// ONE lock for all of it, so no two locks are ever taken in
+    /// different orders (the tray polls the labels constantly).
+    ops: RwLock<OpsState>,
     /// The running wiki file-watcher, kept so operations that rewrite the
     /// working tree in bulk (e.g. the encrypt/convert step) can pause it
     /// — abort, do the work, respawn — instead of racing its auto-commit.
@@ -49,6 +66,9 @@ pub struct AppState {
     /// The running auto-sync scheduler (S11 phase 6), if enabled. Kept so
     /// it can be aborted on unmount or when auto-sync is toggled off.
     auto_sync_task: RwLock<Option<AutoSyncHandle>>,
+    /// The running daily wiki-audit scheduler (A5), replaced on every
+    /// mount so a remount never leaves two schedulers behind.
+    audit_task: RwLock<Option<AuditHandle>>,
     /// Wakes the auto-sync scheduler early. The watcher nudges this after
     /// every successful auto-commit so local edits reach the remote within
     /// seconds instead of waiting out the polling interval (which remains
@@ -72,9 +92,10 @@ impl AppState {
             db: RwLock::new(None),
             last_registration: RwLock::new(None),
             disk_cache: RwLock::new(None),
-            ops: RwLock::new(Vec::new()),
+            ops: RwLock::new(OpsState::default()),
             watcher: RwLock::new(None),
             auto_sync_task: RwLock::new(None),
+            audit_task: RwLock::new(None),
             sync_nudge: tokio::sync::Notify::new(),
         }
     }
@@ -93,6 +114,15 @@ impl AppState {
     /// Store the running auto-sync scheduler, aborting any previous one.
     pub fn set_auto_sync_task(&self, task: Option<AutoSyncHandle>) {
         let mut guard = self.auto_sync_task.write().expect("auto_sync_task write lock");
+        if let Some(old) = guard.take() {
+            old.abort();
+        }
+        *guard = task;
+    }
+
+    /// Store the running audit scheduler, aborting any previous one.
+    pub fn set_audit_task(&self, task: Option<AuditHandle>) {
+        let mut guard = self.audit_task.write().expect("audit_task write lock");
         if let Some(old) = guard.take() {
             old.abort();
         }
@@ -176,30 +206,78 @@ impl AppState {
     }
 
     /// Start an operation with a human label (e.g. "Syncing with the
-    /// remote"). Pair with [`end_op`] using the SAME label.
+    /// remote"). Pair with [`end_op`] using the SAME label. Clears any
+    /// stale progress recorded for that label.
     pub fn begin_op(&self, label: &str) {
-        self.ops.write().expect("ops write lock").push(label.to_string());
+        let mut ops = self.ops.write().expect("ops write lock");
+        ops.progress.remove(label);
+        ops.labels.push(label.to_string());
     }
 
     /// End an operation started with [`begin_op`]. Removes one entry with
-    /// the matching label.
+    /// the matching label (and its progress once no such op is left).
     pub fn end_op(&self, label: &str) {
         let mut ops = self.ops.write().expect("ops write lock");
-        if let Some(pos) = ops.iter().position(|l| l == label) {
-            ops.remove(pos);
+        if let Some(pos) = ops.labels.iter().position(|l| l == label) {
+            ops.labels.remove(pos);
         } else {
             debug_assert!(false, "end_op without matching begin_op: {label}");
         }
+        if !ops.labels.iter().any(|l| l == label) {
+            ops.progress.remove(label);
+        }
     }
 
+    /// Report progress of the running op `label` (e.g. pages re-indexed so
+    /// far). Shown as a `(done/total)` suffix on the label; the begin/end
+    /// pairing keeps using the bare label. Ignored unless an op with that
+    /// label is active, so a late report cannot leave a stale suffix.
+    pub fn set_op_progress(&self, label: &str, done: usize, total: usize) {
+        let mut ops = self.ops.write().expect("ops write lock");
+        if ops.labels.iter().any(|l| l == label) {
+            ops.progress.insert(label.to_string(), (done, total));
+        }
+    }
+
+    /// Start a NON-blocking background task: listed in
+    /// [`AppState::active_op_labels`] but not counted by
+    /// [`AppState::active_ops`] (the unmount gate). Pair with
+    /// [`AppState::end_background_op`] using the same label.
+    pub fn begin_background_op(&self, label: &str) {
+        self.ops
+            .write()
+            .expect("ops write lock")
+            .background
+            .push(label.to_string());
+    }
+
+    /// End a task started with [`AppState::begin_background_op`].
+    pub fn end_background_op(&self, label: &str) {
+        let mut ops = self.ops.write().expect("ops write lock");
+        if let Some(pos) = ops.background.iter().position(|l| l == label) {
+            ops.background.remove(pos);
+        } else {
+            debug_assert!(false, "end_background_op without matching begin: {label}");
+        }
+    }
+
+    /// Number of BLOCKING ops in flight (background tasks excluded).
     pub fn active_ops(&self) -> u32 {
-        self.ops.read().expect("ops read lock").len() as u32
+        self.ops.read().expect("ops read lock").labels.len() as u32
     }
 
-    /// Labels of the operations currently in flight, for the tray/UI
-    /// tooltip ("what's running?").
+    /// Labels of the operations and background tasks currently in flight,
+    /// for the tray/UI tooltip ("what's running?").
     pub fn active_op_labels(&self) -> Vec<String> {
-        self.ops.read().expect("ops read lock").clone()
+        let ops = self.ops.read().expect("ops read lock");
+        ops.labels
+            .iter()
+            .map(|label| match ops.progress.get(label) {
+                Some((done, total)) => format!("{label} ({done}/{total})"),
+                None => label.clone(),
+            })
+            .chain(ops.background.iter().cloned())
+            .collect()
     }
 }
 
@@ -233,6 +311,104 @@ mod tests {
         assert_eq!(s.active_op_labels(), vec!["Rebuilding index"]);
         s.end_op("Rebuilding index");
         assert_eq!(s.active_ops(), 0);
+    }
+
+    #[test]
+    fn active_op_label_shows_the_reported_progress_as_done_over_total() {
+        let s = AppState::new();
+        s.begin_op("Rebuilding the index");
+        s.set_op_progress("Rebuilding the index", 120, 843);
+        assert_eq!(s.active_op_labels(), vec!["Rebuilding the index (120/843)"]);
+    }
+
+    #[test]
+    fn ending_an_op_forgets_its_progress_for_the_next_run() {
+        let s = AppState::new();
+        s.begin_op("Rebuilding the index");
+        s.set_op_progress("Rebuilding the index", 50, 100);
+        s.end_op("Rebuilding the index");
+        s.begin_op("Rebuilding the index");
+        assert_eq!(s.active_op_labels(), vec!["Rebuilding the index"]);
+    }
+
+    #[test]
+    fn progress_reported_for_an_op_that_is_not_running_is_ignored() {
+        let s = AppState::new();
+        s.set_op_progress("Rebuilding the index", 5, 10);
+        s.begin_op("Rebuilding the index");
+        assert_eq!(s.active_op_labels(), vec!["Rebuilding the index"]);
+    }
+
+    #[test]
+    fn a_background_task_is_listed_but_does_not_count_as_an_active_op() {
+        let s = AppState::new();
+        s.begin_background_op("Running the wiki audit");
+        assert_eq!(
+            (s.active_ops(), s.active_op_labels()),
+            (0, vec!["Running the wiki audit".to_string()])
+        );
+    }
+
+    #[test]
+    fn ending_a_background_task_removes_its_label() {
+        let s = AppState::new();
+        s.begin_background_op("Running the wiki audit");
+        s.end_background_op("Running the wiki audit");
+        assert!(s.active_op_labels().is_empty());
+    }
+
+    #[test]
+    fn op_bookkeeping_from_two_threads_at_once_does_not_deadlock() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let s = Arc::new(AppState::new());
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let spawn = |label: &'static str| {
+            let s = s.clone();
+            std::thread::spawn(move || {
+                while Instant::now() < deadline {
+                    s.begin_op(label);
+                    s.set_op_progress(label, 1, 2);
+                    let _ = s.active_op_labels();
+                    s.end_op(label);
+                    let _ = s.active_op_labels();
+                }
+            })
+        };
+        let workers = [spawn("a"), spawn("b")];
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for w in workers {
+                let _ = w.join();
+            }
+            let _ = tx.send(());
+        });
+        assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok(), "op bookkeeping deadlocked");
+    }
+
+    #[test]
+    fn set_audit_task_aborts_the_previous_scheduler() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flag = DropFlag(dropped.clone());
+        let s = AppState::new();
+        s.set_audit_task(Some(AuditHandle::from_future(async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+        })));
+        s.set_audit_task(Some(AuditHandle::from_future(std::future::pending::<()>())));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !dropped.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(dropped.load(Ordering::SeqCst));
     }
 
     #[test]

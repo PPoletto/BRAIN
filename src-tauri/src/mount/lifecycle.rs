@@ -82,6 +82,7 @@ pub fn handle_vault_disappearance(state: &AppState) -> bool {
     if crate::vault::layout::is_vault(&vault) {
         return false;
     }
+    state.set_audit_task(None);
     state.set_db(None);
     state.set_mount(MountState::Disconnected);
     state.set_vault_path(None);
@@ -134,6 +135,7 @@ pub fn unmount(state: &AppState, force: bool) -> MountResult<()> {
         UncleanFlag::clear(&vault).ok();
     }
 
+    state.set_audit_task(None);
     state.set_vault_path(None);
     state.set_mount(MountState::Disconnected);
     // Release the ~2.2 GB bge-m3 model on a deliberate unmount. Off the

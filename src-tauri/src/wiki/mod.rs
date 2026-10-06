@@ -3,11 +3,13 @@
 //! Provides Git initialization with platform-tolerant config, an auto-commit
 //! pipeline, lint, history reading, restore and hard-reset.
 
+pub mod audit;
 pub mod auto_sync;
 pub mod commands;
 pub mod encryption;
 pub mod git;
 pub mod history;
+pub mod hygiene;
 pub mod lint;
 pub mod meta_files;
 pub mod page;

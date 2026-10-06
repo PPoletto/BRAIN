@@ -89,9 +89,10 @@ pub fn query_pages(
 /// automatically. Surfaced as a Settings button so a manual rebuild is
 /// possible after editing pages outside the watcher (rare).
 ///
-/// Resets the stored index_format_version to 0 inside the rebuild
-/// transaction's view, which makes the indexer treat every page as
-/// stale-by-format and bypass the file_hash skip-fast-path for this run.
+/// Clears every page's stored file_hash first, which makes the indexer
+/// treat every page as stale and bypass the file_hash skip-fast-path for
+/// this run (an interrupted forced run resumes like a format upgrade).
+/// Reports batch progress on the op label ("… (120/843)").
 #[tauri::command]
 pub async fn rebuild_index(
     state: State<'_, Arc<crate::state::AppState>>,
@@ -100,23 +101,28 @@ pub async fn rebuild_index(
     let db = state
         .db()
         .ok_or_else(|| BrainError::Internal("no SQLite index is open".into()))?;
-    state.begin_op("Rebuilding the search index");
+    const OP: &str = "Rebuilding the search index";
+    state.begin_op(OP);
+    // Ends the op on every path — also when the rebuild task panics (a
+    // failing embedder) and the `?` below returns early.
+    struct OpGuard(Arc<crate::state::AppState>);
+    impl Drop for OpGuard {
+        fn drop(&mut self) {
+            self.0.end_op(OP);
+        }
+    }
+    let op_guard = OpGuard(state.inner().clone());
+    let progress_state = state.inner().clone();
     let result = tokio::task::spawn_blocking(move || {
-        // Force-bypass the format version skip-fast-path by clearing the
-        // stored marker before the rebuild. The rebuild itself writes
-        // back the current version on success.
-        let _ = db.with(|conn| {
-            let _ = conn.execute(
-                "UPDATE schema_meta SET value='0' WHERE key='index_format_version'",
-                [],
-            );
-            Ok(())
-        });
-        crate::db::pages_index::rebuild(&db, &vault)
+        // Force-bypass the skip-fast-path by clearing every page's stored
+        // hash before the rebuild.
+        db.with(crate::db::pages_index::invalidate_all_pages)?;
+        let progress = |done: usize, total: usize| progress_state.set_op_progress(OP, done, total);
+        crate::db::pages_index::rebuild_with_progress(&db, &vault, Some(&progress))
     })
     .await
     .map_err(|e| BrainError::Internal(format!("rebuild task panicked: {e}")))?;
-    state.end_op("Rebuilding the search index");
+    drop(op_guard);
     result.map_err(|e| BrainError::Internal(format!("rebuild failed: {e}")))?;
     // Page count for the toast confirmation.
     let count = state

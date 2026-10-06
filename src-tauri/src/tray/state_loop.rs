@@ -32,6 +32,9 @@ pub fn spawn<R: Runtime>(app: AppHandle<R>, state: Arc<AppState>) {
         let mut last_busy_at: Option<Instant> = None;
         let mut last_tag: String = String::new();
         let mut last_active_ops: u32 = u32::MAX;
+        // Labels change without the count changing (batch progress
+        // "(120/843)", background tasks like the audit) — re-emit then too.
+        let mut last_labels: Vec<String> = Vec::new();
         let mut last_disappearance_check = Instant::now();
         loop {
             let now = Instant::now();
@@ -86,8 +89,9 @@ pub fn spawn<R: Runtime>(app: AppHandle<R>, state: Arc<AppState>) {
             let tray_state = derive(&state, last_busy_at, now);
             let tag = tray_state.tag().to_string();
             let active = state.active_ops();
+            let labels = state.active_op_labels();
 
-            if tag != last_tag || active != last_active_ops {
+            if tag != last_tag || active != last_active_ops || labels != last_labels {
                 if let Some(tray) = app.tray_by_id("brain-tray") {
                     let _ = tray.set_tooltip(Some(tray_state.tooltip()));
                     if let Ok(img) = IconKind::from_tag(&tag).image() {
@@ -101,11 +105,12 @@ pub fn spawn<R: Runtime>(app: AppHandle<R>, state: Arc<AppState>) {
                         "tooltip": tray_state.tooltip(),
                         "vault_path": state.vault_path().map(|p| p.display().to_string()),
                         "active_operations": active,
-                        "active_operation_labels": state.active_op_labels(),
+                        "active_operation_labels": labels.clone(),
                     }),
                 );
                 last_tag = tag;
                 last_active_ops = active;
+                last_labels = labels;
             }
             tokio::time::sleep(POLL_INTERVAL).await;
         }
@@ -126,6 +131,7 @@ fn finish_auto_reconnect<R: Runtime>(
     }
     let inner_state = state.clone();
     let _ = crate::wiki::watcher::spawn(app.clone(), inner_state, path.clone());
+    state.set_audit_task(Some(crate::wiki::audit::spawn(state.clone(), path.clone())));
 
     // Re-register MCP. The binary path may have changed since the user
     // last connected the disk (e.g. they upgraded BRAIN), so refreshing
@@ -160,7 +166,13 @@ fn finish_auto_reconnect<R: Runtime>(
         impl Drop for Guard<'_> { fn drop(&mut self) { self.s.end_op(OP); } }
         let _g = Guard { s: &state_for_rebuild };
         if let Some(db) = state_for_rebuild.db() {
-            if let Err(err) = crate::db::pages_index::rebuild(&db, &path_for_rebuild) {
+            let progress =
+                |done: usize, total: usize| state_for_rebuild.set_op_progress(OP, done, total);
+            if let Err(err) = crate::db::pages_index::rebuild_with_progress(
+                &db,
+                &path_for_rebuild,
+                Some(&progress),
+            ) {
                 tracing::warn!(?err, "pages_index rebuild on auto-reconnect failed");
             }
         }

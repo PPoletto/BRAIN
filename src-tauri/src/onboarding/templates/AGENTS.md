@@ -213,6 +213,29 @@ out of your write response — fetch them on demand via `brain_lint_report`.
 You do not need to mentally filter "is this error from my current write
 or from something earlier in the session" — the server already did it.
 
+### Scheduled Audit
+
+Once a day BRAIN audits the whole wiki and writes the result to
+`00_meta/audit/<YYYY-MM-DD>.md` (one file per day; read-only for you).
+At the **start of a maintenance session** ("clean up the wiki", "tidy
+my notes"), read the newest file in `00_meta/audit/` — or, if you cannot
+read vault files directly, call `brain_lint_report`, which returns the
+same findings live — and work through it:
+
+- `duplicate-candidate` — two pages of the same type that read almost
+  the same (similarity score in the message). Open both; if they
+  describe the same thing, `brain_merge_pages` the weaker into the
+  stronger. If they are genuinely different, leave them.
+- `orphan` — no other page links here and it has not changed for 90+
+  days. Link it from a related page, merge it into one, or — if it is
+  junk — `brain_delete_page` it.
+- `broken-link` — a link to a page that does not exist. Fix the link,
+  create the missing page, or `brain_rename_page` the page that was
+  meant.
+
+Confirm with the user before merging or deleting pages they wrote
+themselves. The next day's audit shows what is left.
+
 ## Commit Behavior
 
 BRAIN runs an auto-commit watcher that debounces file changes by 5 seconds

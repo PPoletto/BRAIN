@@ -4,6 +4,10 @@
 //! - Git: walk the wiki repo's object database for corruption.
 //! - SQLite: `PRAGMA integrity_check`.
 //! - Filesystem ↔ DB: spot-check that the indexed pages still exist on disk.
+//!
+//! Plus, informational only, the wiki hygiene lint (`lint_with_index`):
+//! its findings are shown on the Integrity page but never make the report
+//! unclean or trigger a recovery action.
 
 use std::path::Path;
 
@@ -19,6 +23,10 @@ pub struct IntegrityReport {
     pub db: CheckResult,
     pub pages: CheckResult,
     pub suggestions: Vec<RecoveryAction>,
+    /// Wiki lint incl. the index-backed hygiene rules (orphans, duplicate
+    /// candidates). `None` when the lint itself failed. Does not affect
+    /// `clean`.
+    pub hygiene: Option<crate::wiki::lint::LintReport>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -72,12 +80,21 @@ pub fn check(vault: &Path, db: Option<&DbHandle>) -> IntegrityReport {
 
     let clean = !git.is_problem() && !db_check.is_problem() && !pages.is_problem();
 
+    let hygiene = match crate::wiki::lint::lint_with_index(vault, db) {
+        Ok(report) => Some(report),
+        Err(err) => {
+            tracing::warn!(?err, "integrity: wiki lint failed");
+            None
+        }
+    };
+
     IntegrityReport {
         clean,
         git,
         db: db_check,
         pages,
         suggestions,
+        hygiene,
     }
 }
 
@@ -199,5 +216,45 @@ mod tests {
             .suggestions
             .iter()
             .any(|s| s.id == "rebuild-pages-index"));
+    }
+
+    #[test]
+    fn check_includes_the_wiki_hygiene_report() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        let db = crate::db::DbHandle::open(tmp.path()).unwrap();
+        let report = check(tmp.path(), Some(&db));
+        assert!(report.hygiene.is_some());
+    }
+
+    #[test]
+    fn hygiene_findings_do_not_make_the_integrity_report_unclean() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        let wiki = crate::vault::layout::wiki_dir(tmp.path()).join("entities");
+        std::fs::create_dir_all(&wiki).unwrap();
+        let page = wiki.join("old.md");
+        std::fs::write(
+            &page,
+            "---
+id: entities/old
+type: entity
+title: Old
+---
+
+Nobody links here.
+",
+        )
+        .unwrap();
+        let db = crate::db::DbHandle::open(tmp.path()).unwrap();
+        crate::db::pages_index::rebuild(&db, tmp.path()).unwrap();
+        // Age the indexed page beyond the orphan threshold.
+        db.with(|conn| {
+            conn.execute("UPDATE pages SET file_mtime = 1", [])?;
+            Ok(())
+        })
+        .unwrap();
+        let report = check(tmp.path(), Some(&db));
+        assert!(report.clean, "hygiene: {:?}", report.hygiene);
     }
 }
