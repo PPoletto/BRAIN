@@ -461,6 +461,14 @@ pub(crate) fn merge_pages_with_store(
         merged = set_frontmatter_list(&merged, "sources", &sources)
             .ok_or_else(|| malformed(into_id, "frontmatter could not be located"))?;
     }
+    // `keep: true` ("leave this page alone") survives when either page
+    // carried it.
+    if from.frontmatter.keep == Some(true) && into.frontmatter.keep != Some(true) {
+        // A bare YAML boolean, not the quoted string `set_frontmatter_scalar`
+        // would write.
+        merged = set_frontmatter_entry(&merged, "keep", Some("keep: true"))
+            .ok_or_else(|| malformed(into_id, "frontmatter could not be located"))?;
+    }
     // References from the target to the source would now point at itself.
     let (merged_refs, mut rewritten_references) =
         rewrite_frontmatter_refs(&merged, into_id, from_id, RefAction::Retarget(into_id));
@@ -2181,6 +2189,62 @@ mod tests {
 
     fn page_fm(id: &str, extra: &str, body: &str) -> String {
         format!("---\nid: {id}\ntype: entity\ntitle: T\n{extra}---\n\n{body}\n")
+    }
+
+    // --- keep (H2) ----------------------------------------------------------
+
+    fn keep_of(vault: &Path, id: &str) -> Option<bool> {
+        parse(&read(vault, id)).unwrap().frontmatter.keep
+    }
+
+    #[test]
+    fn rename_carries_the_keep_mark() {
+        let v = vault_with(&[("entities/old", page_fm("entities/old", "keep: true\n", "Body."))]);
+        rename_page_with_store(v.path(), "entities/old", "entities/new", &store()).unwrap();
+        assert_eq!(keep_of(v.path(), "entities/new"), Some(true));
+    }
+
+    #[test]
+    fn merge_keeps_the_keep_mark_of_the_folded_in_page() {
+        let v = vault_with(&[
+            ("entities/dup", page_fm("entities/dup", "keep: true\n", "Dup.")),
+            ("entities/main", page_fm("entities/main", "", "Main.")),
+        ]);
+        merge_pages_with_store(v.path(), "entities/dup", "entities/main", &store()).unwrap();
+        assert_eq!(keep_of(v.path(), "entities/main"), Some(true));
+    }
+
+    #[test]
+    fn merge_writes_keep_as_a_bare_yaml_boolean() {
+        let v = vault_with(&[
+            ("entities/dup", page_fm("entities/dup", "keep: true
+", "Dup.")),
+            ("entities/main", page_fm("entities/main", "", "Main.")),
+        ]);
+        merge_pages_with_store(v.path(), "entities/dup", "entities/main", &store()).unwrap();
+        assert!(read(v.path(), "entities/main").contains("
+keep: true
+"));
+    }
+
+    #[test]
+    fn merge_keeps_the_keep_mark_of_the_surviving_page() {
+        let v = vault_with(&[
+            ("entities/dup", page_fm("entities/dup", "", "Dup.")),
+            ("entities/main", page_fm("entities/main", "keep: true\n", "Main.")),
+        ]);
+        merge_pages_with_store(v.path(), "entities/dup", "entities/main", &store()).unwrap();
+        assert_eq!(keep_of(v.path(), "entities/main"), Some(true));
+    }
+
+    #[test]
+    fn merge_of_two_pages_without_keep_adds_none() {
+        let v = vault_with(&[
+            ("entities/dup", page_fm("entities/dup", "", "Dup.")),
+            ("entities/main", page_fm("entities/main", "", "Main.")),
+        ]);
+        merge_pages_with_store(v.path(), "entities/dup", "entities/main", &store()).unwrap();
+        assert!(!read(v.path(), "entities/main").contains("keep:"));
     }
 
     fn reference_vault() -> TempDir {

@@ -79,6 +79,73 @@ pub struct DreamItem {
     pub pages: Vec<String>,
     pub reason: String,
     pub suggested_action: String,
+    /// How often earlier dream sessions logged this very item (same kind,
+    /// same pages) as `skipped` or `deferred` (see [`skip_counts`]).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub skipped_before: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// From this many earlier skips on, an item says so in its reason and a
+/// priority-3 item is ranked behind the other priority-3 items — never
+/// dropped: the repetition is the signal.
+pub const REPEATED_SKIP_THRESHOLD: u32 = 3;
+
+/// Only the newest this-many bytes of the dream log are read for
+/// [`skip_counts`] (the log only grows).
+const LOG_TAIL_BYTES: u64 = 500 * 1024;
+
+/// Longest note kept per logged item.
+const MAX_ITEM_NOTE_CHARS: usize = 300;
+
+/// What a dream session did with one queue item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogOutcome {
+    Done,
+    Skipped,
+    Deferred,
+}
+
+impl LogOutcome {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "done" => Some(Self::Done),
+            "skipped" => Some(Self::Skipped),
+            "deferred" => Some(Self::Deferred),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Skipped => "skipped",
+            Self::Deferred => "deferred",
+        }
+    }
+}
+
+/// One queue item as a dream session logs it. `kind` is a single token
+/// (the queue item's kind) and `pages` are valid page ids — the caller
+/// validates both; the log format relies on neither containing spaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogItem {
+    pub kind: String,
+    pub pages: Vec<String>,
+    pub outcome: LogOutcome,
+    pub note: Option<String>,
+}
+
+/// Key of a queue item in the skip history: kind + sorted pages.
+pub type SkipKey = (String, Vec<String>);
+
+fn skip_key(kind: &str, pages: &[String]) -> SkipKey {
+    let mut pages = pages.to_vec();
+    pages.sort();
+    (kind.to_string(), pages)
 }
 
 /// The prioritised work list.
@@ -167,8 +234,20 @@ pub fn load_dream_rows(conn: &rusqlite::Connection) -> DbResult<DreamRows> {
     })
 }
 
-/// Build the queue from `rows` as of `now`. Pure.
+/// Build the queue from `rows` as of `now`, without skip history. Pure.
 pub fn build_queue(rows: &DreamRows, now: chrono::DateTime<chrono::Utc>) -> DreamQueue {
+    build_queue_with_history(rows, now, &HashMap::new())
+}
+
+/// [`build_queue`] with the skip history of earlier sessions (see
+/// [`skip_counts`]): each item carries `skipped_before`; from
+/// [`REPEATED_SKIP_THRESHOLD`] on, its reason says so and a priority-3
+/// item moves behind the other priority-3 items. Pure.
+pub fn build_queue_with_history(
+    rows: &DreamRows,
+    now: chrono::DateTime<chrono::Utc>,
+    skips: &HashMap<SkipKey, u32>,
+) -> DreamQueue {
     let now_unix = now.timestamp();
     let mut candidates: Vec<DreamItem> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
@@ -253,7 +332,7 @@ pub fn build_queue(rows: &DreamRows, now: chrono::DateTime<chrono::Utc>) -> Drea
     let cutoff = now_unix - DECAY_MIN_AGE_DAYS * 24 * 60 * 60;
     for page in &facts {
         let never_read = rows.reads.get(&page.id).copied().unwrap_or(0) == 0;
-        if never_read && page.inbound == 0 && page.mtime > 0 && page.mtime < cutoff {
+        if !page.keep && never_read && page.inbound == 0 && page.mtime > 0 && page.mtime < cutoff {
             candidates.push(item(
                 3,
                 "decay-candidate",
@@ -277,6 +356,24 @@ pub fn build_queue(rows: &DreamRows, now: chrono::DateTime<chrono::Utc>) -> Drea
             ),
             "review-or-archive",
         ));
+    }
+
+    // Skip history: how often each item was skipped or deferred before.
+    for candidate in &mut candidates {
+        let n = skips
+            .get(&skip_key(&candidate.kind, &candidate.pages))
+            .copied()
+            .unwrap_or(0);
+        candidate.skipped_before = n;
+        if n >= REPEATED_SKIP_THRESHOLD {
+            // `keep: true` only answers "nobody links / reads this page".
+            let advice = if matches!(candidate.kind.as_str(), "orphan" | "decay-candidate") {
+                "decide or mark keep"
+            } else {
+                "decide it"
+            };
+            candidate.reason = format!("{} (skipped {n}× before — {advice})", candidate.reason);
+        }
     }
 
     // Candidates are in rank order (priority, then kind order above, then
@@ -305,6 +402,17 @@ pub fn build_queue(rows: &DreamRows, now: chrono::DateTime<chrono::Utc>) -> Drea
         }
         items.push(candidate);
     }
+    // A repeatedly skipped priority-3 item goes behind the other
+    // priority-3 items. Only after the per-page dedupe: moved earlier, a
+    // page's other priority-3 kind (orphan behind decay-candidate) would
+    // win the dedupe and the skipped item would resurface under another
+    // name.
+    items.sort_by_key(|i| {
+        (
+            i.priority,
+            i.priority == 3 && i.skipped_before >= REPEATED_SKIP_THRESHOLD,
+        )
+    });
     let omitted = items.len().saturating_sub(MAX_ITEMS);
     items.truncate(MAX_ITEMS);
     DreamQueue {
@@ -328,6 +436,7 @@ fn item(priority: u8, kind: &str, pages: Vec<String>, reason: String, action: &s
         pages,
         reason,
         suggested_action: action.into(),
+        skipped_before: 0,
     }
 }
 
@@ -353,22 +462,14 @@ pub fn needs_vacuum(freelist_pages: i64, total_pages: i64) -> bool {
     total_pages > 0 && freelist_pages * 5 > total_pages
 }
 
-/// [`load_dream_rows`] + [`build_queue`] on a GUI-side handle.
-pub fn build_dream_queue(
-    db: &DbHandle,
-    now: chrono::DateTime<chrono::Utc>,
-) -> DbResult<DreamQueue> {
-    let rows = db.with(load_dream_rows)?;
-    Ok(build_queue(&rows, now))
-}
-
 /// Build the queue and write `00_meta/dream-queue.md`.
 pub fn refresh_dream_queue(
     vault: &Path,
     db: &DbHandle,
     now: chrono::DateTime<chrono::Utc>,
 ) -> DbResult<DreamQueue> {
-    let queue = build_dream_queue(db, now)?;
+    let rows = db.with(load_dream_rows)?;
+    let queue = build_queue_with_history(&rows, now, &skip_counts(vault));
     write_dream_queue(vault, &queue)?;
     Ok(queue)
 }
@@ -406,6 +507,12 @@ pub fn render_queue(queue: &DreamQueue) -> String {
         out.push_str("|---|---|---|---|---|---|\n");
         for (i, it) in queue.items.iter().enumerate() {
             let pages: Vec<String> = it.pages.iter().map(|p| format!("`{p}`")).collect();
+            // From the threshold on, the reason itself says it.
+            let reason = if (1..REPEATED_SKIP_THRESHOLD).contains(&it.skipped_before) {
+                format!("{} (skipped {}× before)", it.reason, it.skipped_before)
+            } else {
+                it.reason.clone()
+            };
             let _ = writeln!(
                 out,
                 "| {} | {} | {} | {} | {} | {} |",
@@ -413,7 +520,7 @@ pub fn render_queue(queue: &DreamQueue) -> String {
                 it.priority,
                 it.kind,
                 pages.join(", "),
-                it.reason.replace('|', "\\|"),
+                reason.replace('|', "\\|"),
                 it.suggested_action
             );
         }
@@ -455,12 +562,18 @@ pub fn cached_queue(vault: &Path, now: chrono::DateTime<chrono::Utc>) -> Option<
     (age >= chrono::Duration::zero() && age < MAX_QUEUE_AGE).then_some(queue)
 }
 
-/// Append one dated line to `00_meta/dream-log.md` (created with a
-/// header on first use). The entry is collapsed to one line and capped
-/// at 2000 characters; an empty entry is refused.
+/// Append one dated block to `00_meta/dream-log.md` (created with a
+/// header on first use): the session line, then one indented bullet per
+/// logged item, ``- <outcome> <kind> `<page>`, `<page>` — <note>`` (ids in
+/// backticks, so ids with spaces or commas stay unambiguous; the caller
+/// refuses ids containing a backtick). The entry is
+/// collapsed to one line and capped at 2000 characters (an empty entry
+/// is refused); notes are collapsed and capped at 300. Returns the
+/// session line.
 pub fn append_dream_log(
     vault: &Path,
     entry: &str,
+    items: &[LogItem],
     when: chrono::DateTime<chrono::Local>,
 ) -> std::io::Result<String> {
     use std::io::Write as _;
@@ -486,12 +599,121 @@ pub fn append_dream_log(
         .open(&path)?;
     if is_new {
         file.write_all(
-            b"# Dream log\n\nOne line per dream-session note (brain_dream action log). Local file - not synced.\n\n",
+            b"# Dream log\n\nOne block per dream session (brain_dream action log): the session line, \
+              then one bullet per queue item looked at. Local file - not synced.\n\n",
         )?;
     }
     let written = format!("- {} {line}", when.format("%Y-%m-%d %H:%M"));
-    file.write_all(format!("{written}\n").as_bytes())?;
+    let mut block = format!("{written}\n");
+    for item in items {
+        let pages: Vec<String> = item.pages.iter().map(|p| format!("`{p}`")).collect();
+        let _ = write!(
+            block,
+            "  - {} {} {}",
+            item.outcome.as_str(),
+            item.kind,
+            pages.join(", ")
+        );
+        let note = item
+            .note
+            .as_deref()
+            .map(|n| n.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|n| !n.is_empty());
+        if let Some(mut note) = note {
+            if note.chars().count() > MAX_ITEM_NOTE_CHARS {
+                note = note.chars().take(MAX_ITEM_NOTE_CHARS - 1).collect();
+                note.push('…');
+            }
+            let _ = write!(block, " — {note}");
+        }
+        block.push('\n');
+    }
+    file.write_all(block.as_bytes())?;
     Ok(written)
+}
+
+/// How often each queue item (kind + sorted pages) was logged `skipped`
+/// or `deferred` in `00_meta/dream-log.md`. Reads at most the newest
+/// [`LOG_TAIL_BYTES`]; a missing or unreadable log counts nothing, and
+/// lines that are not item bullets of the expected shape are ignored.
+pub fn skip_counts(vault: &Path) -> HashMap<SkipKey, u32> {
+    use std::io::{Read as _, Seek as _};
+    let Ok(mut file) = std::fs::File::open(dream_log_path(vault)) else {
+        return HashMap::new();
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(LOG_TAIL_BYTES);
+    if file.seek(std::io::SeekFrom::Start(start)).is_err() {
+        return HashMap::new();
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return HashMap::new();
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    // A cut into the middle of the file starts with a partial line.
+    let text = if start > 0 {
+        text.split_once('\n').map_or("", |(_, rest)| rest)
+    } else {
+        &text
+    };
+    count_skips(text)
+}
+
+/// The counting behind [`skip_counts`], on the log text, oldest line
+/// first: each `skipped` / `deferred` bullet adds one for its key, a
+/// `done` bullet resets it — an item that was fixed and comes back
+/// starts fresh. Pure.
+pub fn count_skips(text: &str) -> HashMap<SkipKey, u32> {
+    let mut counts: HashMap<SkipKey, u32> = HashMap::new();
+    for line in text.lines() {
+        let Some((outcome, key)) = parse_item_line(line) else {
+            continue;
+        };
+        match outcome {
+            LogOutcome::Done => {
+                counts.remove(&key);
+            }
+            LogOutcome::Skipped | LogOutcome::Deferred => *counts.entry(key).or_default() += 1,
+        }
+    }
+    counts
+}
+
+/// An item bullet of the log: ``  - <outcome> <kind> `<id>`, `<id>`[ — note]``.
+/// `None` for session lines, the header and anything malformed —
+/// including bullets whose ids are not in backticks.
+fn parse_item_line(line: &str) -> Option<(LogOutcome, SkipKey)> {
+    if !line.starts_with(' ') {
+        return None; // session lines and the header
+    }
+    let rest = line.trim_start().strip_prefix("- ")?;
+    let (outcome, rest) = rest.split_once(' ')?;
+    let outcome = LogOutcome::parse(outcome)?;
+    let (kind, mut rest) = rest.split_once(' ')?;
+    if kind.is_empty() {
+        return None;
+    }
+    let mut pages: Vec<String> = Vec::new();
+    loop {
+        let inner = rest.strip_prefix('`')?;
+        let end = inner.find('`')?;
+        let id = &inner[..end];
+        if id.trim().is_empty() || !id.contains('/') {
+            return None;
+        }
+        pages.push(id.to_string());
+        rest = &inner[end + 1..];
+        match rest.strip_prefix(", ") {
+            Some(next) => rest = next,
+            None => break,
+        }
+    }
+    // After the ids: nothing, or the note.
+    if !(rest.is_empty() || rest.starts_with(" — ")) {
+        return None;
+    }
+    Some((outcome, skip_key(kind, &pages)))
 }
 
 #[cfg(test)]
@@ -557,7 +779,7 @@ mod tests {
     }
 
     fn queue(db: &DbHandle) -> DreamQueue {
-        build_dream_queue(db, now()).unwrap()
+        build_queue(&db.with(load_dream_rows).unwrap(), now())
     }
 
     fn kinds_of(q: &DreamQueue, id: &str) -> Vec<String> {
@@ -896,7 +1118,7 @@ mod tests {
     #[test]
     fn a_dream_log_entry_is_appended_as_one_dated_line() {
         let tmp = TempDir::new().unwrap();
-        append_dream_log(tmp.path(), "merged a\ninto b", when()).unwrap();
+        append_dream_log(tmp.path(), "merged a\ninto b", &[], when()).unwrap();
         let text = std::fs::read_to_string(dream_log_path(tmp.path())).unwrap();
         assert_eq!(
             text.lines().last(),
@@ -907,7 +1129,287 @@ mod tests {
     #[test]
     fn an_empty_dream_log_entry_is_refused() {
         let tmp = TempDir::new().unwrap();
-        assert!(append_dream_log(tmp.path(), "  \n ", when()).is_err());
+        assert!(append_dream_log(tmp.path(), "  \n ", &[], when()).is_err());
+    }
+
+    fn log_item(outcome: LogOutcome, kind: &str, pages: &[&str], note: Option<&str>) -> LogItem {
+        LogItem {
+            kind: kind.into(),
+            pages: pages.iter().map(|p| p.to_string()).collect(),
+            outcome,
+            note: note.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_dream_log_with_items_writes_one_bullet_per_item_under_the_session_line() {
+        let tmp = TempDir::new().unwrap();
+        let items = [
+            log_item(
+                LogOutcome::Done,
+                "duplicate-candidate",
+                &["entities/a", "entities/b"],
+                Some("merged b into a"),
+            ),
+            log_item(
+                LogOutcome::Skipped,
+                "orphan",
+                &["entities/x"],
+                Some("still  a\nuseful reference"),
+            ),
+            log_item(LogOutcome::Deferred, "summary-stale", &["entities/y"], None),
+        ];
+        append_dream_log(tmp.path(), "tidied up", &items, when()).unwrap();
+        let text = std::fs::read_to_string(dream_log_path(tmp.path())).unwrap();
+        let block: Vec<&str> = text
+            .lines()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        assert_eq!(
+            block,
+            vec![
+                "- 2026-10-06 22:15 tidied up",
+                "  - done duplicate-candidate `entities/a`, `entities/b` — merged b into a",
+                "  - skipped orphan `entities/x` — still a useful reference",
+                "  - deferred summary-stale `entities/y`",
+            ]
+        );
+    }
+
+    #[test]
+    fn skips_and_deferrals_after_the_latest_done_are_counted_per_kind_and_page_set() {
+        let tmp = TempDir::new().unwrap();
+        let skip = [log_item(
+            LogOutcome::Skipped,
+            "duplicate-candidate",
+            &["entities/b", "entities/a"],
+            Some("no"),
+        )];
+        let defer = [log_item(
+            LogOutcome::Deferred,
+            "duplicate-candidate",
+            &["entities/a", "entities/b"],
+            None,
+        )];
+        let done = [log_item(
+            LogOutcome::Done,
+            "duplicate-candidate",
+            &["entities/a", "entities/b"],
+            None,
+        )];
+        // skipped, done (resets), skipped, deferred → 2.
+        append_dream_log(tmp.path(), "one", &skip, when()).unwrap();
+        append_dream_log(tmp.path(), "two", &done, when()).unwrap();
+        append_dream_log(tmp.path(), "three", &skip, when()).unwrap();
+        append_dream_log(tmp.path(), "four", &defer, when()).unwrap();
+        let key = (
+            "duplicate-candidate".to_string(),
+            vec!["entities/a".to_string(), "entities/b".to_string()],
+        );
+        assert_eq!(skip_counts(tmp.path()).get(&key), Some(&2));
+    }
+
+    #[test]
+    fn malformed_log_lines_are_ignored_when_counting_skips() {
+        let text = "# Dream log\n\n- 2026-10-01 10:00 session\n  - skipped orphan `entities/x` — fine\n  \
+                    - skipped\n  - skipped orphan\n  - maybe orphan `entities/x`\n  - skipped orphan `not an id`\n  \
+                    - skipped orphan entities/x\n  - skipped orphan `entities/x\n  - skipped orphan `entities/x`junk\n\
+                    garbage line ✓\n  - skipped orphan `entities/x`\n";
+        let counts = count_skips(text);
+        assert_eq!(
+            counts.into_iter().collect::<Vec<_>>(),
+            vec![(("orphan".to_string(), vec!["entities/x".to_string()]), 2)]
+        );
+    }
+
+    #[test]
+    fn only_the_tail_of_a_huge_log_is_read() {
+        let tmp = TempDir::new().unwrap();
+        let path = dream_log_path(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // An old skip, then more than LOG_TAIL_BYTES of other lines.
+        let mut text = String::from("  - skipped orphan `entities/old`\n");
+        while (text.len() as u64) < LOG_TAIL_BYTES + 1024 {
+            text.push_str(
+                "- 2026-10-01 10:00 a session line that is long enough to fill the log\n",
+            );
+        }
+        text.push_str("  - skipped orphan `entities/new`\n");
+        std::fs::write(&path, text).unwrap();
+        let counts = skip_counts(tmp.path());
+        assert_eq!(
+            (
+                counts.contains_key(&("orphan".to_string(), vec!["entities/old".to_string()])),
+                counts.len()
+            ),
+            (false, 1)
+        );
+    }
+
+    #[test]
+    fn an_id_with_a_space_round_trips_through_the_log_into_the_skip_count() {
+        let tmp = TempDir::new().unwrap();
+        let item = [log_item(
+            LogOutcome::Skipped,
+            "orphan",
+            &["entities/Acme Inc"],
+            Some("ask"),
+        )];
+        append_dream_log(tmp.path(), "one", &item, when()).unwrap();
+        let key = ("orphan".to_string(), vec!["entities/Acme Inc".to_string()]);
+        assert_eq!(skip_counts(tmp.path()).get(&key), Some(&1));
+    }
+
+    #[test]
+    fn a_single_id_containing_a_comma_is_not_read_as_two_pages() {
+        let tmp = TempDir::new().unwrap();
+        let item = [log_item(
+            LogOutcome::Skipped,
+            "orphan",
+            &["entities/a, entities/b"],
+            None,
+        )];
+        append_dream_log(tmp.path(), "one", &item, when()).unwrap();
+        let keys: Vec<SkipKey> = skip_counts(tmp.path()).into_keys().collect();
+        assert_eq!(
+            keys,
+            vec![(
+                "orphan".to_string(),
+                vec!["entities/a, entities/b".to_string()]
+            )]
+        );
+    }
+
+    #[test]
+    fn a_non_orphan_item_skipped_three_times_is_told_to_be_decided_not_kept() {
+        let (_tmp, db) = open_db();
+        page(&db, "entities/a", NOW);
+        link(&db, "entities/a", "entities/missing");
+        let log = "  - skipped broken-link `entities/a`\n".repeat(3);
+        let item = queue_with(&db, &log).items.into_iter().next().unwrap();
+        assert!(
+            item.reason.ends_with("(skipped 3× before — decide it)"),
+            "{}",
+            item.reason
+        );
+    }
+
+    /// Two old, unread, unlinked pages `a` and `b` (decay candidates).
+    fn two_decaying_pages(db: &DbHandle) {
+        page(db, "entities/a", NOW - 200 * DAY);
+        page(db, "entities/b", NOW - 200 * DAY);
+    }
+
+    fn queue_with(db: &DbHandle, log: &str) -> DreamQueue {
+        let rows = db.with(load_dream_rows).unwrap();
+        build_queue_with_history(&rows, now(), &count_skips(log))
+    }
+
+    #[test]
+    fn an_item_skipped_twice_before_carries_skipped_before_two() {
+        let (_tmp, db) = open_db();
+        two_decaying_pages(&db);
+        let log = "  - skipped decay-candidate `entities/a` — later\n  - deferred decay-candidate `entities/a`\n";
+        let a = queue_with(&db, log)
+            .items
+            .into_iter()
+            .find(|i| i.pages == ["entities/a"])
+            .unwrap();
+        assert_eq!(a.skipped_before, 2);
+    }
+
+    #[test]
+    fn an_item_skipped_three_times_goes_behind_the_other_priority_three_items() {
+        let (_tmp, db) = open_db();
+        two_decaying_pages(&db);
+        let log = "  - skipped decay-candidate `entities/a`\n".repeat(3);
+        let order: Vec<(String, Vec<String>)> = queue_with(&db, &log)
+            .items
+            .into_iter()
+            .map(|i| (i.kind, i.pages))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                (
+                    "decay-candidate".to_string(),
+                    vec!["entities/b".to_string()]
+                ),
+                (
+                    "decay-candidate".to_string(),
+                    vec!["entities/a".to_string()]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_item_skipped_three_times_says_so_in_its_reason() {
+        let (_tmp, db) = open_db();
+        two_decaying_pages(&db);
+        let log = "  - skipped decay-candidate `entities/a`\n".repeat(3);
+        let a = queue_with(&db, &log)
+            .items
+            .into_iter()
+            .find(|i| i.pages == ["entities/a"])
+            .unwrap();
+        assert!(
+            a.reason
+                .ends_with("(skipped 3× before — decide or mark keep)"),
+            "{}",
+            a.reason
+        );
+    }
+
+    #[test]
+    fn skipped_before_is_left_out_of_the_json_when_zero() {
+        let (_tmp, db) = open_db();
+        two_decaying_pages(&db);
+        let json = serde_json::to_string(&queue_with(&db, "")).unwrap();
+        assert!(!json.contains("skipped_before"), "{json}");
+    }
+
+    #[test]
+    fn the_markdown_queue_names_an_earlier_skip() {
+        let (_tmp, db) = open_db();
+        two_decaying_pages(&db);
+        let md = render_queue(&queue_with(
+            &db,
+            "  - skipped decay-candidate `entities/a`\n",
+        ));
+        assert!(md.contains("(skipped 1× before)"), "{md}");
+    }
+
+    fn mark_keep(db: &DbHandle, id: &str) {
+        exec(
+            db,
+            "UPDATE pages SET frontmatter = ?1 WHERE id = ?2",
+            &[
+                &format!(r#"{{"id":"{id}","type":"entity","keep":true}}"#),
+                &id,
+            ],
+        );
+    }
+
+    #[test]
+    fn a_page_marked_keep_gets_no_decay_or_orphan_item() {
+        let (_tmp, db) = open_db();
+        page(&db, "entities/kept", NOW - 200 * DAY);
+        mark_keep(&db, "entities/kept");
+        assert!(queue(&db).items.is_empty(), "{:?}", queue(&db).items);
+    }
+
+    #[test]
+    fn a_page_marked_keep_still_gets_its_broken_link_item() {
+        let (_tmp, db) = open_db();
+        page(&db, "entities/kept", NOW - 200 * DAY);
+        mark_keep(&db, "entities/kept");
+        link(&db, "entities/kept", "entities/missing");
+        assert_eq!(kinds_of(&queue(&db), "entities/kept"), vec!["broken-link"]);
     }
 
     // ---- not watcher-relevant ------------------------------------------------

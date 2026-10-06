@@ -80,21 +80,29 @@ struct PageRow {
     /// Frontmatter `distinct_from`: ids this page declares to be a
     /// different thing — never reported as its duplicate.
     distinct_from: Vec<String>,
+    /// Frontmatter `keep: true`: the user decided the page stays even
+    /// though nothing links to it — never reported as an orphan.
+    keep: bool,
 }
 
-/// The `distinct_from` ids in a `pages.frontmatter` JSON text (empty on
-/// a missing or unreadable value).
-fn distinct_from_of(frontmatter: Option<&str>) -> Vec<String> {
-    frontmatter
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
-        .and_then(|fm| {
-            fm.get("distinct_from").and_then(|v| v.as_array()).map(|ids| {
-                ids.iter()
-                    .filter_map(|id| id.as_str().map(str::to_string))
-                    .collect()
-            })
+/// `distinct_from` ids and the `keep` flag of a `pages.frontmatter` JSON
+/// text (empty / false on a missing or unreadable value).
+fn frontmatter_marks(frontmatter: Option<&str>) -> (Vec<String>, bool) {
+    let Some(fm) = frontmatter.and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+    else {
+        return (Vec::new(), false);
+    };
+    let distinct_from = fm
+        .get("distinct_from")
+        .and_then(|v| v.as_array())
+        .map(|ids| {
+            ids.iter()
+                .filter_map(|id| id.as_str().map(str::to_string))
+                .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let keep = fm.get("keep").and_then(serde_json::Value::as_bool) == Some(true);
+    (distinct_from, keep)
 }
 
 /// [`load_rows`] + [`evaluate`] on a GUI-side handle (no timeout).
@@ -117,12 +125,15 @@ pub fn load_rows(conn: &rusqlite::Connection) -> DbResult<HygieneRows> {
             "SELECT id, type, path, COALESCE(file_mtime, 0), frontmatter FROM pages ORDER BY id",
         )?;
         stmt.query_map([], |row| {
+            let (distinct_from, keep) =
+                frontmatter_marks(row.get::<_, Option<String>>(4)?.as_deref());
             Ok(PageRow {
                 id: row.get(0)?,
                 page_type: row.get(1)?,
                 path: row.get(2)?,
                 mtime: row.get(3)?,
-                distinct_from: distinct_from_of(row.get::<_, Option<String>>(4)?.as_deref()),
+                distinct_from,
+                keep,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?
@@ -270,13 +281,17 @@ fn inbound_sources(links: &[(String, String)]) -> HashMap<&str, HashSet<&str>> {
     inbound
 }
 
-/// The pages the `orphan` rule reports (see [`orphans`]).
+/// The pages the `orphan` rule reports (see [`orphans`]). A page marked
+/// `keep: true` is never one: the mark is the user's answer to "nobody
+/// links here".
 fn orphan_rows<'a>(pages: &'a [PageRow], links: &[(String, String)], now_unix: i64) -> Vec<&'a PageRow> {
     let inbound = inbound_sources(links);
     let cutoff = now_unix - ORPHAN_MIN_AGE_DAYS * 24 * 60 * 60;
     pages
         .iter()
-        .filter(|p| p.mtime > 0 && p.mtime < cutoff && !inbound.contains_key(p.id.as_str()))
+        .filter(|p| {
+            !p.keep && p.mtime > 0 && p.mtime < cutoff && !inbound.contains_key(p.id.as_str())
+        })
         .collect()
 }
 
@@ -289,6 +304,8 @@ pub struct PageFacts {
     pub mtime: i64,
     /// Number of OTHER pages linking here (see [`inbound_sources`]).
     pub inbound: usize,
+    /// Frontmatter `keep: true` (see [`PageRow::keep`]).
+    pub keep: bool,
 }
 
 impl HygieneRows {
@@ -302,6 +319,7 @@ impl HygieneRows {
                 page_type: p.page_type.clone(),
                 mtime: p.mtime,
                 inbound: inbound.get(p.id.as_str()).map_or(0, HashSet::len),
+                keep: p.keep,
             })
             .collect()
     }
@@ -523,6 +541,22 @@ mod tests {
     }
 
     #[test]
+    fn an_old_unlinked_page_marked_keep_is_not_an_orphan() {
+        let (_tmp, db) = open_db();
+        insert_page(&db, "entities/kept", "entity", NOW - 200 * DAY);
+        db.with(|conn| {
+            conn.execute(
+                "UPDATE pages SET frontmatter = ?1 WHERE id = 'entities/kept'",
+                [r#"{"id":"entities/kept","type":"entity","keep":true}"#],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let findings = check(&db, true, NOW).unwrap();
+        assert!(kinds(&findings, "orphan").is_empty());
+    }
+
+    #[test]
     fn a_page_without_inbound_links_changed_recently_is_not_an_orphan() {
         let (_tmp, db) = open_db();
         insert_page(&db, "entities/fresh", "entity", NOW - 10 * DAY);
@@ -707,6 +741,7 @@ mod tests {
                 path: String::new(),
                 mtime: NOW,
                 distinct_from: Vec::new(),
+                keep: false,
             });
         }
         let findings = evaluate(&rows, true, NOW);

@@ -48,6 +48,20 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is loaded, and the index size — without loading the model or building
   the index (replaces the former embedding-status tool, which could load
   the model).
+- **Dream log per item.** A dream session now ends with one log call
+  that lists every queue item the agent looked at and what it did
+  (`done`, `skipped` with a reason, `deferred`); the log stays readable
+  Markdown (page ids in backticks). Items skipped or deferred before come
+  back marked `skipped_before` (counted until the item is logged done);
+  after three skips their reason says so and low-priority ones move to the
+  end of the queue — still listed (beyond 50 items such an item may fall
+  into `omitted`), so the repetition stays visible. Logging items
+  refreshes the stored queue.
+- **`keep: true` for pages that stay.** A page marked `keep: true` in its
+  frontmatter ("I know nothing links here; leave it") no longer shows up
+  as an orphan in the lint report or as a decay / orphan item in the
+  dream queue. Broken links, duplicates, summaries and errors are still
+  reported; rename and merge carry the mark over.
 - **Rename, merge and delete pages from Claude/Codex.** The new MCP tool
   `brain_refactor` lets an agent clean up the wiki instead of leaving
   mistakes behind:

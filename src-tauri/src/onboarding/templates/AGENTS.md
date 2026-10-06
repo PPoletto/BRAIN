@@ -80,7 +80,13 @@ Rules:
   `invalid-date` and ignored by the validity filter.
 - `distinct_from` (optional) lists ids of pages that share a name with
   this one but are a different thing — it silences the `alias-collision`
-  warning for that pair.
+  warning for that pair, and the two pages are never reported (or queued)
+  as possible duplicates.
+- `keep: true` (optional) says the user decided the page stays even
+  though nothing links to it or nobody reads it. It silences the
+  `orphan` warning and the dream queue's decay / orphan items for that
+  page — nothing else (broken links, duplicates, summaries and errors are
+  still reported). Set it only when the user says so.
 - Don't invent additional fields unless asked. Extra fields parse fine but
   no tool reads them, so they're dead weight.
 
@@ -188,7 +194,7 @@ rewriting an existing page, **always** read it with `brain_get_pages` and
 `response_format: "detailed"` and carry over **every** frontmatter field
 unchanged except the one you mean to change — `aliases`, `sources`,
 `tags`, `superseded_by`, `valid_from` / `valid_to`, `distinct_from`,
-`created`, everything. A concise read has no frontmatter; rewriting from
+`keep`, `created`, everything. A concise read has no frontmatter; rewriting from
 it silently drops those fields, and a dropped `superseded_by` makes a
 replaced page current again. To change only a body section, use
 `brain_patch_page` instead — it never touches the frontmatter.
@@ -405,10 +411,22 @@ A dream session (the `dream` prompt contains the same protocol):
    link to**; **supersede instead of overwriting** facts; keep minority
    views and open questions instead of flattening them into one "truth";
    ask the user before changing pages they clearly wrote themselves.
-4. Finish with `brain_dream` `action: "log"` and one `entry` saying what
-   you changed and why ("merged entities/acme-inc into entities/acme;
-   summaries for 3 hubs"). Every change stays recoverable with
-   `brain_history` (`action: "restore"`).
+4. Finish with **one** `brain_dream` `action: "log"` call: an `entry`
+   saying what you changed and why ("merged entities/acme-inc into
+   entities/acme; summaries for 3 hubs"), and `items` — **every** queue
+   item you looked at, each `{kind, pages, outcome, note}` with
+   `outcome` `done`, `skipped` (the `note` gives a one-line reason) or
+   `deferred`. Every change stays recoverable with `brain_history`
+   (`action: "restore"`).
+
+Skipped and deferred items come back in later queues with
+`skipped_before: n` (skips are counted until the item is logged `done`);
+from 3 on, the reason says "skipped 3× before — decide it" ("— decide
+or mark keep" for orphan and decay-candidate items) and a priority-3
+item moves to the end. Decide such
+an item instead of skipping it again — and if the user says a page
+stays, set `keep: true` on it with a detailed read + rewrite (see
+"Rewriting a Page"); its decay / orphan items then stop.
 
 The queue lists each page at most once; what you leave undone (or what
 your changes uncover) shows up in the next queue.

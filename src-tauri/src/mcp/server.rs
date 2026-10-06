@@ -1311,7 +1311,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "brain_write_page",
             title: "Write a page",
-            description: "Create or fully overwrite ONE page. Use it for a new page or to rewrite a page including its frontmatter (summary, aliases, superseded_by). Not for several pages that link to each other — use brain_write_batch; not for changing one section — use brain_patch_page. `content` = YAML frontmatter (id, type: entity|concept|source|topic — singular, title, summary: one or two sentences; optional tags, aliases, sources: [sources/…], valid_from/valid_to YYYY-MM-DD, superseded_by) followed by the markdown body; link pages as [[type-dir/slug]]. Creating a NEW id is refused when brain_lookup would report an alias or normalised match (the error names the page); overwriting an existing id never is. Facts are not overwritten: supersede the old page instead (superseded_by + valid_to). Rewriting an existing page: read it first with brain_get_pages (response_format \"detailed\") and carry over EVERY frontmatter field unchanged (aliases, sources, tags, superseded_by, valid_from/valid_to, distinct_from) — a concise read has no frontmatter, and a dropped field is lost. Returns {wrote, previous_size_bytes, new_size_bytes, warnings}; lint errors on this page fail the call and list the findings. The watcher commits.",
+            description: "Create or fully overwrite ONE page. Use it for a new page or to rewrite a page including its frontmatter (summary, aliases, superseded_by). Not for several pages that link to each other — use brain_write_batch; not for changing one section — use brain_patch_page. `content` = YAML frontmatter (id, type: entity|concept|source|topic — singular, title, summary: one or two sentences; optional tags, aliases, sources: [sources/…], valid_from/valid_to YYYY-MM-DD, superseded_by, distinct_from, keep: true) followed by the markdown body; link pages as [[type-dir/slug]]. Creating a NEW id is refused when brain_lookup would report an alias or normalised match (the error names the page); overwriting an existing id never is. Facts are not overwritten: supersede the old page instead (superseded_by + valid_to). Rewriting an existing page: read it first with brain_get_pages (response_format \"detailed\") and carry over EVERY frontmatter field unchanged (aliases, sources, tags, superseded_by, valid_from/valid_to, distinct_from, keep) — a concise read has no frontmatter, and a dropped field is lost. Returns {wrote, previous_size_bytes, new_size_bytes, warnings}; lint errors on this page fail the call and list the findings. The watcher commits.",
             input: json!({
                 "type": "object",
                 "properties": {
@@ -1504,13 +1504,27 @@ fn tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "brain_dream",
             title: "Dream (consolidate the wiki)",
-            description: "Consolidation ('dreaming') — only when the user asks for it ('träum mal', 'tidy up the wiki'). action 'queue': BRAIN's prioritised work list {generated_at, items: [{priority 1..3, kind, pages, reason, suggested_action}], omitted}, served from 00_meta/dream-queue.md when under an hour old (`refresh: true` recomputes). action 'log': append one line (`entry`) to 00_meta/dream-log.md at the end of the session saying what you changed and why. Work the queue with the `dream` prompt: at most 10 changes, never delete linked pages, supersede instead of overwrite. Not for a lint cleanup — use brain_lint_report.",
+            description: "Consolidation ('dreaming') — only when the user asks for it ('träum mal', 'tidy up the wiki'). action 'queue': BRAIN's prioritised work list {generated_at, items: [{priority 1..3, kind, pages, reason, suggested_action}], omitted}, served from 00_meta/dream-queue.md when under an hour old (`refresh: true` recomputes). action 'log' (once, at the end of the session): `entry` — one line saying what you changed and why — plus `items`, every queue item you looked at with its outcome (done / skipped with a one-line reason / deferred); appended to 00_meta/dream-log.md. Items skipped or deferred before carry `skipped_before` in later queues. Work the queue with the `dream` prompt: at most 10 changes, never delete linked pages, supersede instead of overwrite. Not for a lint cleanup — use brain_lint_report.",
             input: json!({
                 "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": ["queue", "log"], "description": "'queue' to read the work list, 'log' to record the session (needs entry)" },
                     "refresh": { "type": "boolean", "default": false, "description": "queue: recompute even if the stored queue is fresh" },
-                    "entry": { "type": "string", "description": "log: one line, e.g. 'merged entities/acme-inc into entities/acme; summaries for 3 hubs'" }
+                    "entry": { "type": "string", "description": "log: one line for the session, e.g. 'merged entities/acme-inc into entities/acme; summaries for 3 hubs'" },
+                    "items": {
+                        "type": "array",
+                        "description": "log: every queue item you looked at, with what you did — skipped and deferred items show up as `skipped_before` in later queues",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": { "type": "string", "description": "the queue item's kind, e.g. 'orphan'" },
+                                "pages": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "the queue item's pages" },
+                                "outcome": { "type": "string", "enum": ["done", "skipped", "deferred"] },
+                                "note": { "type": "string", "description": "one line: what you did, or why you skipped / deferred it" }
+                            },
+                            "required": ["kind", "pages", "outcome"]
+                        }
+                    }
                 },
                 "required": ["action"]
             }),
@@ -1519,7 +1533,8 @@ fn tool_specs() -> Vec<ToolSpec> {
                 "items": { "type": "array" },
                 "omitted": { "type": "integer" },
                 "notes": { "type": "array" },
-                "logged": { "type": "string" }
+                "logged": { "type": "string" },
+                "items_logged": { "type": "integer" }
             })),
             hints: write(false, false),
         },
@@ -1705,7 +1720,7 @@ Follow the vault conventions (resource brain://agents-md). Steps:
 1. Raw file: if the material is not under 01_raw/ yet, store it verbatim with brain_write_raw_file ({connector}; relative_path: a date-prefixed file name).
 2. Find what exists: brain_search for the main names and topics, then brain_lookup for every entity or concept page you plan to create (by name or planned id). An existing page or a match means: extend that page and add your spelling to its aliases — never create a duplicate.
 3. Plan the pages: one `sources/<yyyy-mm-dd>-<slug>` page for the artifact (what it is, key facts, the raw file path), entity pages for the people, organisations and products it names, concept pages for methods and terms, and a topic page only for a synthesis across several sources.
-4. Write all new and changed pages in ONE brain_write_batch call. Every page: frontmatter id, type (singular: entity, concept, source or topic), title, summary (one or two sentences); entity and concept pages also `sources: [sources/<the source page>]`. Link with [[type-dir/slug]] only to pages that exist or are in the same batch. Before changing an existing page, read it with brain_get_pages (response_format \"detailed\") and carry over EVERY frontmatter field unchanged (aliases, sources, tags, superseded_by, valid_from/valid_to, distinct_from) — a concise read has no frontmatter, and a dropped field is lost.
+4. Write all new and changed pages in ONE brain_write_batch call. Every page: frontmatter id, type (singular: entity, concept, source or topic), title, summary (one or two sentences); entity and concept pages also `sources: [sources/<the source page>]`. Link with [[type-dir/slug]] only to pages that exist or are in the same batch. Before changing an existing page, read it with brain_get_pages (response_format \"detailed\") and carry over EVERY frontmatter field unchanged (aliases, sources, tags, superseded_by, valid_from/valid_to, distinct_from, keep) — a concise read has no frontmatter, and a dropped field is lost.
 5. Check the response: fix lint errors it reports. If new_size_bytes is much smaller than previous_size_bytes on an existing page, stop and tell the user.
 6. Changed facts are never overwritten: supersede the old page (superseded_by + valid_to) and write the new state.
 Finish with a short report for the user: pages created, pages updated, open questions."
@@ -1722,7 +1737,7 @@ fn lint_session_prompt(focus: Option<&str>) -> String {
     format!(
         "Run a cleanup session on the BRAIN wiki.
 1. Read the newest audit (resource brain://audit/latest) or call brain_lint_report for the live state (concise: counts per kind). {scope}
-2. Rewrite rule: before any brain_write_page on an existing page, read it with brain_get_pages (response_format \"detailed\") and carry over EVERY frontmatter field unchanged except the one you fix (aliases, sources, tags, superseded_by, valid_from/valid_to, distinct_from) — a concise read has no frontmatter, and a dropped field is lost.
+2. Rewrite rule: before any brain_write_page on an existing page, read it with brain_get_pages (response_format \"detailed\") and carry over EVERY frontmatter field unchanged except the one you fix (aliases, sources, tags, superseded_by, valid_from/valid_to, distinct_from, keep) — a concise read has no frontmatter, and a dropped field is lost.
 3. For each kind, get its findings with brain_lint_report (response_format \"detailed\", kind \"<kind>\") and fix them:
 - broken-link / broken-source: correct the id, create the missing page, or rename the page that was meant (brain_refactor action \"rename\").
 - unregistered-type / frontmatter / missing-title: read the page with brain_get_pages (response_format \"detailed\"), then rewrite it with brain_write_page keeping every other frontmatter field (type is singular: entity, concept, source, topic).
@@ -1748,7 +1763,7 @@ Hard rules:
 - Supersede instead of overwriting facts (superseded_by + valid_to on the old page; keep its body).
 - Keep minority views and open questions; do not flatten them into one \"truth\".
 - Ask before changing pages the user clearly wrote themselves.
-- Rewrite rule: before any brain_write_page on an existing page, read it with brain_get_pages (response_format \"detailed\") and carry over EVERY frontmatter field unchanged except the one you change (aliases, sources, tags, superseded_by, valid_from/valid_to, distinct_from) — a concise read has no frontmatter, and a dropped superseded_by makes a replaced page current again.
+- Rewrite rule: before any brain_write_page on an existing page, read it with brain_get_pages (response_format \"detailed\") and carry over EVERY frontmatter field unchanged except the one you change (aliases, sources, tags, superseded_by, valid_from/valid_to, distinct_from, keep) — a concise read has no frontmatter, and a dropped superseded_by makes a replaced page current again.
 
 Steps:
 1. brain_dream with action \"queue\" (refresh: true if the wiki changed a lot since the last queue).
@@ -1758,7 +1773,7 @@ Steps:
 - update-summary / write-summary: read the page with brain_get_pages (response_format \"detailed\") and write a fitting one-to-two-sentence summary with brain_write_page (body and every other frontmatter field unchanged). If the existing summary is still right, confirm it instead: brain_write_page with the page exactly as read (response_format \"detailed\") and confirm_summary: true.
 - archive-or-supersede / review-or-archive: link it from a related page if it is still useful; if its facts were replaced, set superseded_by and valid_to (rewrite rule above). Do not delete it.
 3. Stop after {max_changes} changes or when the queue is done; what is left shows up in the next queue.
-4. End with brain_dream action \"log\" and one line saying what you changed and why (e.g. \"merged entities/acme-inc into entities/acme; summaries for 3 hubs\"). Every change stays restorable with brain_history action \"restore\"."
+4. End with ONE brain_dream action \"log\" call: `entry` = one line saying what you changed and why (e.g. \"merged entities/acme-inc into entities/acme; summaries for 3 hubs\"), and `items` = every queue item you looked at, each {{kind, pages, outcome: \"done\" | \"skipped\" | \"deferred\", note}} — a skipped item needs a one-line reason in its note. Items that were skipped 3 times before say so in their reason: decide them now. Only for orphan and decay-candidate items is there a third answer: if the user says the page stays, mark it `keep: true` (rewrite rule above). Every change stays restorable with brain_history action \"restore\"."
     )
 }
 
@@ -1948,7 +1963,7 @@ fn dream_queue(
         }
     }
     let rows = db_op(db, vault, "brain_dream", dream::load_dream_rows)?;
-    let queue = dream::build_queue(&rows, now);
+    let queue = dream::build_queue_with_history(&rows, now, &dream::skip_counts(vault));
     if let Err(err) = dream::write_dream_queue(vault, &queue) {
         tracing::warn!(?err, "could not write the dream queue");
     }
@@ -2482,12 +2497,90 @@ fn call_tool(
             }
             _ => {
                 let entry = required_str(&args, "entry")?;
-                let line = crate::wiki::dream::append_dream_log(vault, entry, chrono::Local::now())
-                    .map_err(|e| e.to_string())?;
-                Ok(serde_json::to_string(&json!({ "logged": line })).unwrap_or_default())
+                let items = dream_log_items(&args)?;
+                let line = crate::wiki::dream::append_dream_log(
+                    vault,
+                    entry,
+                    &items,
+                    chrono::Local::now(),
+                )
+                .map_err(|e| e.to_string())?;
+                // The stored queue's skip counts are now out of date: drop it so
+                // the next `queue` call recomputes.
+                if !items.is_empty() {
+                    drop_stored_queue(vault);
+                }
+                Ok(json!({ "logged": line, "items_logged": items.len() }).to_string())
             }
         },
         other => Err(format!("unknown tool: {other}")),
+    }
+}
+
+/// The optional `items` of `brain_dream` action `log`, validated: each
+/// `{kind, pages, outcome, note?}` with a one-word `kind`, at least one
+/// valid page id and `outcome` one of done / skipped / deferred.
+fn dream_log_items(args: &Value) -> Result<Vec<crate::wiki::dream::LogItem>, String> {
+    use crate::wiki::dream::{LogItem, LogOutcome};
+    let raw = match args.get("items") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(raw)) => raw,
+        Some(_) => return Err("'items' must be an array of {kind, pages, outcome, note?}".into()),
+    };
+    raw.iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let at = |msg: &str| format!("items[{i}]: {msg}");
+            let kind = item
+                .get("kind")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|k| !k.is_empty() && !k.contains(char::is_whitespace))
+                .ok_or_else(|| at("'kind' must be the queue item's kind, e.g. \"orphan\""))?;
+            let pages: Vec<String> = item
+                .get("pages")
+                .and_then(Value::as_array)
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| at("'pages' must be a non-empty array of page ids"))?
+                .iter()
+                .map(|p| {
+                    let id = p
+                        .as_str()
+                        .ok_or_else(|| at("'pages' must contain page id strings"))?;
+                    check_page_id(id).map_err(|e| at(&e))?;
+                    if id.contains('`') {
+                        return Err(at("page ids must not contain a backtick"));
+                    }
+                    Ok(id.to_string())
+                })
+                .collect::<Result<_, String>>()?;
+            let outcome = item
+                .get("outcome")
+                .and_then(Value::as_str)
+                .and_then(LogOutcome::parse)
+                .ok_or_else(|| at("'outcome' must be \"done\", \"skipped\" or \"deferred\""))?;
+            let note = match item.get("note") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(n)) => Some(n.clone()),
+                Some(_) => return Err(at("'note' must be a string")),
+            };
+            Ok(LogItem {
+                kind: kind.to_string(),
+                pages,
+                outcome,
+                note,
+            })
+        })
+        .collect()
+}
+
+/// Delete `00_meta/dream-queue.md` so the next `brain_dream` queue call
+/// recomputes it. Best effort: a failure is logged, never surfaced.
+fn drop_stored_queue(vault: &std::path::Path) {
+    match std::fs::remove_file(crate::wiki::dream::dream_queue_path(vault)) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => tracing::warn!(?err, "could not drop the stored dream queue"),
     }
 }
 
@@ -3476,11 +3569,7 @@ fn forget_in_index(
     // The stored dream queue names pages by id; after a rename, merge or
     // delete it is out of date, so drop the cache — the next
     // brain_dream queue recomputes it.
-    match std::fs::remove_file(crate::wiki::dream::dream_queue_path(vault)) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => tracing::warn!(?err, "could not drop the stored dream queue"),
-    }
+    drop_stored_queue(vault);
     let ids = vec![id.to_string()];
     let carry_to = carry_to.map(str::to_string);
     if let Err(err) = db_op(db, vault, "forget refactored page", move |conn| {
@@ -8176,5 +8265,152 @@ Body.
                 && title.starts_with(cut.trim_end_matches('…').trim_end()),
             "{out}"
         );
+    }
+
+    // ---- dream log items and keep (third round) ------------------------------
+
+    fn dream_log(tmp: &TempDir, items: Value) -> Result<String, String> {
+        call_tool(
+            &json!({ "name": "brain_dream", "arguments": { "action": "log", "entry": "session", "items": items } }),
+            tmp.path(),
+            &mut None,
+        )
+    }
+
+    #[test]
+    fn dream_log_reports_how_many_items_it_logged() {
+        let tmp = vault();
+        let out: Value = serde_json::from_str(
+            &dream_log(
+                &tmp,
+                json!([
+                    { "kind": "orphan", "pages": ["entities/x"], "outcome": "skipped", "note": "still useful" },
+                    { "kind": "summary-stale", "pages": ["entities/y"], "outcome": "done" }
+                ]),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["items_logged"], json!(2));
+    }
+
+    #[test]
+    fn dream_log_refuses_an_unknown_outcome() {
+        let tmp = vault();
+        let err = dream_log(
+            &tmp,
+            json!([{ "kind": "orphan", "pages": ["entities/x"], "outcome": "maybe" }]),
+        )
+        .unwrap_err();
+        assert!(err.contains("items[0]: 'outcome' must be"), "{err}");
+    }
+
+    #[test]
+    fn dream_log_refuses_an_invalid_page_id() {
+        let tmp = vault();
+        let err = dream_log(
+            &tmp,
+            json!([{ "kind": "orphan", "pages": ["../etc/passwd"], "outcome": "done" }]),
+        )
+        .unwrap_err();
+        assert!(err.starts_with("items[0]:"), "{err}");
+    }
+
+    #[test]
+    fn a_refused_dream_log_writes_nothing() {
+        let tmp = vault();
+        let _ = dream_log(
+            &tmp,
+            json!([{ "kind": "", "pages": ["entities/x"], "outcome": "done" }]),
+        );
+        assert!(!crate::wiki::dream::dream_log_path(tmp.path()).exists());
+    }
+
+    #[test]
+    fn a_queue_after_two_logged_skips_carries_skipped_before_two() {
+        let tmp = vault();
+        put(tmp.path(), "entities/a", "", "Links [[entities/missing]].");
+        let mut db = indexed(tmp.path());
+        for _ in 0..2 {
+            dream_log(
+                &tmp,
+                json!([{ "kind": "broken-link", "pages": ["entities/a"], "outcome": "skipped", "note": "ask the user" }]),
+            )
+            .unwrap();
+        }
+        let queue = call_json(
+            tmp.path(),
+            &mut db,
+            "brain_dream",
+            json!({ "action": "queue", "refresh": true }),
+        );
+        let item = queue["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["kind"] == json!("broken-link"))
+            .cloned()
+            .unwrap();
+        assert_eq!(item["skipped_before"], json!(2));
+    }
+
+    #[test]
+    fn write_page_keeps_a_keep_mark_in_the_written_file() {
+        let tmp = vault();
+        call(
+            tmp.path(),
+            &mut None,
+            "brain_write_page",
+            json!({
+                "id": "entities/kept",
+                "content": "---\nid: entities/kept\ntype: entity\ntitle: Kept\nkeep: true\n---\n\nBody.\n"
+            }),
+        );
+        let text = std::fs::read_to_string(wiki_dir(tmp.path()).join("entities/kept.md")).unwrap();
+        assert!(text.contains("keep: true\n"), "{text}");
+    }
+
+    #[test]
+    fn the_detailed_read_of_a_kept_page_shows_the_keep_mark() {
+        let tmp = vault();
+        put(tmp.path(), "entities/kept", "keep: true\n", "Body.");
+        let out = call_json(
+            tmp.path(),
+            &mut None,
+            "brain_get_pages",
+            json!({ "ids": ["entities/kept"], "response_format": "detailed" }),
+        );
+        let fm: Value =
+            serde_json::from_str(out["pages"][0]["page"]["frontmatter"].as_str().unwrap()).unwrap();
+        assert_eq!(fm["keep"], json!(true));
+    }
+
+    #[test]
+    fn a_dream_log_with_items_drops_the_stored_queue() {
+        let tmp = vault();
+        let stored = crate::wiki::dream::DreamQueue {
+            generated_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            items: Vec::new(),
+            omitted: 0,
+            notes: Vec::new(),
+        };
+        crate::wiki::dream::write_dream_queue(tmp.path(), &stored).unwrap();
+        dream_log(
+            &tmp,
+            json!([{ "kind": "orphan", "pages": ["entities/x"], "outcome": "skipped", "note": "later" }]),
+        )
+        .unwrap();
+        assert!(!crate::wiki::dream::dream_queue_path(tmp.path()).exists());
+    }
+
+    #[test]
+    fn dream_log_refuses_a_page_id_with_a_backtick() {
+        let tmp = vault();
+        let err = dream_log(
+            &tmp,
+            json!([{ "kind": "orphan", "pages": ["entities/a`b"], "outcome": "done" }]),
+        )
+        .unwrap_err();
+        assert!(err.contains("backtick"), "{err}");
     }
 }

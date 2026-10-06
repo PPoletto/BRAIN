@@ -312,7 +312,12 @@ vor (Tiefschlaf); ein geplanter Agenten-Lauf über MCP erledigt das inhaltliche 
   AGENTS.md-Abschnitt mit harten Regeln: max N Änderungen pro Lauf (Standard 10), nie
   verlinkte Seiten löschen, Ablösen statt Überschreiben (`superseded_by`),
   Minderheitshypothesen behalten (Preprint: Verfestigung), jeder Lauf hinterlässt ein
-  lesbares Log, alles per `brain_history` (`action: restore`) rückholbar. **Auslösung (Nutzerentscheidung
+  lesbares Log, alles per `brain_history` (`action: restore`) rückholbar. **Log pro Eintrag
+  (0.3.5):** der eine `brain_dream`-`log`-Aufruf am Ende nennt jedes angesehene Queue-Item mit
+  Ergebnis (`done` / `skipped` + Grund / `deferred`); die Queue zählt frühere Skips
+  (`skipped_before`), ab 3 mit Hinweis im Grund und P3-Items ans Ende (nie ausgeblendet).
+  **`keep: true`** im Frontmatter („bleibt, obwohl unverlinkt/ungelesen") unterdrückt
+  `orphan`-Warnung und Decay-/Orphan-Items — sonst nichts. **Auslösung (Nutzerentscheidung
   06.10.): kein Zeitplan.** Der Nutzer triggert die REM-Phase bei Gelegenheit selbst — im
   Client per Prompt-Template `dream` oder schlicht „träum mal" an den Agenten, der dann
   `brain_dream` (`action: queue`) liest; wer automatisieren will, kann es (z. B. `/schedule`), BRAIN

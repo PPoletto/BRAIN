@@ -19,7 +19,8 @@ over MCP. The full conventions are in `00_meta/AGENTS.md` (MCP resource
   search ranks it highest). Optional: `tags: [..]`, `aliases: [..]`,
   `sources: [sources/..]` (expected on entity and concept pages),
   `valid_from` / `valid_to` (YYYY-MM-DD), `superseded_by: <id>`,
-  `distinct_from: [<id>]`.
+  `distinct_from: [<id>]`, `keep: true` (the user says an unlinked or
+  unread page stays: no orphan / decay reports for it).
 - Links: always `[[entities/dan-shapiro]]` or `[[entities/dan-shapiro|Dan]]`
   (no `|alias` inside table cells). Only link to pages that exist.
 
@@ -55,7 +56,11 @@ only when you need the extra fields.
   `brain://audit/latest`) or `brain_lint_report`; errors first, then one
   warning kind at a time (`response_format: "detailed"`, `kind`).
 - **Dream** (MCP prompt `dream`, only when the user asks): `brain_dream`
-  `queue`, work top-down, at most 10 changes, end with `brain_dream` `log`.
+  `queue`, work top-down, at most 10 changes, end with ONE `brain_dream`
+  `log` call whose `items` list every queue item you looked at with its
+  outcome (`done` / `skipped` + one-line reason / `deferred`). Items
+  skipped 3× before: decide them; only an orphan or decay-candidate item
+  may instead get `keep: true` on its page, if the user says it stays.
 
 ## Hard rules
 
@@ -67,7 +72,7 @@ only when you need the extra fields.
 - Before rewriting an existing page with `brain_write_page`, read it with
   `brain_get_pages` and `response_format: "detailed"` and carry over every
   frontmatter field unchanged (aliases, sources, tags, superseded_by,
-  valid_from/valid_to, distinct_from) — a concise read has no frontmatter.
+  valid_from/valid_to, distinct_from, keep) — a concise read has no frontmatter.
   For a body section only, use `brain_patch_page`.
 - Never delete a page other pages link to; ask before merging or deleting
   pages the user wrote.

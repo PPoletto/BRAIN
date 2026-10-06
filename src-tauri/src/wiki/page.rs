@@ -39,6 +39,16 @@ pub struct PageFrontmatter {
     /// thing (A2): silences the `alias-collision` lint for those pairs.
     #[serde(default, deserialize_with = "de_page_ref_list", skip_serializing_if = "Vec::is_empty")]
     pub distinct_from: Vec<String>,
+    /// "Leave this page alone" (H2): the user decided an unlinked or
+    /// unread page stays. Silences the `orphan` hygiene warning and the
+    /// dream queue's decay/orphan items — nothing else. Lenient: `true` /
+    /// `yes` (any case) count as set, `false` / `no` as unset. Any other
+    /// value is not a flag: it stays in [`Self::extra`] under `keep`
+    /// unchanged (a vault may use the key with its own meaning) and this
+    /// is `None`. Resolved by [`parse`] from the flattened keys;
+    /// serialised only when set.
+    #[serde(skip_deserializing, skip_serializing_if = "flag_unset")]
+    pub keep: Option<bool>,
     /// One or two sentences saying what the page is about (B2), written
     /// by the agent. Indexed as its own, higher-weighted FTS column and
     /// appended to every chunk's embedding context header. A list keeps
@@ -165,6 +175,32 @@ fn de_opt_scalar<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String
     Ok(de_list(d, false)?.into_iter().next())
 }
 
+impl PageFrontmatter {
+    /// Move a recognisable `keep` value (`true`/`false`, or the strings
+    /// `true`/`yes`/`false`/`no` in any case) from [`Self::extra`] into
+    /// [`Self::keep`]; any other value stays in `extra` as it was.
+    fn resolve_keep_flag(&mut self) {
+        let flag = match self.extra.get("keep") {
+            Some(serde_json::Value::Bool(b)) => Some(*b),
+            Some(serde_json::Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+                "true" | "yes" => Some(true),
+                "false" | "no" => Some(false),
+                _ => None,
+            },
+            _ => None,
+        };
+        if flag.is_some() {
+            self.extra.remove("keep");
+            self.keep = flag;
+        }
+    }
+}
+
+/// `skip_serializing_if` for flags that are written only when set.
+fn flag_unset(flag: &Option<bool>) -> bool {
+    *flag != Some(true)
+}
+
 fn de_opt_page_ref<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
     Ok(de_list(d, true)?.into_iter().next())
 }
@@ -264,7 +300,8 @@ pub fn parse(raw: &str) -> WikiResult<ParsedPage> {
         .trim_start_matches('\n');
 
     let frontmatter_raw: YamlValue = serde_yaml::from_str(yaml)?;
-    let frontmatter: PageFrontmatter = serde_yaml::from_str(yaml)?;
+    let mut frontmatter: PageFrontmatter = serde_yaml::from_str(yaml)?;
+    frontmatter.resolve_keep_flag();
     let wiki_links = extract_wiki_links(body);
     Ok(ParsedPage {
         frontmatter,
@@ -890,6 +927,34 @@ Intro mentions [Dan](entities/dan-shapiro).
             frontmatter_with("distinct_from: [\"[[entities/y]]\"]\n").distinct_from,
             vec!["entities/y"]
         );
+    }
+
+    #[test]
+    fn keep_true_is_read_as_a_set_flag() {
+        assert_eq!(frontmatter_with("keep: true\n").keep, Some(true));
+    }
+
+    #[test]
+    fn keep_yes_is_read_as_a_set_flag() {
+        assert_eq!(frontmatter_with("keep: yes\n").keep, Some(true));
+    }
+
+    #[test]
+    fn an_unreadable_keep_value_is_ignored_instead_of_failing_the_page() {
+        assert_eq!(frontmatter_with("keep: maybe\n").keep, None);
+    }
+
+    #[test]
+    fn an_unreadable_keep_value_is_kept_as_it_was_in_the_json_view() {
+        let json = serde_json::to_value(frontmatter_with("keep: maybe\n")).unwrap();
+        assert_eq!(json["keep"], serde_json::json!("maybe"));
+    }
+
+    #[test]
+    fn the_json_view_carries_keep_only_when_it_is_set() {
+        let unset = serde_json::to_value(frontmatter_with("keep: false\n")).unwrap();
+        let set = serde_json::to_value(frontmatter_with("keep: true\n")).unwrap();
+        assert_eq!((unset.get("keep").is_none(), set["keep"].clone()), (true, serde_json::json!(true)));
     }
 
     #[test]
