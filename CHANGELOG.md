@@ -6,6 +6,25 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Semantic search understands where a passage belongs.** Pages are now
+  split for the search index along their headings, and every passage is
+  indexed together with a short context line — the page title, its type
+  and the headings above it (e.g. "Customer A (entity) › Contract ›
+  Term"). A sentence like "the contract renews for 12 months" is now
+  found when you search for the customer or the topic, not only for the
+  exact words. Paraphrased and semantic queries — from the app and from
+  Claude/Codex via MCP — return noticeably better matches. Page content,
+  search snippets and full-text search are unchanged.
+- **One-time re-index after this update.** The first time a vault is
+  mounted after updating, BRAIN re-indexes every page once so existing
+  pages get the new context. With the semantic model active this can
+  keep BRAIN busy for a few minutes on a large vault; the status bar
+  shows "Rebuilding the index" while it runs, and searches started in
+  the meantime may wait until it is done. Later mounts only re-index
+  pages you changed, as before.
+
 ## [0.3.4] — 2026-10-06
 
 ### Changed

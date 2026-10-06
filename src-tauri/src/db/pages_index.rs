@@ -27,7 +27,15 @@ use super::{DbHandle, DbResult};
 /// History:
 ///  - v1: initial release ([[wiki-link]] only)
 ///  - v2: also recognise standard markdown `[text](id)` as wiki-link
-const INDEX_FORMAT_VERSION: i64 = 2;
+///  - v3: contextual chunking — chunks are cut per Markdown section and
+///    embedded with a `<title> (<type>) › <h1> › <h2>` context header
+///    (stored chunk text unchanged in kind: the original section words).
+///    Vectors written by v2 carry no page/section context, so every page
+///    must be re-embedded exactly once after the update; the version
+///    bump below is what forces that (written back in the same
+///    transaction, so an interrupted run simply retries next mount and a
+///    finished one never repeats).
+const INDEX_FORMAT_VERSION: i64 = 3;
 
 /// Rebuild with the process-cached embedder for `vault`, so a re-index
 /// after every watcher commit does not reload the bge-m3 weights.
@@ -51,6 +59,19 @@ pub fn rebuild_with<E: Embedder + ?Sized>(
         // skipping would leave the DB inconsistent with the new code.
         let stored_version = read_index_version(&tx).unwrap_or(0);
         let force_full = stored_version != INDEX_FORMAT_VERSION;
+        if force_full {
+            let indexed_pages: i64 = tx
+                .query_row("SELECT COUNT(*) FROM pages", [], |row| row.get(0))
+                .unwrap_or(0);
+            if indexed_pages > 0 {
+                tracing::info!(
+                    stored_version,
+                    new_version = INDEX_FORMAT_VERSION,
+                    pages = indexed_pages,
+                    "index format changed — re-indexing and re-embedding every page once"
+                );
+            }
+        }
 
         let mut seen_ids: HashSet<String> = HashSet::new();
         for sub in WIKI_SUBDIRS {
@@ -224,12 +245,23 @@ fn visit<E: Embedder + ?Sized>(
             }
         }
         tx.execute("DELETE FROM chunks WHERE page_id = ?1", params![&id])?;
-        for (idx, chunk_text) in chunker::chunks(&parsed.body).into_iter().enumerate() {
-            let v = embedder.embed(&chunk_text);
+        // Contextual chunking: the embedder sees "<title> (<type>) › <h1> ›
+        // <h2>" in front of each chunk so the vector encodes where the text
+        // belongs. Only the bare chunk text is stored — snippets, FTS and
+        // the UI never see the header. Queries are embedded bare.
+        let context_title = title.as_deref().unwrap_or(&id);
+        for (idx, chunk) in chunker::section_chunks(&parsed.body).into_iter().enumerate() {
+            let embed_input = chunker::contextual_text(
+                context_title,
+                &parsed.frontmatter.page_type,
+                &chunk.heading_path,
+                &chunk.text,
+            );
+            let v = embedder.embed(&embed_input);
             let blob = vec_to_bytes(&v);
             tx.execute(
                 "INSERT INTO chunks(page_id, chunk_idx, text, embedding) VALUES (?1, ?2, ?3, ?4)",
-                params![&id, idx as i64, &chunk_text, &blob],
+                params![&id, idx as i64, &chunk.text, &blob],
             )?;
             if vec_table_present {
                 let chunk_id = tx.last_insert_rowid();
@@ -514,5 +546,98 @@ mod tests {
             "untouched page should have stayed cached (initial={initial}, delta={})",
             after_edit - initial
         );
+    }
+
+    /// Fake embedder that records every text it was asked to embed.
+    struct RecordingEmbedder {
+        inputs: std::sync::Mutex<Vec<String>>,
+    }
+    impl RecordingEmbedder {
+        fn new() -> Self {
+            Self { inputs: std::sync::Mutex::new(Vec::new()) }
+        }
+        fn count(&self) -> usize {
+            self.inputs.lock().unwrap().len()
+        }
+    }
+    impl crate::embedding::Embedder for RecordingEmbedder {
+        fn dim(&self) -> usize { crate::embedding::EMBED_DIM }
+        fn name(&self) -> &'static str { "recording" }
+        fn embed(&self, text: &str) -> Vec<f32> {
+            self.inputs.lock().unwrap().push(text.to_string());
+            vec![0.0; crate::embedding::EMBED_DIM]
+        }
+    }
+
+    const CONTRACT_BODY: &str = "# Vertrag
+
+## Laufzeit
+
+the contract renews for 12 months";
+
+    #[test]
+    fn rebuild_embeds_the_chunk_with_a_context_header_starting_with_the_page_title() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        write_page(tmp.path(), "entities", "kunde-a", CONTRACT_BODY, &[]);
+        let db = DbHandle::open(tmp.path()).unwrap();
+        let embedder = RecordingEmbedder::new();
+        rebuild_with(&db, tmp.path(), &embedder).unwrap();
+        let inputs = embedder.inputs.lock().unwrap().clone();
+        assert_eq!(
+            inputs,
+            vec!["T (entity) › Vertrag › Laufzeit
+
+the contract renews for 12 months".to_string()]
+        );
+    }
+
+    #[test]
+    fn rebuild_stores_the_original_chunk_text_without_the_context_header() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        write_page(tmp.path(), "entities", "kunde-a", CONTRACT_BODY, &[]);
+        let db = DbHandle::open(tmp.path()).unwrap();
+        rebuild_with(&db, tmp.path(), &RecordingEmbedder::new()).unwrap();
+        let stored: Vec<String> = db
+            .with(|conn| {
+                let mut stmt = conn.prepare("SELECT text FROM chunks ORDER BY chunk_idx")?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(stored, vec!["the contract renews for 12 months".to_string()]);
+    }
+
+    /// Upgrade path: an index written by the pre-contextual indexer (format
+    /// v2) holds context-free vectors. The first rebuild after the update
+    /// must re-embed a page even though its file hash is unchanged, and
+    /// the rebuild after that must not embed anything again.
+    #[test]
+    fn upgrading_from_format_v2_re_embeds_an_unchanged_page_exactly_once() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        write_page(tmp.path(), "entities", "kunde-a", CONTRACT_BODY, &[]);
+        let db = DbHandle::open(tmp.path()).unwrap();
+        let embedder = RecordingEmbedder::new();
+        rebuild_with(&db, tmp.path(), &embedder).unwrap();
+        db.with(|conn| {
+            conn.execute(
+                "UPDATE schema_meta SET value='2' WHERE key='index_format_version'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let before = embedder.count();
+        rebuild_with(&db, tmp.path(), &embedder).unwrap();
+        let upgrade_run = embedder.count() - before;
+        rebuild_with(&db, tmp.path(), &embedder).unwrap();
+        let next_run = embedder.count() - before - upgrade_run;
+
+        assert_eq!((upgrade_run, next_run), (1, 0));
     }
 }
