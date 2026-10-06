@@ -191,7 +191,7 @@ pnpm tauri build
 ls src-tauri/target/release/bundle/
 ```
 
-Install it locally (`.msi` on Windows, drag to `/Applications` on macOS,
+Install it locally (`*-setup.exe` (NSIS) on Windows, drag to `/Applications` on macOS,
 `AppImage` on Linux). Run through:
 
 - Onboarding completes

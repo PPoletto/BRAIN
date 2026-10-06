@@ -21,6 +21,16 @@ on:
     tags:
       - "v*"
 
+# One release build per tag at a time. Moving a tag while a run is still
+# uploading let two runs write into the same draft (run #33 failed that
+# way); the newer push now cancels the older run.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+# Actions are pinned to commit SHAs (supply-chain hardening); the tag they
+# were resolved from is in the trailing comment. Bump by resolving the new
+# tag with `git ls-remote https://github.com/<owner>/<repo>.git refs/tags/<tag>^{}`.
 jobs:
   build:
     permissions:
@@ -40,7 +50,7 @@ jobs:
     runs-on: ${{ matrix.platform }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Install Linux build deps
         if: matrix.platform == 'ubuntu-24.04'
@@ -54,23 +64,26 @@ jobs:
             libssl-dev \
             patchelf
 
+      # Pinned to a SHA, so the toolchain channel must be given explicitly
+      # (unpinned, the action takes it from the ref name `@stable`).
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable branch
         with:
+          toolchain: stable
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: ./src-tauri -> target
 
       # No `version:` here on purpose — `package.json`'s
       # `packageManager: "pnpm@9.12.0"` field is the source of truth.
       - name: Set up pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
 
       - name: Set up Node
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
           cache: pnpm
@@ -113,7 +126,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Build, sign, upload
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -131,8 +144,8 @@ jobs:
           releaseBody: ${{ steps.notes.outputs.body }}
           releaseDraft: true
           prerelease: false
-          # Belt-and-suspenders: even if a future tauri.conf.json regression
-          # re-enables MSI on Windows, latest.json should reference the NSIS
-          # bundle (the one we actually ship and sign for auto-update).
+          # tauri.conf.json lists the bundle targets explicitly (NSIS, no
+          # MSI). Belt-and-suspenders: should a future change re-enable MSI,
+          # latest.json still references the NSIS bundle we ship and sign.
           updaterJsonPreferNsis: true
           args: ${{ matrix.args }}
