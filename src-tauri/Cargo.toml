@@ -62,9 +62,10 @@ zerocopy = "0.8"
 
 # ML (bge-m3 embeddings via candle, XLM-RoBERTa architecture).
 # CPU-only — no CUDA/MKL/Accelerate dependency to keep portable. Loading the
-# 1024-d model adds ~2.3 GB on disk and ~1 GB RAM; the embedder gracefully
-# falls back to the deterministic HashedEmbedder when model files are absent
-# (see src/embedding/mod.rs::for_vault).
+# 1024-d model adds ~2.3 GB on disk and ~2.2 GB RAM (F32, ~568M params),
+# loaded once per process (src/embedding/mod.rs::cached_for_vault); the
+# embedder gracefully falls back to the deterministic HashedEmbedder when
+# model files are absent.
 candle-core = { version = "0.10", default-features = false }
 candle-nn = { version = "0.10", default-features = false }
 candle-transformers = { version = "0.10", default-features = false }

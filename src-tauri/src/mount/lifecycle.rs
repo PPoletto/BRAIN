@@ -136,6 +136,13 @@ pub fn unmount(state: &AppState, force: bool) -> MountResult<()> {
 
     state.set_vault_path(None);
     state.set_mount(MountState::Disconnected);
+    // Release the ~2.2 GB bge-m3 model on a deliberate unmount. Off the
+    // calling thread: unmount runs from sync commands/tray handlers, and
+    // the invalidation waits on the cache lock if a load is in progress.
+    // An in-flight search keeps its own `Arc`, so this is safe. Not done
+    // in `handle_vault_disappearance`: a cable bump must not force a
+    // multi-second reload once the disk is back.
+    std::thread::spawn(crate::embedding::invalidate_embedder_cache);
     Ok(())
 }
 

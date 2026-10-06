@@ -182,6 +182,14 @@ pub fn run_stdio() -> std::io::Result<()> {
     // reachable.
     let mut db: Option<crate::db::DbHandle> = None;
 
+    // The embedding model is deliberately NOT warmed up here. Every MCP
+    // client (Claude Desktop, Claude Code, Cursor, ...) spawns its own
+    // `brain mcp` process, and an eager bge-m3 load would cost ~2.2 GB
+    // of RAM (F32 weights) per process even if that client never
+    // searches. The model loads lazily on the first `brain_search` (via
+    // the process cache in `embedding::cached_for_vault`); later
+    // searches reuse it.
+
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -842,10 +850,17 @@ fn call_tool(
             // walker so the LLM still gets results — the same graceful
             // degradation `search_with_db` did internally, but now the
             // timeout boundary lives here where we own `&mut db`.
+            //
+            // The embedder is resolved BEFORE db_op: the first search in
+            // this process loads the 2.2 GB bge-m3 weights, which takes
+            // longer than DB_OP_TIMEOUT. Inside the timeout that load
+            // was abandoned every time and search silently degraded to
+            // the substring walk. Outside it, the first search pays the
+            // load once and every later search hits the process cache.
+            let embedder = crate::embedding::cached_for_vault(vault);
             let query_owned = q.to_string();
-            let vault_owned = vault.to_path_buf();
             let hybrid = db_op(db, vault, "brain_search", move |conn| {
-                search::search_hybrid_on_conn(conn, &vault_owned, &query_owned)
+                search::search_hybrid_on_conn(conn, embedder.as_ref(), &query_owned)
                     .map_err(crate::db::DbError::from)
             });
             let hits = match hybrid {
@@ -1304,11 +1319,14 @@ fn call_tool(
             Ok(serde_json::to_string_pretty(&hits).unwrap_or_default())
         }
         "brain_embedding_status" => {
-            // Read which embedder `for_vault` would build for this
-            // vault right now — same code path as the indexer, so the
-            // status reflects what's actually generating chunk
-            // vectors. Cheap (no model load when files are absent).
-            let embedder = crate::embedding::for_vault(vault);
+            // Read which embedder `cached_for_vault` serves for this
+            // vault right now — same code path as the indexer and
+            // search, so the status reflects what's actually generating
+            // chunk vectors. Cheap when the files are absent or the
+            // model is already cached; otherwise this call pays the
+            // one-time load that later searches then reuse.
+            // TODO(S06): report from a cache peek (loaded / failed / not yet loaded) instead of forcing a load here.
+            let embedder = crate::embedding::cached_for_vault(vault);
             let model_dir = crate::vault::layout::models_dir(vault).join("bge-m3");
             let semantic = embedder.name() == "bge-m3";
             // Chunk count via db_op (timeout-bounded, self-healing).

@@ -11,7 +11,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::db::{migrations, DbHandle};
-use crate::embedding::{bytes_to_vec, cosine, vec_to_bytes};
+use crate::embedding::{bytes_to_vec, cosine, vec_to_bytes, Embedder};
 use crate::vault::layout::{wiki_dir, WIKI_SUBDIRS};
 use crate::wiki::page::{extract_wiki_links, parse};
 
@@ -68,24 +68,33 @@ pub fn search_with_db(
 /// appears in either ranked list, `score = 1/(k+rank_fts) + 1/(k+rank_vec)`
 /// with `k=60` per the canonical RRF paper. RRF is robust against
 /// score-scale mismatches between BM25 and cosine.
+///
+/// The embedder comes from the process-wide cache, so the bge-m3 weights
+/// are loaded once (first search or mount warm-up), not per query.
 fn search_hybrid(db: &DbHandle, vault: &Path, query: &str) -> ViewerResult<Vec<SearchHit>> {
-    db.with(|conn| search_hybrid_on_conn(conn, vault, query).map_err(crate::db::DbError::from))
-        .map_err(|err| super::ViewerError::Io(std::io::Error::other(err.to_string())))
+    let embedder = crate::embedding::cached_for_vault(vault);
+    db.with(|conn| {
+        search_hybrid_on_conn(conn, embedder.as_ref(), query).map_err(crate::db::DbError::from)
+    })
+    .map_err(|err| super::ViewerError::Io(std::io::Error::other(err.to_string())))
 }
 
 /// The connection-only core of hybrid search. Split out from
 /// [`search_hybrid`] so the MCP server can run it through its
 /// timeout/reopen wrapper (`db_op`) — that wrapper owns the
 /// `&mut Option<DbHandle>` and therefore must call into a function that
-/// takes a bare `&Connection`. The embedder work (model load + embed)
-/// is included here so it, too, is covered by the MCP timeout boundary;
-/// it does no DB I/O of its own.
+/// takes a bare `&Connection`.
+///
+/// The embedder is a parameter on purpose: callers obtain it via
+/// `embedding::cached_for_vault` BEFORE entering any timeout boundary, so
+/// a one-time model load (seconds for the 2.2 GB bge-m3 weights) is never
+/// misread as a hung disk. Only the query embedding (fast, CPU) and the
+/// DB work run here.
 pub fn search_hybrid_on_conn(
     conn: &rusqlite::Connection,
-    vault: &Path,
+    embedder: &dyn Embedder,
     query: &str,
 ) -> rusqlite::Result<Vec<SearchHit>> {
-    let embedder = crate::embedding::for_vault(vault);
     let q_vec = embedder.embed(query);
     let q = sanitize_fts_query(query);
 

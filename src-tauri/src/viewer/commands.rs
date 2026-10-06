@@ -31,14 +31,24 @@ pub fn read_page(
     tree::read_page(&vault, &id).map_err(BrainError::from)
 }
 
+/// Async so the search never runs on the UI thread: the first search
+/// after mount may still be waiting for the bge-m3 load (see the mount
+/// warm-up), and even a warm hybrid search is CPU + DB work. No
+/// `begin_op`: Tier2 re-runs the current query on every data refresh
+/// (auto-commit, disk reconnect) in addition to explicit submits, so an
+/// op label would make the status pill flicker for routine background
+/// refreshes. Tier2 guards against overlapping calls (single in flight).
 #[tauri::command]
-pub fn search_pages(
-    state: State<Arc<crate::state::AppState>>,
+pub async fn search_pages(
+    state: State<'_, Arc<crate::state::AppState>>,
     query: String,
 ) -> BrainResult<Vec<SearchHit>> {
     let vault = current_vault(&state)?;
     let db = state.db();
-    search::search_with_db(&vault, &query, db.as_ref()).map_err(BrainError::from)
+    tokio::task::spawn_blocking(move || search::search_with_db(&vault, &query, db.as_ref()))
+        .await
+        .map_err(|e| BrainError::Internal(format!("search task panicked: {e}")))?
+        .map_err(BrainError::from)
 }
 
 #[tauri::command]

@@ -29,8 +29,10 @@ use super::{DbHandle, DbResult};
 ///  - v2: also recognise standard markdown `[text](id)` as wiki-link
 const INDEX_FORMAT_VERSION: i64 = 2;
 
+/// Rebuild with the process-cached embedder for `vault`, so a re-index
+/// after every watcher commit does not reload the bge-m3 weights.
 pub fn rebuild(db: &DbHandle, vault: &Path) -> DbResult<()> {
-    let embedder = crate::embedding::for_vault(vault);
+    let embedder = crate::embedding::cached_for_vault(vault);
     rebuild_with(db, vault, embedder.as_ref())
 }
 

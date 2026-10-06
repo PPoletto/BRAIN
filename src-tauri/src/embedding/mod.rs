@@ -14,8 +14,10 @@ pub mod chunk;
 pub mod download;
 pub mod hashed;
 
-use std::path::Path;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::SystemTime;
 
 /// Build the best available embedder for `vault`. Prefers `bge-m3` when its
 /// model files are present in `04_models/bge-m3/`; falls back to the
@@ -23,16 +25,178 @@ use std::sync::Arc;
 ///
 /// Falling back is intentional: search must work on a freshly-onboarded
 /// vault before the user has downloaded ~2 GB of weights.
+///
+/// This is the UNCACHED constructor: every call with a present model
+/// re-reads the ~2.2 GB weights from disk. Production code must use
+/// [`cached_for_vault`]; this stays public for tests and one-off tools.
 pub fn for_vault(vault: &Path) -> Arc<dyn Embedder> {
-    let model_dir = crate::vault::layout::models_dir(vault).join("bge-m3");
-    if has_full_model(&model_dir) {
-        match bge_m3::BgeM3Embedder::try_new(&model_dir) {
-            Ok(e) => return Arc::new(e),
-            Err(err) => {
-                tracing::warn!(?err, "bge-m3 init failed, falling back to hashed embedder");
+    try_load_bge_m3(&bge_m3_dir(vault)).unwrap_or_else(hashed_fallback)
+}
+
+/// Like [`for_vault`], but loads the bge-m3 weights at most once per
+/// process and model directory; later calls return the same `Arc`.
+///
+/// The cache lock is held WHILE the model loads. That is deliberate: two
+/// concurrent callers (e.g. the mount warm-up and the first search, or the
+/// background re-index) must never both read the 2.2 GB file and keep two
+/// ~2.2 GB copies in RAM (the model loads as F32, ~568M parameters). The
+/// second caller simply waits for the first load and then gets the cached
+/// instance. The cost is that a cache hit for a different vault also waits
+/// during a load — acceptable, since only one vault is mounted at a time.
+///
+/// A missing model is never cached: a fresh `HashedEmbedder` is returned,
+/// so a model downloaded later is picked up on the next call. A model
+/// whose files are all present but fail to load IS remembered (negative
+/// cache keyed by a size/mtime fingerprint of the files), so a corrupt
+/// download doesn't re-read 2.2 GB on every search and re-index. Changing
+/// a fingerprinted file, or [`invalidate_embedder_cache`], retries.
+pub fn cached_for_vault(vault: &Path) -> Arc<dyn Embedder> {
+    global_cache().get_or_load(&bge_m3_dir(vault), try_load_bge_m3)
+}
+
+/// Drop every cached embedder and every remembered load failure. Call
+/// after the model files changed on disk (e.g. a completed download) or
+/// on unmount to release the model's RAM. May block while a load is in
+/// progress (the cache lock is held during loads), so call it off the UI
+/// thread. In-flight users keep their own `Arc`, so clearing is safe.
+pub fn invalidate_embedder_cache() {
+    global_cache().clear();
+}
+
+fn global_cache() -> &'static EmbedderCache {
+    static CACHE: OnceLock<EmbedderCache> = OnceLock::new();
+    CACHE.get_or_init(EmbedderCache::default)
+}
+
+/// Cheap identity of the model files on disk, used to decide whether a
+/// remembered load failure is still valid. Covers the weights (length +
+/// mtime: the 2.2 GB file we must not re-read needlessly) plus the
+/// tokenizer and config, which `BgeM3Embedder::try_new` parses before the
+/// weights, so a fix to either must also trigger a retry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelFingerprint {
+    bin_len: u64,
+    bin_mtime: SystemTime,
+    tok_mtime: SystemTime,
+    config_mtime: SystemTime,
+}
+
+impl ModelFingerprint {
+    /// `None` when any file's metadata is unreadable. The failure is then
+    /// not remembered and the next call simply retries.
+    fn of(model_dir: &Path) -> Option<Self> {
+        let bin = std::fs::metadata(model_dir.join("pytorch_model.bin")).ok()?;
+        let tok = std::fs::metadata(model_dir.join("tokenizer.json")).ok()?;
+        let config = std::fs::metadata(model_dir.join("config.json")).ok()?;
+        Some(Self {
+            bin_len: bin.len(),
+            bin_mtime: bin.modified().ok()?,
+            tok_mtime: tok.modified().ok()?,
+            config_mtime: config.modified().ok()?,
+        })
+    }
+}
+
+enum Slot {
+    /// A successfully loaded real model.
+    Loaded(Arc<dyn Embedder>),
+    /// All files were present but loading failed. Not retried while the
+    /// files still match this fingerprint.
+    Failed(ModelFingerprint),
+}
+
+/// Map from model directory to its [`Slot`]. One process-wide instance
+/// backs [`cached_for_vault`]; tests build their own instances so they
+/// never race with other tests (e.g. unmount) that clear the global one.
+#[derive(Default)]
+struct EmbedderCache {
+    slots: Mutex<HashMap<PathBuf, Slot>>,
+}
+
+impl EmbedderCache {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, Slot>> {
+        // A poisoned lock only means a previous load panicked; the map is
+        // still consistent (slots are written only after a load returns).
+        self.slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn get_or_load(
+        &self,
+        model_dir: &Path,
+        load: impl Fn(&Path) -> Option<Arc<dyn Embedder>>,
+    ) -> Arc<dyn Embedder> {
+        let mut slots = self.lock();
+        let fingerprint = if has_full_model(model_dir) {
+            ModelFingerprint::of(model_dir)
+        } else {
+            None
+        };
+        match slots.get(model_dir) {
+            Some(Slot::Loaded(embedder)) => return embedder.clone(),
+            Some(Slot::Failed(failed)) if fingerprint.as_ref() == Some(failed) => {
+                return hashed_fallback();
+            }
+            _ => {}
+        }
+        match load(model_dir) {
+            Some(embedder) => {
+                slots.insert(model_dir.to_path_buf(), Slot::Loaded(embedder.clone()));
+                embedder
+            }
+            None => {
+                // Remember only a failure with every file present (and a
+                // readable fingerprint). A missing model stays uncached so
+                // a later download is picked up.
+                match fingerprint {
+                    Some(fp) => {
+                        slots.insert(model_dir.to_path_buf(), Slot::Failed(fp));
+                    }
+                    None => {
+                        slots.remove(model_dir);
+                    }
+                }
+                hashed_fallback()
             }
         }
     }
+
+    fn clear(&self) {
+        self.lock().clear();
+    }
+
+    /// Test-only peek: `Some("loaded")`, `Some("failed")`, or `None` when
+    /// the directory has no slot.
+    #[cfg(test)]
+    fn slot_kind(&self, model_dir: &Path) -> Option<&'static str> {
+        self.lock().get(model_dir).map(|slot| match slot {
+            Slot::Loaded(_) => "loaded",
+            Slot::Failed(_) => "failed",
+        })
+    }
+}
+
+fn bge_m3_dir(vault: &Path) -> PathBuf {
+    crate::vault::layout::models_dir(vault).join("bge-m3")
+}
+
+/// Load the real bge-m3 model from `model_dir`, or `None` when the files
+/// are incomplete or loading fails (logged).
+fn try_load_bge_m3(model_dir: &Path) -> Option<Arc<dyn Embedder>> {
+    if !has_full_model(model_dir) {
+        return None;
+    }
+    match bge_m3::BgeM3Embedder::try_new(model_dir) {
+        Ok(e) => Some(Arc::new(e)),
+        Err(err) => {
+            tracing::warn!(?err, "bge-m3 init failed, falling back to hashed embedder");
+            None
+        }
+    }
+}
+
+fn hashed_fallback() -> Arc<dyn Embedder> {
     Arc::new(hashed::HashedEmbedder::new())
 }
 
@@ -121,5 +285,128 @@ mod tests {
     #[test]
     fn bytes_to_vec_returns_empty_for_misaligned_input() {
         assert!(bytes_to_vec(&[1, 2, 3]).is_empty());
+    }
+
+    /// Minimal embedder so cache tests never need the real model.
+    struct FakeEmbedder;
+    impl Embedder for FakeEmbedder {
+        fn dim(&self) -> usize {
+            EMBED_DIM
+        }
+        fn embed(&self, _text: &str) -> Vec<f32> {
+            vec![0.0; EMBED_DIM]
+        }
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+    }
+
+    fn fake_loader(_dir: &Path) -> Option<Arc<dyn Embedder>> {
+        Some(Arc::new(FakeEmbedder))
+    }
+
+    /// Writes the four model files as tiny stubs with an invalid
+    /// `config.json`, so `BgeM3Embedder::try_new` fails while parsing the
+    /// config, before it would ever read weights.
+    fn write_broken_model(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("pytorch_model.bin"), b"stub").unwrap();
+        std::fs::write(dir.join("tokenizer.json"), b"{}").unwrap();
+        std::fs::write(dir.join("config.json"), b"not json").unwrap();
+        std::fs::write(dir.join("sentencepiece.bpe.model"), b"stub").unwrap();
+    }
+
+    #[test]
+    fn cached_for_vault_returns_a_full_dimension_embedder_when_no_model_is_present() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert_eq!(cached_for_vault(tmp.path()).dim(), EMBED_DIM);
+    }
+
+    #[test]
+    fn the_cache_does_not_remember_the_fallback_when_no_model_is_present() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = EmbedderCache::default();
+        let _ = cache.get_or_load(tmp.path(), try_load_bge_m3);
+        assert_eq!(cache.slot_kind(tmp.path()), None);
+    }
+
+    #[test]
+    fn the_cache_returns_the_same_instance_for_a_loaded_model_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = EmbedderCache::default();
+        let first = cache.get_or_load(tmp.path(), fake_loader);
+        let second = cache.get_or_load(tmp.path(), fake_loader);
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn clearing_the_cache_removes_a_loaded_embedder() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = EmbedderCache::default();
+        let _ = cache.get_or_load(tmp.path(), fake_loader);
+        cache.clear();
+        assert_eq!(cache.slot_kind(tmp.path()), None);
+    }
+
+    #[test]
+    fn invalidate_embedder_cache_empties_the_process_wide_cache() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Unique tempdir key; a concurrent clear from another test (e.g.
+        // unmount) can only make the assertion "more true", never flaky.
+        let _ = global_cache().get_or_load(tmp.path(), fake_loader);
+        invalidate_embedder_cache();
+        assert_eq!(global_cache().slot_kind(tmp.path()), None);
+    }
+
+    #[test]
+    fn a_failed_real_load_falls_back_to_the_hashed_embedder() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_broken_model(tmp.path());
+        let cache = EmbedderCache::default();
+        let _ = cache.get_or_load(tmp.path(), try_load_bge_m3);
+        let second = cache.get_or_load(tmp.path(), try_load_bge_m3);
+        assert_eq!(second.name(), hashed::HashedEmbedder::new().name());
+    }
+
+    #[test]
+    fn a_failed_real_load_is_not_cached_as_loaded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_broken_model(tmp.path());
+        let cache = EmbedderCache::default();
+        let _ = cache.get_or_load(tmp.path(), try_load_bge_m3);
+        assert_eq!(cache.slot_kind(tmp.path()), Some("failed"));
+    }
+
+    #[test]
+    fn a_failed_real_model_load_is_remembered_and_not_retried_while_the_files_are_unchanged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_broken_model(tmp.path());
+        let cache = EmbedderCache::default();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let counting = |dir: &Path| {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            try_load_bge_m3(dir)
+        };
+        let _ = cache.get_or_load(tmp.path(), counting);
+        let _ = cache.get_or_load(tmp.path(), counting);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_failed_real_model_load_is_retried_once_the_weights_file_changes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_broken_model(tmp.path());
+        let cache = EmbedderCache::default();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let counting = |dir: &Path| {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            try_load_bge_m3(dir)
+        };
+        let _ = cache.get_or_load(tmp.path(), counting);
+        // A different length changes the fingerprint regardless of the
+        // filesystem's mtime resolution.
+        std::fs::write(tmp.path().join("pytorch_model.bin"), b"longer stub").unwrap();
+        let _ = cache.get_or_load(tmp.path(), counting);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

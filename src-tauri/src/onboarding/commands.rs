@@ -207,7 +207,14 @@ pub async fn download_embedding_model(app: AppHandle, path: String) -> BrainResu
             );
         };
         crate::embedding::download::download_bge_m3(&models, Some(&cb))
-            .map_err(|e| BrainError::Internal(format!("model download failed: {e}")))
+            .map_err(|e| BrainError::Internal(format!("model download failed: {e}")))?;
+        // The model files on disk may have just appeared or changed; drop
+        // any cached embedder (or remembered load failure) so the next
+        // search / re-index loads the fresh weights. Inside the blocking
+        // task because invalidation waits on the cache lock if a load is
+        // in progress — that must never stall a tokio worker.
+        crate::embedding::invalidate_embedder_cache();
+        Ok::<(), BrainError>(())
     })
     .await
     .map_err(|e| BrainError::Internal(format!("download task panicked: {e}")))??;
@@ -448,11 +455,17 @@ fn complete_auto_mount(
 /// (with optional bge-m3 calls for any page whose file_hash changed) and
 /// MCP re-registration. Bumps the active-ops counter so the tray pill
 /// goes yellow while the work runs and back to green when it's done.
+///
+/// Called exactly once per mount (from `complete_auto_mount` and
+/// `finish_onboarding`), so the embedding warm-up below also runs once
+/// per mount.
 fn spawn_bootstrap_background_work(
     app: AppHandle,
     state: Arc<crate::state::AppState>,
     vault: PathBuf,
 ) {
+    spawn_embedder_warm_up(state.clone(), vault.clone());
+
     std::thread::spawn(move || {
         const OP: &str = "Preparing the vault (index + MCP)";
         state.begin_op(OP);
@@ -475,6 +488,37 @@ fn spawn_bootstrap_background_work(
             }
             Err(err) => tracing::warn!(?err, "background MCP re-registration failed"),
         }
+    });
+}
+
+/// Loads the bge-m3 model into the process-wide embedder cache in the
+/// background, so the first search after mount does not pay the multi-
+/// second load. Never blocks mounting. If the background re-index or a
+/// search asks for the embedder while this runs, it waits on the cache
+/// lock and reuses this load instead of starting a second one. Without a
+/// downloaded model this returns almost immediately (hashed fallback,
+/// nothing cached).
+///
+/// GUI only: the MCP subprocess stays lazy (see `mcp::server::run_stdio`).
+fn spawn_embedder_warm_up(state: Arc<crate::state::AppState>, vault: PathBuf) {
+    const OP: &str = "Loading the embedding model";
+    // Drop guard ends the op even if the model load panics, or if the task
+    // is dropped without ever running (runtime shutdown) — it is built
+    // BEFORE the spawn and moved into the closure.
+    struct OpGuard {
+        state: Arc<crate::state::AppState>,
+    }
+    impl Drop for OpGuard {
+        fn drop(&mut self) {
+            self.state.end_op(OP);
+        }
+    }
+    state.begin_op(OP);
+    let guard = OpGuard { state };
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        let embedder = crate::embedding::cached_for_vault(&vault);
+        tracing::info!(embedder = embedder.name(), "embedding model warm-up finished");
     });
 }
 

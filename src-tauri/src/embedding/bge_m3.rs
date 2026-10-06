@@ -21,9 +21,10 @@
 //! `viewer::search::search_hybrid`) wrap it in a blocking task when needed.
 //!
 //! When any of the required files are missing or weight-loading fails, the
-//! module returns a typed error and the caller (`embedding::for_vault`)
-//! falls back to `HashedEmbedder`. Search still works on a freshly-onboarded
-//! vault before the user has downloaded the ~2.3 GB of weights.
+//! module returns a typed error and the caller (`embedding::try_load_bge_m3`,
+//! used by `embedding::cached_for_vault`) falls back to `HashedEmbedder`.
+//! Search still works on a freshly-onboarded vault before the user has
+//! downloaded the ~2.3 GB of weights.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -120,6 +121,15 @@ impl BgeM3Embedder {
             });
         }
 
+        // Load the tokenizer BEFORE the weights: a broken tokenizer then
+        // fails in milliseconds instead of after reading 2.2 GB.
+        let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| BgeM3Error::BadTokenizer(e.to_string()))?;
+        // We never batch-encode here, so padding is unnecessary; truncation
+        // we do ourselves below to stay under MAX_TOKENS.
+        let _ = tokenizer.with_padding(None);
+        let _ = tokenizer.with_truncation(None);
+
         let device = Device::Cpu;
 
         let vb = if safetensors_path.exists() {
@@ -146,13 +156,6 @@ impl BgeM3Embedder {
             Err(_) => XLMRobertaModel::new(&config, vb.pp("roberta"))
                 .map_err(|e| BgeM3Error::BadWeights(e.to_string()))?,
         };
-
-        let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| BgeM3Error::BadTokenizer(e.to_string()))?;
-        // We never batch-encode here, so padding is unnecessary; truncation
-        // we do ourselves below to stay under MAX_TOKENS.
-        let _ = tokenizer.with_padding(None);
-        let _ = tokenizer.with_truncation(None);
 
         Ok(Self {
             model,
