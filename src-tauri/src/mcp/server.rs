@@ -128,6 +128,11 @@ fn spawn_parent_watchdog() {
 /// allocation failure, the last heartbeat shows whether memory had been
 /// growing beforehand. Once every 10 minutes: cheap, and enough to see a
 /// trend over a multi-day session.
+///
+/// Each tick also drops the bge-m3 model if no search used it for
+/// `EMBEDDER_IDLE_TTL` (logged at info level by `evict_idle_embedders`).
+/// With the 10-minute tick the effective idle window is 15–25 minutes.
+/// Eviction runs before the RSS sample so the heartbeat reflects it.
 fn spawn_health_heartbeat() {
     use sysinfo::{Pid, ProcessesToUpdate, System};
     let me = Pid::from_u32(std::process::id());
@@ -135,6 +140,7 @@ fn spawn_health_heartbeat() {
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(std::time::Duration::from_secs(600));
+            crate::embedding::evict_idle_embedders(crate::embedding::EMBEDDER_IDLE_TTL);
             let mut sys = System::new();
             sys.refresh_processes(ProcessesToUpdate::Some(&[me]), true);
             let rss_mb = sys.process(me).map(|p| p.memory() / (1024 * 1024)).unwrap_or(0);

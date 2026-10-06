@@ -499,6 +499,10 @@ fn spawn_bootstrap_background_work(
 /// downloaded model this returns almost immediately (hashed fallback,
 /// nothing cached).
 ///
+/// One-shot per mount: if the idle ticker later evicts the model
+/// (`embedding::EMBEDDER_IDLE_TTL`), nothing re-warms it; the next search
+/// or re-index reloads it lazily (a few seconds).
+///
 /// GUI only: the MCP subprocess stays lazy (see `mcp::server::run_stdio`).
 fn spawn_embedder_warm_up(state: Arc<crate::state::AppState>, vault: PathBuf) {
     const OP: &str = "Loading the embedding model";

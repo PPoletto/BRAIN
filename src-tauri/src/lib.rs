@@ -348,6 +348,17 @@ pub fn run() {
                     prewarm.set_disk_cache(disks);
                 }
             });
+
+            // Idle eviction for the ~2.2 GB bge-m3 model: started once per
+            // process (setup runs once), not per mount. Every 60 s, drop the
+            // model if nothing used it for EMBEDDER_IDLE_TTL; the next
+            // search reloads it lazily. `evict_idle_embedders` logs at info
+            // level when it evicts and skips a round instead of waiting
+            // behind an in-progress load.
+            std::thread::spawn(|| loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                embedding::evict_idle_embedders(embedding::EMBEDDER_IDLE_TTL);
+            });
             Ok(())
         })
         .on_window_event(|window, event| {

@@ -17,7 +17,7 @@ pub mod hashed;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 /// Build the best available embedder for `vault`. Prefers `bge-m3` when its
 /// model files are present in `04_models/bge-m3/`; falls back to the
@@ -50,6 +50,10 @@ pub fn for_vault(vault: &Path) -> Arc<dyn Embedder> {
 /// cache keyed by a size/mtime fingerprint of the files), so a corrupt
 /// download doesn't re-read 2.2 GB on every search and re-index. Changing
 /// a fingerprinted file, or [`invalidate_embedder_cache`], retries.
+///
+/// A loaded model that goes unused for [`EMBEDDER_IDLE_TTL`] is dropped by
+/// the periodic [`evict_idle_embedders`] check; the next call then reloads
+/// it lazily (a few seconds).
 pub fn cached_for_vault(vault: &Path) -> Arc<dyn Embedder> {
     global_cache().get_or_load(&bge_m3_dir(vault), try_load_bge_m3)
 }
@@ -61,6 +65,41 @@ pub fn cached_for_vault(vault: &Path) -> Arc<dyn Embedder> {
 /// thread. In-flight users keep their own `Arc`, so clearing is safe.
 pub fn invalidate_embedder_cache() {
     global_cache().clear();
+}
+
+/// How long a loaded bge-m3 model may sit unused before
+/// [`evict_idle_embedders`] drops it.
+///
+/// Trade-off: the model holds ~2.2 GB of RAM (F32 weights) for as long as
+/// it is cached, while reloading it after a pause costs a few seconds on
+/// the next search or re-index. 15 minutes keeps it resident through an
+/// active working session (searches, auto-commits that re-index) and
+/// gives the memory back once the user has moved on. After an eviction
+/// the next caller reloads lazily; nothing re-warms automatically.
+pub const EMBEDDER_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// Drop every cached real model that has not been handed out for longer
+/// than `max_idle`; returns how many were evicted (and logs at info level
+/// when that is non-zero). Remembered load failures are kept: they are
+/// tiny and stop a corrupt model from being re-read.
+///
+/// Never queues behind an in-progress model load: if the cache lock is
+/// held, this round is skipped and 0 is returned — the next tick retries.
+///
+/// Safe while a search runs: every user holds its own `Arc` to the
+/// embedder, so eviction only drops the cache's reference and the memory
+/// is freed when the last in-flight user finishes.
+pub fn evict_idle_embedders(max_idle: Duration) -> usize {
+    let evicted = global_cache().evict_idle(max_idle);
+    if let Some(longest_idle) = evicted.iter().max() {
+        tracing::info!(
+            evicted = evicted.len(),
+            longest_idle_secs = longest_idle.as_secs(),
+            ttl_secs = max_idle.as_secs(),
+            "evicted idle embedding model(s) from the cache"
+        );
+    }
+    evicted.len()
 }
 
 fn global_cache() -> &'static EmbedderCache {
@@ -98,8 +137,12 @@ impl ModelFingerprint {
 }
 
 enum Slot {
-    /// A successfully loaded real model.
-    Loaded(Arc<dyn Embedder>),
+    /// A successfully loaded real model and when it was last handed out
+    /// (on load and on every cache hit), for idle eviction.
+    Loaded {
+        embedder: Arc<dyn Embedder>,
+        last_used: Instant,
+    },
     /// All files were present but loading failed. Not retried while the
     /// files still match this fingerprint.
     Failed(ModelFingerprint),
@@ -133,8 +176,14 @@ impl EmbedderCache {
         } else {
             None
         };
-        match slots.get(model_dir) {
-            Some(Slot::Loaded(embedder)) => return embedder.clone(),
+        match slots.get_mut(model_dir) {
+            Some(Slot::Loaded {
+                embedder,
+                last_used,
+            }) => {
+                *last_used = Instant::now();
+                return embedder.clone();
+            }
             Some(Slot::Failed(failed)) if fingerprint.as_ref() == Some(failed) => {
                 return hashed_fallback();
             }
@@ -142,7 +191,13 @@ impl EmbedderCache {
         }
         match load(model_dir) {
             Some(embedder) => {
-                slots.insert(model_dir.to_path_buf(), Slot::Loaded(embedder.clone()));
+                slots.insert(
+                    model_dir.to_path_buf(),
+                    Slot::Loaded {
+                        embedder: embedder.clone(),
+                        last_used: Instant::now(),
+                    },
+                );
                 embedder
             }
             None => {
@@ -166,12 +221,50 @@ impl EmbedderCache {
         self.lock().clear();
     }
 
+    /// Removes `Loaded` slots idle for longer than `max_idle` and returns
+    /// each evicted slot's idle time. Uses `try_lock`: a load in progress
+    /// holds the lock for seconds, and eviction must not queue behind it —
+    /// the round is skipped instead.
+    fn evict_idle(&self, max_idle: Duration) -> Vec<Duration> {
+        let mut slots = match self.slots.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Vec::new(),
+        };
+        let now = Instant::now();
+        let mut evicted = Vec::new();
+        slots.retain(|_, slot| match slot {
+            Slot::Loaded { last_used, .. } => {
+                let idle = now.saturating_duration_since(*last_used);
+                if idle > max_idle {
+                    evicted.push(idle);
+                    false
+                } else {
+                    true
+                }
+            }
+            Slot::Failed(_) => true,
+        });
+        evicted
+    }
+
+    /// Test-only: pretend the slot for `model_dir` was last used `ago`
+    /// earlier, so idle eviction can be tested without sleeping.
+    #[cfg(test)]
+    fn backdate(&self, model_dir: &Path, ago: Duration) {
+        if let Some(Slot::Loaded { last_used, .. }) = self.lock().get_mut(model_dir) {
+            *last_used = Instant::now()
+                .checked_sub(ago)
+                .expect("backdate fits in the monotonic clock");
+        }
+    }
+
     /// Test-only peek: `Some("loaded")`, `Some("failed")`, or `None` when
     /// the directory has no slot.
     #[cfg(test)]
     fn slot_kind(&self, model_dir: &Path) -> Option<&'static str> {
         self.lock().get(model_dir).map(|slot| match slot {
-            Slot::Loaded(_) => "loaded",
+            Slot::Loaded { .. } => "loaded",
             Slot::Failed(_) => "failed",
         })
     }
@@ -408,5 +501,35 @@ mod tests {
         std::fs::write(tmp.path().join("pytorch_model.bin"), b"longer stub").unwrap();
         let _ = cache.get_or_load(tmp.path(), counting);
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn an_embedder_idle_longer_than_the_ttl_is_evicted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = EmbedderCache::default();
+        let _ = cache.get_or_load(tmp.path(), fake_loader);
+        cache.backdate(tmp.path(), Duration::from_secs(120));
+        let _ = cache.evict_idle(Duration::from_secs(60));
+        assert_eq!(cache.slot_kind(tmp.path()), None);
+    }
+
+    #[test]
+    fn an_embedder_used_within_the_ttl_is_kept() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = EmbedderCache::default();
+        let _ = cache.get_or_load(tmp.path(), fake_loader);
+        cache.backdate(tmp.path(), Duration::from_secs(30));
+        let _ = cache.evict_idle(Duration::from_secs(60));
+        assert_eq!(cache.slot_kind(tmp.path()), Some("loaded"));
+    }
+
+    #[test]
+    fn eviction_leaves_failed_load_slots_in_place() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_broken_model(tmp.path());
+        let cache = EmbedderCache::default();
+        let _ = cache.get_or_load(tmp.path(), try_load_bge_m3);
+        let _ = cache.evict_idle(Duration::ZERO);
+        assert_eq!(cache.slot_kind(tmp.path()), Some("failed"));
     }
 }
