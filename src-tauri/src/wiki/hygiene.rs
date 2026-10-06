@@ -77,6 +77,24 @@ struct PageRow {
     path: String,
     /// Unix seconds of the file's last modification; 0 = unknown.
     mtime: i64,
+    /// Frontmatter `distinct_from`: ids this page declares to be a
+    /// different thing — never reported as its duplicate.
+    distinct_from: Vec<String>,
+}
+
+/// The `distinct_from` ids in a `pages.frontmatter` JSON text (empty on
+/// a missing or unreadable value).
+fn distinct_from_of(frontmatter: Option<&str>) -> Vec<String> {
+    frontmatter
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        .and_then(|fm| {
+            fm.get("distinct_from").and_then(|v| v.as_array()).map(|ids| {
+                ids.iter()
+                    .filter_map(|id| id.as_str().map(str::to_string))
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
 }
 
 /// [`load_rows`] + [`evaluate`] on a GUI-side handle (no timeout).
@@ -95,14 +113,16 @@ pub fn check(db: &DbHandle, model_available: bool, now_unix: i64) -> DbResult<Hy
 pub fn load_rows(conn: &rusqlite::Connection) -> DbResult<HygieneRows> {
     let index_embedder = crate::db::pages_index::index_embedder(conn);
     let pages = {
-        let mut stmt = conn
-            .prepare("SELECT id, type, path, COALESCE(file_mtime, 0) FROM pages ORDER BY id")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, type, path, COALESCE(file_mtime, 0), frontmatter FROM pages ORDER BY id",
+        )?;
         stmt.query_map([], |row| {
             Ok(PageRow {
                 id: row.get(0)?,
                 page_type: row.get(1)?,
                 path: row.get(2)?,
                 mtime: row.get(3)?,
+                distinct_from: distinct_from_of(row.get::<_, Option<String>>(4)?.as_deref()),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?
@@ -371,6 +391,11 @@ fn duplicate_pair_rows<'a>(
         }
         for (i, (a, va)) in group.iter().enumerate() {
             for (b, vb) in &group[i + 1..] {
+                // Declared different things (A2 `distinct_from`, either
+                // side) are never duplicate candidates.
+                if a.distinct_from.contains(&b.id) || b.distinct_from.contains(&a.id) {
+                    continue;
+                }
                 let score = crate::embedding::cosine(va, vb);
                 if score >= DUPLICATE_SIMILARITY_THRESHOLD {
                     pairs.push((score, a, b));
@@ -591,6 +616,25 @@ mod tests {
     }
 
     #[test]
+    fn a_near_identical_pair_declared_distinct_is_not_a_duplicate_candidate() {
+        let (_tmp, db) = open_semantic_db();
+        insert_page(&db, "entities/michael", "entity", NOW);
+        insert_page(&db, "entities/michal", "entity", NOW);
+        db.with(|conn| {
+            conn.execute(
+                "UPDATE pages SET frontmatter = ?1 WHERE id = 'entities/michal'",
+                [r#"{"id":"entities/michal","type":"entity","distinct_from":["entities/michael"]}"#],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        insert_chunk(&db, "entities/michael", &unit(0, 0.0));
+        insert_chunk(&db, "entities/michal", &unit(0, 0.1));
+        let findings = check(&db, true, NOW).unwrap();
+        assert!(kinds(&findings, "duplicate-candidate").is_empty());
+    }
+
+    #[test]
     fn pages_below_the_similarity_threshold_are_not_duplicate_candidates() {
         let (_tmp, db) = open_semantic_db();
         insert_page(&db, "entities/a", "entity", NOW);
@@ -662,6 +706,7 @@ mod tests {
                 page_type: "entity".into(),
                 path: String::new(),
                 mtime: NOW,
+                distinct_from: Vec::new(),
             });
         }
         let findings = evaluate(&rows, true, NOW);

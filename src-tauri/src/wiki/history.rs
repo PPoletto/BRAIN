@@ -285,8 +285,7 @@ pub fn commit_detail(wiki_path: &Path, sha: &str) -> WikiResult<CommitDetail> {
 /// commit recording the restore.
 pub fn restore_page(wiki_path: &Path, sha: &str, page: &str) -> WikiResult<()> {
     let repo = init_repo(wiki_path)?;
-    let oid = git2::Oid::from_str(sha)?;
-    let commit = repo.find_commit(oid)?;
+    let commit = commit_by_sha(&repo, sha)?;
     let tree = commit.tree()?;
 
     let entry = tree.get_path(Path::new(page)).map_err(|_| {
@@ -306,6 +305,20 @@ pub fn restore_page(wiki_path: &Path, sha: &str, page: &str) -> WikiResult<()> {
     let message = format!("revert: restored {page} from {}", short_sha(sha));
     crate::wiki::encryption::commit_wiki(wiki_path, &message)?;
     Ok(())
+}
+
+/// The commit a full or abbreviated (at least 4 hex digits, unambiguous)
+/// sha names. Only hex shas are accepted — no ref names or revision
+/// expressions like `HEAD~1`.
+fn commit_by_sha<'r>(repo: &'r git2::Repository, sha: &str) -> WikiResult<git2::Commit<'r>> {
+    let hex = sha.len() >= 4 && sha.len() <= 40 && sha.chars().all(|c| c.is_ascii_hexdigit());
+    if !hex {
+        return Err(git2::Error::from_str(&format!(
+            "'{sha}' is not a commit sha (4 to 40 hex digits)"
+        ))
+        .into());
+    }
+    Ok(repo.revparse_single(sha)?.peel_to_commit()?)
 }
 
 /// Hard-reset the wiki to the given commit. Records a "reset: …" commit on

@@ -201,7 +201,7 @@ Wiki-style `[[id]]` links resolve at index time and feed the graph view.
 | Storage       | SQLite (WAL, FTS5, [sqlite-vec](https://github.com/asg017/sqlite-vec)) |
 | Embedding     | [bge-m3](https://huggingface.co/BAAI/bge-m3) (1024-d, multilingual) via [candle](https://github.com/huggingface/candle) |
 | Versioning    | libgit2 via [git2-rs](https://crates.io/crates/git2) |
-| MCP           | [Model Context Protocol](https://modelcontextprotocol.io) JSON-RPC over stdio + HTTP |
+| MCP           | [Model Context Protocol](https://modelcontextprotocol.io) JSON-RPC over stdio |
 | Update        | Tauri Updater + minisign signature verification |
 | Graph         | [Cytoscape.js](https://js.cytoscape.org/) + [fcose](https://github.com/iVis-at-Bilkent/cytoscape.js-fcose) layout |
 
@@ -354,20 +354,12 @@ After registration, **restart your LLM client** (Claude Desktop reads
 config only at process start). The MCP server name is `BRAIN`. Verify
 with `claude mcp list` for Claude Code, with `/mcp` inside Codex.
 
-**ChatGPT Desktop: not auto-registered.** ChatGPT does speak MCP (under
+**ChatGPT Desktop: not supported.** ChatGPT does speak MCP (under
 Settings → Apps & Connectors → Advanced → Developer Mode), but the
-connect originates from OpenAI's backend, so the URL must be public
-HTTPS — `localhost` is unreachable. Registration is also UI-only
-(no config file to write into), so auto-registration like the other
-clients isn't possible.
-
-If you really want BRAIN in ChatGPT, expose its HTTP MCP transport
-(port 7137 by default, bearer-token in `00_meta/.mcp.json`) through a
-Cloudflare Tunnel or ngrok and paste the public `https://…/mcp` URL
-plus token into the Developer Mode form. Caveat: tunnel traffic
-egresses through a third party, which is a real privacy regression
-vs. Claude Desktop / Codex / Continue.dev (all dial localhost
-directly). The Settings tab in BRAIN spells this out.
+connection originates from OpenAI's backend and needs a public HTTPS
+URL. BRAIN's MCP server speaks **stdio only** (the client starts
+`brain mcp` as a local process); there is no HTTP transport to expose,
+and registration in ChatGPT is UI-only anyway.
 
 ### Tools exposed
 
@@ -596,7 +588,8 @@ What's already shipped:
 - ✅ Real bge-m3 embeddings via candle (XLM-RoBERTa, CLS-pooled, 1024-d)
 - ✅ Cytoscape graph view with type/tag/recency filters
 - ✅ Dataview-style structured query DSL
-- ✅ MCP server (stdio + HTTP) with bearer-token auth and 9 tools
+- ✅ MCP server over stdio (legacy and 2026-07-28 protocol) with 15 tools,
+  3 prompts and 3 resources
 - ✅ Auto-registration in Claude Code, Claude Desktop, Codex,
   Continue.dev (ChatGPT Desktop intentionally excluded — see
   "Where the entry lives" above)

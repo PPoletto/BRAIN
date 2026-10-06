@@ -300,6 +300,27 @@ mod tests {
     }
 
     #[test]
+    fn the_agents_template_requires_a_detailed_read_before_rewriting_a_page() {
+        let section = AGENTS_MD
+            .split("### Rewriting a Page")
+            .nth(1)
+            .and_then(|rest| rest.split("\n#").next())
+            .unwrap_or_default();
+        assert!(
+            section.contains("`response_format: \"detailed\"`") && section.contains("**every**"),
+            "{section}"
+        );
+    }
+
+    #[test]
+    fn the_skill_template_requires_a_detailed_read_before_rewriting_a_page() {
+        assert!(
+            SKILL_MD.contains("`response_format: \"detailed\"` and carry over every"),
+            "{SKILL_MD}"
+        );
+    }
+
+    #[test]
     fn refresh_vault_templates_rewrites_an_outdated_skill_file() {
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();

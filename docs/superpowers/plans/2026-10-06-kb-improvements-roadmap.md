@@ -238,7 +238,7 @@ Agent beim Anlegen einer Seite automatisch eine Beispielfrage dazu eintragen?
 **Akzeptanzkriterien**
 - `tools/list` genau 15 Einträge; jede Beschreibung nennt den Anwendungsfall in einem Satz
   und das Geschwister-Tool für den Fall „nicht hierfür".
-- `brain_search` concise für 10 Treffer < 1.500 Zeichen; detailed enthält Snippets.
+- `brain_search` concise für 10 realistische Treffer (35-Zeichen-Id, 30-Zeichen-Titel, 80-Zeichen-Snippet) < 2.000 Zeichen, Titel auf 60 Zeichen gekürzt; detailed enthält hervorgehobene Snippets.
 - Alte Tool-Namen liefern einen Fehler mit dem neuen Namen (eine Übergangsversion lang).
 
 **Aufwand:** S–M. **Risiko:** gering technisch. **Nutzerentscheidung (06.10.): keine

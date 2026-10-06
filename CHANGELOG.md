@@ -32,12 +32,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   plain file names). **Update both machines to this release together:**
   an older BRAIN on the other machine does not know SKILL.md and keeps
   dropping it from what it shares, so the file's sync entry flips back
-  and forth until both run the new version (no data is lost).
+  and forth until both run the new version (no data is lost) — and the
+  updated AGENTS.md syncs to the other machine too, where it names tools
+  an older BRAIN does not have.
 - **Short or full answers (`response_format`).** `brain_search`,
   `brain_get_pages`, `brain_query`, `brain_graph` and `brain_lint_report`
   answer `"concise"` by default (ids, titles, summaries, counts; search
   hits carry a plain snippet of at most 80 characters — the page summary
-  when there is one — and ten hits stay under 1,500 characters) and
+  when there is one — and a title of at most 60 characters, about 190
+  characters per hit) and
   everything with `"detailed"` (highlighted snippets, full frontmatter,
   salience counters, every lint warning).
 - **`brain_ping` with `detail: true`** reports the vault, whether search
@@ -303,6 +306,39 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Agents keep a page's frontmatter when they rewrite it.** The `dream`
+  and `lint-session` prompts, AGENTS.md, SKILL.md and the
+  `brain_write_page` description now say to read a page with
+  `response_format: "detailed"` and carry over every frontmatter field
+  before rewriting it. Rewriting from the short read silently dropped
+  `aliases`, `sources`, `tags`, `superseded_by` and validity dates — a
+  replaced page could become current again.
+- **`distinct_from` is respected everywhere.** Two pages that declare
+  each other different things are no longer reported as possible
+  duplicates (lint report, audit) or queued for merging (dream queue).
+- **A stale AGENTS.md is not served to agents.** When the vault's
+  AGENTS.md still names tools that no longer exist, the MCP resource
+  `brain://agents-md` serves the current conventions with a notice to
+  run "Update vault templates".
+- **Reading the dream-queue resource never computes anything.** It
+  serves the stored queue (fresh for an hour) and otherwise points at
+  `brain_dream`; it no longer builds the search index or writes files.
+- **`brain_patch_page` refuses a heading that is not a markdown heading**
+  (`## Title`); an empty or `#`-less heading could replace the rest of the
+  page.
+- **No silent re-id on case-insensitive disks.** Writing `entities/ACME`
+  where the file holds `entities/acme` (or any other id) is refused with
+  the existing id, for `brain_write_page` and `brain_write_batch`.
+- **`brain_history` restores from a short sha** (a unique prefix of at
+  least 4 hex digits), as documented.
+- **`brain_ping` with `detail: true` stays bounded on a hung disk:** the
+  vault and model-file checks now run under the same 2-second limit as
+  the index counts.
+- **`instructions` in every handshake.** `initialize` now carries the
+  usage instructions for every protocol version.
+- **README and Settings no longer describe an HTTP MCP transport.** BRAIN
+  serves MCP over stdio only; ChatGPT (which needs a public HTTPS server)
+  is not supported.
 - **Semantic search now ranks by similarity (bug since the first
   release).** The vector part of the search returned its candidate
   passages in storage order instead of by similarity, so the closest

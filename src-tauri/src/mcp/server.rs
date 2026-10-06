@@ -487,8 +487,8 @@ fn server_info() -> Value {
     json!({ "name": SERVER_NAME, "version": SERVER_VERSION })
 }
 
-/// Usage hint for the client (`instructions` of `initialize` from
-/// 2025-03-26 and of `server/discover`).
+/// Usage hint for the client (`instructions` of `initialize` — part of
+/// InitializeResult in every legacy revision — and of `server/discover`).
 const INSTRUCTIONS: &str = "BRAIN is the user's wiki memory. Read resource brain://agents-md before \
 writing pages. Check brain_lookup before creating a page; write linked pages with \
 brain_write_batch; never overwrite facts — supersede.";
@@ -559,16 +559,12 @@ fn dispatch(
             let requested = req.params.get("protocolVersion").and_then(Value::as_str);
             let negotiated = negotiate_legacy(requested);
             session.legacy_version = Some(negotiated);
-            let mut result = json!({
+            Reply::Result(json!({
                 "protocolVersion": negotiated,
                 "serverInfo": server_info(),
-                "capabilities": capabilities()
-            });
-            // `instructions` exists in InitializeResult since 2025-03-26.
-            if Features::for_legacy(negotiated).annotations {
-                result["instructions"] = json!(INSTRUCTIONS);
-            }
-            Reply::Result(result)
+                "capabilities": capabilities(),
+                "instructions": INSTRUCTIONS
+            }))
         }
         "ping" => match era {
             Era::Legacy => Reply::Result(json!({})),
@@ -621,7 +617,7 @@ fn dispatch(
             LIST_TTL_MS,
         )),
         // Vault content: private to this user and changes any time.
-        "resources/read" => match resource_read(&req.params, vault, db) {
+        "resources/read" => match resource_read(&req.params, vault) {
             Reply::Result(v) => Reply::Result(cacheable(era, v, "private", 0)),
             err => err,
         },
@@ -843,7 +839,25 @@ fn brain_ping_detail(vault: Option<&std::path::Path>, db: &Option<crate::db::DbH
         payload["vault"] = json!({ "configured": false });
         return payload.to_string();
     };
-    let reachable = crate::vault::layout::is_vault(vault);
+    // The file-system stats run on a worker thread bounded like the index
+    // reads: a hung disk must not stall the ping (the thread is left
+    // behind on a timeout).
+    let (tx, rx) = std::sync::mpsc::channel();
+    let probe_vault = vault.to_path_buf();
+    std::thread::spawn(move || {
+        let reachable = crate::vault::layout::is_vault(&probe_vault);
+        let files = reachable && crate::embedding::model_available(&probe_vault);
+        let _ = tx.send((reachable, files));
+    });
+    let Ok((reachable, files_present)) = rx.recv_timeout(COUNTER_DB_TIMEOUT) else {
+        payload["vault"] = json!({
+            "configured": true,
+            "reachable": false,
+            "path": display_path(vault),
+            "note": "the vault did not answer within 2 s — the disk may be hung",
+        });
+        return payload.to_string();
+    };
     payload["vault"] = json!({
         "configured": true,
         "reachable": reachable,
@@ -852,7 +866,6 @@ fn brain_ping_detail(vault: Option<&std::path::Path>, db: &Option<crate::db::DbH
     if !reachable {
         return payload.to_string();
     }
-    let files_present = crate::embedding::model_available(vault);
     let state = crate::embedding::model_state(vault);
     // With complete model files the next search uses (and, if needed,
     // loads) bge-m3 — unless a load already failed for these files.
@@ -1298,7 +1311,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "brain_write_page",
             title: "Write a page",
-            description: "Create or fully overwrite ONE page. Use it for a new page or to rewrite a page including its frontmatter (summary, aliases, superseded_by). Not for several pages that link to each other — use brain_write_batch; not for changing one section — use brain_patch_page. `content` = YAML frontmatter (id, type: entity|concept|source|topic — singular, title, summary: one or two sentences; optional tags, aliases, sources: [sources/…], valid_from/valid_to YYYY-MM-DD, superseded_by) followed by the markdown body; link pages as [[type-dir/slug]]. Creating a NEW id is refused when brain_lookup would report an alias or normalised match (the error names the page); overwriting an existing id never is. Facts are not overwritten: supersede the old page instead (superseded_by + valid_to). Returns {wrote, previous_size_bytes, new_size_bytes, warnings}; lint errors on this page fail the call and list the findings. The watcher commits.",
+            description: "Create or fully overwrite ONE page. Use it for a new page or to rewrite a page including its frontmatter (summary, aliases, superseded_by). Not for several pages that link to each other — use brain_write_batch; not for changing one section — use brain_patch_page. `content` = YAML frontmatter (id, type: entity|concept|source|topic — singular, title, summary: one or two sentences; optional tags, aliases, sources: [sources/…], valid_from/valid_to YYYY-MM-DD, superseded_by) followed by the markdown body; link pages as [[type-dir/slug]]. Creating a NEW id is refused when brain_lookup would report an alias or normalised match (the error names the page); overwriting an existing id never is. Facts are not overwritten: supersede the old page instead (superseded_by + valid_to). Rewriting an existing page: read it first with brain_get_pages (response_format \"detailed\") and carry over EVERY frontmatter field unchanged (aliases, sources, tags, superseded_by, valid_from/valid_to, distinct_from) — a concise read has no frontmatter, and a dropped field is lost. Returns {wrote, previous_size_bytes, new_size_bytes, warnings}; lint errors on this page fail the call and list the findings. The watcher commits.",
             input: json!({
                 "type": "object",
                 "properties": {
@@ -1322,7 +1335,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "brain_write_batch",
             title: "Write several pages atomically",
-            description: "Atomic multi-page write: every entry is validated first (one bad entry → nothing is written), all are written, then lint runs once. Use it whenever new pages link to each other (ingest), so the links between them resolve. Not for a single page — use brain_write_page. Entries have the brain_write_page format; the duplicate refusal applies too, also against earlier entries of the batch. Returns {wrote: [{id, previous_size_bytes, new_size_bytes, warnings}]}. The watcher commits.",
+            description: "Atomic multi-page write: every entry is validated first (one bad entry → nothing is written), all are written, then lint runs once. Use it whenever new pages link to each other (ingest), so the links between them resolve. Not for a single page — use brain_write_page. Entries have the brain_write_page format (for existing pages: read them with response_format \"detailed\" and carry over every frontmatter field); the duplicate refusal applies too, also against earlier entries of the batch. Returns {wrote: [{id, previous_size_bytes, new_size_bytes, warnings}]}. The watcher commits.",
             input: json!({
                 "type": "object",
                 "properties": {
@@ -1438,7 +1451,7 @@ fn tool_specs() -> Vec<ToolSpec> {
                     "action": { "type": "string", "enum": ["list", "restore"], "default": "list", "description": "list: needs id (optional limit); restore: needs id + sha" },
                     "id": { "type": "string", "description": "page id, e.g. 'entities/alice' ('.md' optional)" },
                     "limit": { "type": "integer", "minimum": 1, "default": 20, "description": "list: maximum commits" },
-                    "sha": { "type": "string", "description": "restore: commit sha (full or short) from action 'list'" }
+                    "sha": { "type": "string", "description": "restore: commit sha from action 'list' — full, or a unique prefix of at least 4 hex digits" }
                 },
                 "required": ["id"]
             }),
@@ -1692,7 +1705,7 @@ Follow the vault conventions (resource brain://agents-md). Steps:
 1. Raw file: if the material is not under 01_raw/ yet, store it verbatim with brain_write_raw_file ({connector}; relative_path: a date-prefixed file name).
 2. Find what exists: brain_search for the main names and topics, then brain_lookup for every entity or concept page you plan to create (by name or planned id). An existing page or a match means: extend that page and add your spelling to its aliases — never create a duplicate.
 3. Plan the pages: one `sources/<yyyy-mm-dd>-<slug>` page for the artifact (what it is, key facts, the raw file path), entity pages for the people, organisations and products it names, concept pages for methods and terms, and a topic page only for a synthesis across several sources.
-4. Write all new and changed pages in ONE brain_write_batch call. Every page: frontmatter id, type (singular: entity, concept, source or topic), title, summary (one or two sentences); entity and concept pages also `sources: [sources/<the source page>]`. Link with [[type-dir/slug]] only to pages that exist or are in the same batch. Before changing an existing page, read it with brain_get_pages (response_format \"detailed\") and keep its frontmatter.
+4. Write all new and changed pages in ONE brain_write_batch call. Every page: frontmatter id, type (singular: entity, concept, source or topic), title, summary (one or two sentences); entity and concept pages also `sources: [sources/<the source page>]`. Link with [[type-dir/slug]] only to pages that exist or are in the same batch. Before changing an existing page, read it with brain_get_pages (response_format \"detailed\") and carry over EVERY frontmatter field unchanged (aliases, sources, tags, superseded_by, valid_from/valid_to, distinct_from) — a concise read has no frontmatter, and a dropped field is lost.
 5. Check the response: fix lint errors it reports. If new_size_bytes is much smaller than previous_size_bytes on an existing page, stop and tell the user.
 6. Changed facts are never overwritten: supersede the old page (superseded_by + valid_to) and write the new state.
 Finish with a short report for the user: pages created, pages updated, open questions."
@@ -1709,18 +1722,19 @@ fn lint_session_prompt(focus: Option<&str>) -> String {
     format!(
         "Run a cleanup session on the BRAIN wiki.
 1. Read the newest audit (resource brain://audit/latest) or call brain_lint_report for the live state (concise: counts per kind). {scope}
-2. For each kind, get its findings with brain_lint_report (response_format \"detailed\", kind \"<kind>\") and fix them:
+2. Rewrite rule: before any brain_write_page on an existing page, read it with brain_get_pages (response_format \"detailed\") and carry over EVERY frontmatter field unchanged except the one you fix (aliases, sources, tags, superseded_by, valid_from/valid_to, distinct_from) — a concise read has no frontmatter, and a dropped field is lost.
+3. For each kind, get its findings with brain_lint_report (response_format \"detailed\", kind \"<kind>\") and fix them:
 - broken-link / broken-source: correct the id, create the missing page, or rename the page that was meant (brain_refactor action \"rename\").
-- unregistered-type / frontmatter / missing-title: rewrite the page with brain_write_page (type is singular: entity, concept, source, topic).
+- unregistered-type / frontmatter / missing-title: read the page with brain_get_pages (response_format \"detailed\"), then rewrite it with brain_write_page keeping every other frontmatter field (type is singular: entity, concept, source, topic).
 - dangling-supersede / supersede-cycle: point superseded_by at an existing, current page.
 - duplicate-candidate / alias-collision: read both pages (brain_get_pages); the same thing → brain_refactor action \"merge\" the weaker into the stronger; different things → add distinct_from (or fix the clashing alias).
 - orphan: link it from a related page or merge it; delete it (brain_refactor action \"delete\") only if it is junk.
-- missing-summary / missing-sources: add a one-to-two-sentence summary / the source pages with brain_write_page, body unchanged.
+- missing-summary / missing-sources: read the page with brain_get_pages (response_format \"detailed\"), then add a one-to-two-sentence summary / the source pages with brain_write_page, body and every other frontmatter field unchanged.
 - expired-but-linked: point the links at the successor.
 - invalid-date: write YYYY-MM-DD; valid_from must not lie after valid_to.
 - non-canonical-wiki-link / wikilink-pipe-in-table-cell: rewrite as [[type-dir/slug]] (no |alias inside table cells).
-3. Ask the user before merging or deleting pages they wrote themselves.
-4. Call brain_lint_report again at the end and report what you fixed and what is left."
+4. Ask the user before merging or deleting pages they wrote themselves.
+5. Call brain_lint_report again at the end and report what you fixed and what is left."
     )
 }
 
@@ -1734,14 +1748,15 @@ Hard rules:
 - Supersede instead of overwriting facts (superseded_by + valid_to on the old page; keep its body).
 - Keep minority views and open questions; do not flatten them into one \"truth\".
 - Ask before changing pages the user clearly wrote themselves.
+- Rewrite rule: before any brain_write_page on an existing page, read it with brain_get_pages (response_format \"detailed\") and carry over EVERY frontmatter field unchanged except the one you change (aliases, sources, tags, superseded_by, valid_from/valid_to, distinct_from) — a concise read has no frontmatter, and a dropped superseded_by makes a replaced page current again.
 
 Steps:
 1. brain_dream with action \"queue\" (refresh: true if the wiki changed a lot since the last queue).
 2. Work top-down (priority 1 first). By suggested_action:
 - fix-link: repair the broken link or sources entry (right id, create the missing page, or brain_refactor action \"rename\" on the page that was meant).
-- merge: read both pages (brain_get_pages); the same thing → brain_refactor action \"merge\" the weaker into the stronger, then tidy the appended section with brain_patch_page; different things → add distinct_from.
-- update-summary / write-summary: read the page and write a fitting one-to-two-sentence summary with brain_write_page (body unchanged). If the existing summary is still right, confirm it instead: brain_write_page with the page unchanged and confirm_summary: true.
-- archive-or-supersede / review-or-archive: link it from a related page if it is still useful; if its facts were replaced, set superseded_by and valid_to. Do not delete it.
+- merge: read both pages (brain_get_pages); the same thing → brain_refactor action \"merge\" the weaker into the stronger, then tidy the appended section with brain_patch_page; different things → add distinct_from (rewrite rule above).
+- update-summary / write-summary: read the page with brain_get_pages (response_format \"detailed\") and write a fitting one-to-two-sentence summary with brain_write_page (body and every other frontmatter field unchanged). If the existing summary is still right, confirm it instead: brain_write_page with the page exactly as read (response_format \"detailed\") and confirm_summary: true.
+- archive-or-supersede / review-or-archive: link it from a related page if it is still useful; if its facts were replaced, set superseded_by and valid_to (rewrite rule above). Do not delete it.
 3. Stop after {max_changes} changes or when the queue is done; what is left shows up in the next queue.
 4. End with brain_dream action \"log\" and one line saying what you changed and why (e.g. \"merged entities/acme-inc into entities/acme; summaries for 3 hubs\"). Every change stays restorable with brain_history action \"restore\"."
     )
@@ -1773,7 +1788,7 @@ const RESOURCES: &[(&str, &str, &str, &str, &str)] = &[
         RESOURCE_DREAM_QUEUE,
         "dream-queue",
         "Dream queue",
-        "BRAIN's prioritised consolidation work list (as brain_dream action 'queue'), recomputed when older than an hour.",
+        "BRAIN's prioritised consolidation work list as last stored (fresh for an hour); when none is stored, call the tool brain_dream with action 'queue'.",
         "application/json",
     ),
 ];
@@ -1796,14 +1811,32 @@ fn resource_descriptors(features: Features) -> Vec<Value> {
         .collect()
 }
 
+/// Prepended to the bundled AGENTS.md when the vault's copy is stale.
+const STALE_AGENTS_NOTICE: &str = "> **Notice from BRAIN:** this vault's `00_meta/AGENTS.md` \
+predates BRAIN 0.3.5 and names MCP tools that were renamed. Ask the user to run \
+\"Update vault templates\" in Settings → Danger. The current conventions follow.\n\n";
+
+/// Whether an AGENTS.md text names a removed tool outside its "Renamed
+/// tools" paragraph (which lists the old names on purpose).
+fn names_removed_tools(text: &str) -> bool {
+    let without_renamed = match text.find("**Renamed tools.**") {
+        Some(start) => {
+            let end = text[start..].find("\n\n").map_or(text.len(), |i| start + i);
+            format!("{}{}", &text[..start], &text[end..])
+        }
+        None => text.to_string(),
+    };
+    let token = regex::Regex::new(r"brain_[a-z_]+").expect("valid tool-name pattern");
+    token
+        .find_iter(&without_renamed)
+        .any(|m| tools::removed(m.as_str()).is_some())
+}
+
 /// `resources/read`. AGENTS.md falls back to the bundled template when no
-/// vault (or no file) is there, so the conventions are always readable;
-/// the audit and the dream queue need the vault.
-fn resource_read(
-    params: &Value,
-    vault: Option<&std::path::Path>,
-    db: &mut Option<crate::db::DbHandle>,
-) -> Reply {
+/// vault (or no file) is there, or when the vault's copy is stale, so the
+/// current conventions are always readable; the audit and the dream queue
+/// need the vault and are served only from stored files.
+fn resource_read(params: &Value, vault: Option<&std::path::Path>) -> Reply {
     let Some(uri) = params.get("uri").and_then(Value::as_str) else {
         return rpc_error(INVALID_PARAMS, "missing resource 'uri'");
     };
@@ -1816,14 +1849,24 @@ fn resource_read(
     };
     let reachable = vault.filter(|v| crate::vault::layout::is_vault(v));
     let text = match uri {
-        RESOURCE_AGENTS_MD => reachable
-            .and_then(|v| {
+        RESOURCE_AGENTS_MD => {
+            let bundled = crate::onboarding::template::AGENTS_MD;
+            match reachable.and_then(|v| {
                 std::fs::read_to_string(
                     crate::vault::layout::meta_dir(v).join(crate::vault::layout::AGENTS_FILENAME),
                 )
                 .ok()
-            })
-            .unwrap_or_else(|| crate::onboarding::template::AGENTS_MD.to_string()),
+            }) {
+                // A copy written by an older BRAIN names tools that no
+                // longer exist: serve the current conventions instead,
+                // with a notice how to refresh the vault's file.
+                Some(text) if names_removed_tools(&text) => {
+                    format!("{STALE_AGENTS_NOTICE}{bundled}")
+                }
+                Some(text) => text,
+                None => bundled.to_string(),
+            }
+        }
         _ => {
             let Some(v) = reachable else {
                 return match vault {
@@ -1845,9 +1888,20 @@ fn resource_read(
                     }
                 }
             } else {
-                match dream_queue(v, db, false) {
-                    Ok(queue) => serde_json::to_string(&queue).unwrap_or_default(),
-                    Err(err) => return rpc_error(-32603, err),
+                // Never compute here: a resource read must not build the
+                // index or write files on the stdio thread. Only a stored,
+                // fresh queue is served; brain_dream computes one.
+                match crate::wiki::dream::cached_queue(v, chrono::Utc::now()) {
+                    Some(queue) => serde_json::to_string(&queue).unwrap_or_default(),
+                    None => {
+                        return Reply::Error {
+                            code: RESOURCE_NOT_FOUND,
+                            message: "no fresh dream queue stored — call the tool brain_dream \
+                                      with action \"queue\" to compute one"
+                                .to_string(),
+                            data: Some(json!({ "uri": uri })),
+                        };
+                    }
                 }
             }
         }
@@ -2029,7 +2083,7 @@ fn call_tool(
                                 .unwrap_or(h.snippet.as_str());
                             json!({
                                 "id": h.id,
-                                "title": h.title,
+                                "title": plain_snippet(&h.title, CONCISE_TITLE_CHARS),
                                 "score": (f64::from(h.score) * 10_000.0).round() / 10_000.0,
                                 "snippet": plain_snippet(source, CONCISE_SNIPPET_CHARS),
                             })
@@ -2147,6 +2201,7 @@ fn call_tool(
             // under another id. Overwriting an existing id is never blocked.
             let target =
                 crate::wiki::encryption::page_path(vault, id).map_err(|e| e.to_string())?;
+            check_target_owner(&target, id)?;
             let mut matches_checked = true;
             if !allow_duplicate && !target.is_file() {
                 match load_name_entries(db, vault) {
@@ -2262,6 +2317,7 @@ fn call_tool(
                 .get("heading")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "missing 'heading'".to_string())?;
+            check_heading(heading)?;
             let section = args
                 .get("content")
                 .and_then(Value::as_str)
@@ -2489,9 +2545,14 @@ fn history_page_id(args: &Value) -> Result<&str, String> {
 
 /// Longest snippet of a concise `brain_search` hit, in characters.
 const CONCISE_SNIPPET_CHARS: usize = 80;
-/// Character budget of a concise `brain_search` answer (roadmap D2: ten
-/// hits under 1,500 characters); over it, the scores are dropped.
-const CONCISE_SEARCH_BUDGET: usize = 1500;
+/// Longest title of a concise `brain_search` hit, in characters.
+const CONCISE_TITLE_CHARS: usize = 60;
+/// Character budget of a concise `brain_search` answer: ten realistic
+/// hits (35-character id, 30-character title, 80-character snippet, score)
+/// take about 1,950 characters; over the budget the scores are dropped
+/// first. (The roadmap's 1,500 cannot hold ten 80-character snippets
+/// plus ids and titles.)
+const CONCISE_SEARCH_BUDGET: usize = 2000;
 
 /// Plain text for a concise hit: no FTS5 `«»` highlight markers, runs of
 /// whitespace collapsed, cut at a word boundary so the result (with a
@@ -2925,6 +2986,7 @@ fn write_batch(
         let allow_duplicate =
             allow_all || allow_duplicate_arg(entry).map_err(|e| format!("pages[{idx}]: {e}"))?;
         let target = crate::wiki::encryption::page_path(vault, id).map_err(|e| e.to_string())?;
+        check_target_owner(&target, id).map_err(|e| format!("pages[{idx}] ({id}): {e}"))?;
         if !allow_duplicate && !target.is_file() {
             let index = index_names.get_or_insert_with(|| load_name_entries(db, vault));
             if index.is_none() {
@@ -3128,6 +3190,49 @@ fn patch_section(body: &str, heading: &str, new_content: &str) -> String {
             out
         }
     }
+}
+
+/// `brain_patch_page`'s `heading` must be a markdown heading line
+/// (`#`–`######`, a space, then text): anything else would never match a
+/// heading of the body and could swallow the rest of the page.
+fn check_heading(heading: &str) -> Result<(), String> {
+    let pattern = regex::Regex::new(r"^#{1,6} \S").expect("valid heading pattern");
+    if pattern.is_match(heading.trim_start()) {
+        Ok(())
+    } else {
+        Err(format!(
+            "'heading' must be a markdown heading line such as '## Kontakt' (1–6 '#', a space, \
+             then the title); got {heading:?}"
+        ))
+    }
+}
+
+/// When `target` already exists, its frontmatter `id` must be `id`. On a
+/// case-insensitive file system `entities/ACME` resolves to the file of
+/// `entities/acme`; overwriting it would silently re-id that page. A file
+/// whose frontmatter cannot be read is left to the caller (overwriting
+/// it with the right id is the repair).
+fn check_target_owner(target: &std::path::Path, id: &str) -> Result<(), String> {
+    let Ok(existing) = std::fs::read_to_string(target) else {
+        return Ok(());
+    };
+    let Ok(parsed) = page::parse(&existing) else {
+        return Ok(());
+    };
+    let owner = parsed.frontmatter.id;
+    // Only a CASE-ONLY difference is a collision: on a case-insensitive
+    // file system `entities/ACME` resolves to `acme.md`, and overwriting
+    // it would silently re-id the existing page. Any other mismatch (a
+    // hand-edited or copied file whose id disagrees with its path) is
+    // the repair path and keeps the old overwrite behaviour.
+    if owner.is_empty() || owner == id || !owner.eq_ignore_ascii_case(id) {
+        return Ok(());
+    }
+    Err(format!(
+        "the file for '{id}' already holds the page '{owner}' (page ids are case-sensitive, the \
+         file system may not be) — write to '{owner}' instead, or rename it with brain_refactor \
+         (action \"rename\")"
+    ))
 }
 
 /// A required string argument: `missing '<key>'` when absent,
@@ -6452,14 +6557,22 @@ mod protocol_tests {
     }
 
     #[test]
-    fn a_legacy_initialize_result_has_exactly_the_three_legacy_fields() {
+    fn a_legacy_initialize_result_has_exactly_the_four_initialize_fields() {
         let resp = once(&legacy(
             1,
             "initialize",
             json!({ "protocolVersion": "2024-11-05" }),
         ));
         let keys: Vec<&String> = resp["result"].as_object().unwrap().keys().collect();
-        assert_eq!(keys, vec!["capabilities", "protocolVersion", "serverInfo"]);
+        assert_eq!(
+            keys,
+            vec![
+                "capabilities",
+                "instructions",
+                "protocolVersion",
+                "serverInfo"
+            ]
+        );
     }
 
     #[test]
@@ -6947,8 +7060,15 @@ mod protocol_tests {
     }
 
     #[test]
-    fn the_dream_queue_resource_serves_the_queue_as_json() {
+    fn the_dream_queue_resource_serves_the_stored_queue_as_json() {
         let tmp = vault_with_marker();
+        let stored = crate::wiki::dream::DreamQueue {
+            generated_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            items: Vec::new(),
+            omitted: 0,
+            notes: Vec::new(),
+        };
+        crate::wiki::dream::write_dream_queue(tmp.path(), &stored).unwrap();
         let queue: Value = serde_json::from_str(&resource_text(&read_resource(
             "brain://dream-queue",
             Some(tmp.path()),
@@ -6992,13 +7112,13 @@ mod protocol_tests {
     }
 
     #[test]
-    fn initialize_for_2024_11_05_carries_no_instructions() {
+    fn initialize_for_2024_11_05_carries_the_usage_instructions_too() {
         let resp = once(&legacy(
             1,
             "initialize",
             json!({ "protocolVersion": "2024-11-05" }),
         ));
-        assert!(resp["result"].get("instructions").is_none(), "{resp}");
+        assert_eq!(resp["result"]["instructions"], json!(INSTRUCTIONS));
     }
 
     #[test]
@@ -7059,6 +7179,87 @@ mod protocol_tests {
         assert!(
             !text.contains("brain_patch_page with unchanged content"),
             "{text}"
+        );
+    }
+
+    // ---- second fix round -----------------------------------------------
+
+    #[test]
+    fn every_prompt_line_that_rewrites_a_page_asks_for_a_detailed_read_first() {
+        // A concise read has no frontmatter; rewriting from it drops
+        // aliases, sources, superseded_by, validity … (review blocker).
+        let texts = [
+            prompt_text("ingest", json!({ "source": "x" })),
+            prompt_text("lint-session", json!({})),
+            prompt_text("dream", json!({})),
+        ];
+        let unsafe_lines: Vec<String> = texts
+            .iter()
+            .flat_map(|t| t.lines())
+            .filter(|l| {
+                l.contains("brain_write_page") && !l.contains("response_format \"detailed\"")
+            })
+            .map(str::to_string)
+            .collect();
+        assert!(unsafe_lines.is_empty(), "{unsafe_lines:#?}");
+    }
+
+    #[test]
+    fn the_write_page_description_asks_for_a_detailed_read_before_a_rewrite() {
+        let spec = tool_specs()
+            .into_iter()
+            .find(|t| t.name == "brain_write_page")
+            .unwrap();
+        assert!(
+            spec.description.contains("response_format \"detailed\""),
+            "{}",
+            spec.description
+        );
+    }
+
+    #[test]
+    fn a_stale_vault_agents_md_is_replaced_by_the_bundled_one_with_a_notice() {
+        let tmp = vault_with_marker();
+        std::fs::write(
+            crate::vault::layout::meta_dir(tmp.path()).join("AGENTS.md"),
+            "| `brain_get_page` | Read one page by id |",
+        )
+        .unwrap();
+        let text = resource_text(&read_resource("brain://agents-md", Some(tmp.path())));
+        assert_eq!(
+            text,
+            format!(
+                "{STALE_AGENTS_NOTICE}{}",
+                crate::onboarding::template::AGENTS_MD
+            )
+        );
+    }
+
+    #[test]
+    fn old_names_inside_the_renamed_tools_paragraph_do_not_make_agents_md_stale() {
+        let text = "Use `brain_get_pages`.\n\n**Renamed tools.** Older instructions may name \
+                    `brain_get_page`.\n\nMore text.";
+        assert!(!names_removed_tools(text));
+    }
+
+    #[test]
+    fn the_dream_queue_resource_without_a_stored_queue_is_resource_not_found() {
+        let tmp = vault_with_marker();
+        let resp = read_resource("brain://dream-queue", Some(tmp.path()));
+        assert_eq!(resp["error"]["code"], json!(-32002));
+    }
+
+    #[test]
+    fn reading_the_dream_queue_resource_creates_neither_an_index_nor_a_queue_file() {
+        let tmp = vault_with_marker();
+        let _ = read_resource("brain://dream-queue", Some(tmp.path()));
+        let db_file = crate::vault::layout::db_dir(tmp.path()).join(crate::db::DB_FILENAME);
+        assert_eq!(
+            (
+                db_file.exists(),
+                crate::wiki::dream::dream_queue_path(tmp.path()).exists()
+            ),
+            (false, false)
         );
     }
 }
@@ -7730,5 +7931,250 @@ Body.
             }
         }
         assert!(mismatches.is_empty(), "{mismatches:?}");
+    }
+
+    // ---- second fix round -----------------------------------------------
+
+    #[test]
+    fn patch_page_rejects_an_empty_heading() {
+        let tmp = vault();
+        put(
+            tmp.path(),
+            "entities/alice",
+            "",
+            "Intro.\n\n## Kontakt\n\nalt",
+        );
+        let err = call_tool(
+            &json!({ "name": "brain_patch_page", "arguments": { "id": "entities/alice", "heading": "", "content": "x" } }),
+            tmp.path(),
+            &mut None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("'heading' must be a markdown heading line"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn patch_page_with_a_heading_without_hashes_writes_nothing() {
+        let tmp = vault();
+        put(
+            tmp.path(),
+            "entities/alice",
+            "",
+            "Intro.\n\n## Kontakt\n\nalt",
+        );
+        let file = wiki_dir(tmp.path()).join("entities/alice.md");
+        let before = std::fs::read_to_string(&file).unwrap();
+        let _ = call_tool(
+            &json!({ "name": "brain_patch_page", "arguments": { "id": "entities/alice", "heading": "Kontakt", "content": "x" } }),
+            tmp.path(),
+            &mut None,
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+    }
+
+    #[test]
+    fn write_page_refuses_a_file_that_belongs_to_a_case_only_different_id() {
+        // What a case-insensitive file system does to `entities/ACME`
+        // next to `entities/acme`, made explicit: the file at the target
+        // path carries the same id in a different case.
+        let tmp = vault();
+        let file = wiki_dir(tmp.path()).join("entities/acme.md");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file,
+            "---\nid: entities/ACME\ntype: entity\ntitle: A\n---\n\nBody.\n",
+        )
+        .unwrap();
+        let err = call_tool(
+            &json!({ "name": "brain_write_page", "arguments": {
+                "id": "entities/acme",
+                "content": "---\nid: entities/acme\ntype: entity\ntitle: A\n---\n\nNew.\n"
+            } }),
+            tmp.path(),
+            &mut None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("already holds the page 'entities/ACME'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn write_page_still_repairs_a_file_whose_id_disagrees_with_its_path() {
+        // A hand-edited or copied file (Obsidian, VS Code) whose
+        // frontmatter id does not match its file name is not a case
+        // collision: writing the correct page over it is the repair path.
+        let tmp = vault();
+        let file = wiki_dir(tmp.path()).join("entities/acme.md");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file,
+            "---\nid: entities/acme-corp\ntype: entity\ntitle: A\n---\n\nBody.\n",
+        )
+        .unwrap();
+        call(
+            tmp.path(),
+            &mut None,
+            "brain_write_page",
+            json!({
+                "id": "entities/acme",
+                "content": "---\nid: entities/acme\ntype: entity\ntitle: A\n---\n\nRepaired.\n"
+            }),
+        );
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            text.contains("id: entities/acme\n") && text.contains("Repaired."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn write_batch_refuses_an_entry_whose_file_belongs_to_a_case_only_different_id() {
+        let tmp = vault();
+        let file = wiki_dir(tmp.path()).join("entities/acme.md");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file,
+            "---\nid: entities/ACME\ntype: entity\ntitle: A\n---\n\nBody.\n",
+        )
+        .unwrap();
+        let err = call_tool(
+            &json!({ "name": "brain_write_batch", "arguments": { "pages": [{
+                "id": "entities/acme",
+                "content": "---\nid: entities/acme\ntype: entity\ntitle: A\n---\n\nNew.\n"
+            }] } }),
+            tmp.path(),
+            &mut None,
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with("pages[0] (entities/acme): the file for"),
+            "{err}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_page_with_a_case_only_different_id_leaves_the_existing_page_untouched() {
+        let tmp = vault();
+        put(tmp.path(), "entities/acme", "", "Original.");
+        let file = wiki_dir(tmp.path()).join("entities/acme.md");
+        let _ = call_tool(
+            &json!({ "name": "brain_write_page", "arguments": {
+                "id": "entities/ACME",
+                "content": "---\nid: entities/ACME\ntype: entity\ntitle: A\n---\n\nNew.\n"
+            } }),
+            tmp.path(),
+            &mut None,
+        );
+        assert!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("id: entities/acme\n")
+        );
+    }
+
+    #[test]
+    fn history_restore_accepts_a_seven_character_sha_prefix() {
+        let tmp = vault();
+        let wiki = wiki_dir(tmp.path());
+        crate::wiki::git::init_repo(&wiki).unwrap();
+        put(tmp.path(), "entities/alice", "", "Version one.");
+        let v1 = crate::wiki::git::commit_all(&wiki, "v1").unwrap().unwrap();
+        put(tmp.path(), "entities/alice", "", "Version two.");
+        crate::wiki::git::commit_all(&wiki, "v2").unwrap();
+        call(
+            tmp.path(),
+            &mut None,
+            "brain_history",
+            json!({ "action": "restore", "id": "entities/alice", "sha": &v1[..7] }),
+        );
+        let text = std::fs::read_to_string(wiki.join("entities/alice.md")).unwrap();
+        assert!(text.contains("Version one."), "{text}");
+    }
+
+    #[test]
+    fn history_restore_refuses_a_revision_expression() {
+        let tmp = vault();
+        let wiki = wiki_dir(tmp.path());
+        crate::wiki::git::init_repo(&wiki).unwrap();
+        put(tmp.path(), "entities/alice", "", "Body.");
+        crate::wiki::git::commit_all(&wiki, "v1").unwrap();
+        let err = call_tool(
+            &json!({ "name": "brain_history", "arguments": { "action": "restore", "id": "entities/alice", "sha": "HEAD~1" } }),
+            tmp.path(),
+            &mut None,
+        )
+        .unwrap_err();
+        assert!(err.contains("is not a commit sha"), "{err}");
+    }
+
+    /// Ten indexed pages with realistic lengths: 35-character ids,
+    /// 30-character titles and long summaries.
+    fn realistic_vault() -> (TempDir, Option<crate::db::DbHandle>) {
+        let tmp = vault();
+        for i in 0..10 {
+            let id = format!("entities/customer-zebrafish-labs-{i:02}");
+            assert_eq!(id.len(), 35);
+            let dir = wiki_dir(tmp.path()).join("entities");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(format!("{}.md", id.trim_start_matches("entities/"))),
+                format!(
+                    "---\nid: {id}\ntype: entity\ntitle: Zebrafish Labs Customer No {i:02}\n\
+                     summary: Zebrafish Labs is a long-standing customer whose contract renews every \
+                     twelve months with a three-month notice period.\n---\n\nZebrafish body.\n"
+                ),
+            )
+            .unwrap();
+        }
+        let db = indexed(tmp.path());
+        (tmp, db)
+    }
+
+    #[test]
+    fn concise_search_for_ten_realistic_hits_stays_within_the_budget() {
+        let (tmp, mut db) = realistic_vault();
+        let out = call(
+            tmp.path(),
+            &mut db,
+            "brain_search",
+            json!({ "query": "zebrafish" }),
+        );
+        assert!(
+            out.len() <= CONCISE_SEARCH_BUDGET,
+            "{} chars: {out}",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn concise_search_titles_are_cut_at_sixty_characters() {
+        let tmp = vault();
+        let title = "A very long page title that keeps going well past sixty characters in total";
+        put(tmp.path(), "entities/long", "summary: Long.\n", "zebrafish");
+        let file = wiki_dir(tmp.path()).join("entities/long.md");
+        let text = std::fs::read_to_string(&file)
+            .unwrap()
+            .replace("title: long", &format!("title: {title}"));
+        std::fs::write(&file, text).unwrap();
+        let mut db = indexed(tmp.path());
+        let out = call_json(
+            tmp.path(),
+            &mut db,
+            "brain_search",
+            json!({ "query": "zebrafish" }),
+        );
+        let cut = out["hits"][0]["title"].as_str().unwrap();
+        assert!(
+            cut.chars().count() <= 60
+                && !cut.is_empty()
+                && title.starts_with(cut.trim_end_matches('…').trim_end()),
+            "{out}"
+        );
     }
 }

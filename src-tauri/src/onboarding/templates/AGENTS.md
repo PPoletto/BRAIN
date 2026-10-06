@@ -25,7 +25,8 @@ decision.
 **error** — `brain_write_page` returns failure, the file lands on disk
 but does not get auto-committed, and **no subsequent auto-commit will
 succeed** until the drift is fixed. The fix is always the same:
-rewrite the page via `brain_write_page` with the singular form. The
+rewrite the page via `brain_write_page` with the singular form (read it
+first with `response_format: "detailed"` — see "Rewriting a Page"). The
 error message lists the four valid singular forms; do not guess.
 
 There is no `notes/` directory. Single-fact memos, preferences, and personal
@@ -91,7 +92,8 @@ When a fact changes (a new contract, a new role, a revised decision), do
 1. Write the new state as its own page (or update the page that already
    describes the current state).
 2. On the old page set `superseded_by: <new id>` and `valid_to:` (the last
-   day the old facts held). Leave its body as it was.
+   day the old facts held). Leave its body as it was (read it with
+   `response_format: "detailed"` first — see "Rewriting a Page").
 
 `brain_query` hides superseded, expired and not-yet-valid pages by
 default (`valid:all` shows them, `valid:expired` lists only them).
@@ -179,6 +181,18 @@ counts) or `"detailed"` (every field). Ask for `"detailed"` only when you
 need it — e.g. `brain_get_pages` detailed returns the full frontmatter,
 which you need before rewriting a page with `brain_write_page`.
 
+### Rewriting a Page
+
+`brain_write_page` replaces the whole file, frontmatter included. Before
+rewriting an existing page, **always** read it with `brain_get_pages` and
+`response_format: "detailed"` and carry over **every** frontmatter field
+unchanged except the one you mean to change — `aliases`, `sources`,
+`tags`, `superseded_by`, `valid_from` / `valid_to`, `distinct_from`,
+`created`, everything. A concise read has no frontmatter; rewriting from
+it silently drops those fields, and a dropped `superseded_by` makes a
+replaced page current again. To change only a body section, use
+`brain_patch_page` instead — it never touches the frontmatter.
+
 **Renamed tools.** Older instructions may name `brain_get_page`,
 `brain_get_context`, `brain_page_exists`, `brain_list_pages`,
 `brain_list_tags`, `brain_embedding_status`, `brain_rename_page`,
@@ -227,7 +241,7 @@ slug and title, and list the other id in `distinct_from`. Overwriting an
 existing id is never refused. If two existing pages share a name through
 an alias or the same slug, the lint reports `alias-collision`: merge them
 (`brain_refactor` with `action: "merge"`), fix the alias, or add
-`distinct_from`.
+`distinct_from` (adding a field is a rewrite — see "Rewriting a Page").
 
 ### Bulk-Ingest Workflow
 
@@ -374,17 +388,19 @@ A dream session (the `dream` prompt contains the same protocol):
      same thing, merge the weaker into the stronger (`brain_refactor`,
      `action: "merge"`) and tidy
      the appended section with `brain_patch_page`. If not, leave them (and
-     add `distinct_from` if they share a name).
-   - `update-summary` / `write-summary` — read the page and write a
+     add `distinct_from` if they share a name — detailed read first).
+   - `update-summary` / `write-summary` — read the page with
+     `brain_get_pages` and `response_format: "detailed"`, then write a
      fitting one-to-two-sentence `summary` (`brain_patch_page` cannot edit
-     frontmatter — rewrite the page with `brain_write_page`, body
-     unchanged). If a stale summary is still accurate, confirm it instead:
-     write the page unchanged with `brain_write_page` and
+     frontmatter — rewrite the page with `brain_write_page`, body and
+     every other frontmatter field unchanged; see "Rewriting a Page"). If
+     a stale summary is still accurate, confirm it instead: write the page
+     exactly as read (detailed) with `brain_write_page` and
      `confirm_summary: true`, and the item goes away.
    - `archive-or-supersede` / `review-or-archive` — a page nobody reads or
      links to. Link it from a related page if it is still useful; if its
-     facts were replaced, set `superseded_by` and `valid_to`. Do not
-     delete it.
+     facts were replaced, set `superseded_by` and `valid_to` (detailed
+     read first, every other field kept). Do not delete it.
 3. Hard rules: **at most 10 changes**; **never delete a page other pages
    link to**; **supersede instead of overwriting** facts; keep minority
    views and open questions instead of flattening them into one "truth";

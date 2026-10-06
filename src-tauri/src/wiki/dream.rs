@@ -669,6 +669,23 @@ mod tests {
     }
 
     #[test]
+    fn a_duplicate_pair_declared_distinct_gives_no_merge_item() {
+        let (_tmp, db) = open_db();
+        duplicate_pair(&db);
+        exec(
+            &db,
+            "UPDATE pages SET frontmatter = ?1 WHERE id = 'entities/b'",
+            &[&r#"{"id":"entities/b","type":"entity","distinct_from":["entities/a"]}"#],
+        );
+        let merges = queue(&db)
+            .items
+            .iter()
+            .filter(|i| i.suggested_action == "merge")
+            .count();
+        assert_eq!(merges, 0);
+    }
+
+    #[test]
     fn a_duplicate_pair_gives_one_merge_item_naming_both_pages() {
         let (_tmp, db) = open_db();
         duplicate_pair(&db);

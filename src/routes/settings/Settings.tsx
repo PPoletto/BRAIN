@@ -1325,28 +1325,13 @@ function MemoryTab({ prompt, copy }: { prompt: string; copy: (s: string) => void
               ChatGPT does support MCP servers (under{" "}
               <strong>Settings → Apps & Connectors → Advanced →
               Developer Mode</strong>), but the connection originates
-              from OpenAI's backend, not the local app. So the URL has
-              to be reachable from the public internet — a localhost
-              endpoint like BRAIN's HTTP server isn't acceptable, and
-              there's no config file we could auto-write into either
-              (registration is UI-only).
-            </p>
-            <p className="mt-2">
-              <strong>If you really want BRAIN in ChatGPT:</strong> run a
-              Cloudflare Tunnel or ngrok pointing at BRAIN's local HTTP
-              MCP port (default <code className="font-mono">7137</code>),
-              then paste the public <code className="font-mono">https://…/mcp</code>{" "}
-              URL plus the bearer token (from{" "}
-              <code className="font-mono">00_meta/.mcp.json</code>) into
-              the Developer Mode form.
-            </p>
-            <p className="mt-2 text-xs text-amber-300/90">
-              <strong>Trade-off:</strong> tunnel traffic egresses through
-              a third party, which is a real privacy regression vs. the
-              other supported clients (Claude Desktop, Codex,
-              Continue.dev — all dial localhost directly). Make sure
-              you understand what your ChatGPT queries would expose
-              before going down this path.
+              from OpenAI's backend, not the local app. So the server
+              has to be reachable over public HTTPS — and BRAIN's MCP
+              server speaks stdio only (your client starts{" "}
+              <code className="font-mono">brain mcp</code> as a local
+              process). There is no HTTP endpoint to expose, and
+              registration in ChatGPT is UI-only anyway, so ChatGPT is
+              not supported.
             </p>
           </SetupAccordion>
 

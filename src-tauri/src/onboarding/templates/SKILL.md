@@ -64,6 +64,11 @@ only when you need the extra fields.
   existing page and add your name for it to its `aliases`.
 - Facts are never overwritten: set `superseded_by` + `valid_to` on the old
   page and write the new state.
+- Before rewriting an existing page with `brain_write_page`, read it with
+  `brain_get_pages` and `response_format: "detailed"` and carry over every
+  frontmatter field unchanged (aliases, sources, tags, superseded_by,
+  valid_from/valid_to, distinct_from) — a concise read has no frontmatter.
+  For a body section only, use `brain_patch_page`.
 - Never delete a page other pages link to; ask before merging or deleting
   pages the user wrote.
 - If `new_size_bytes` is much smaller than `previous_size_bytes` after an
