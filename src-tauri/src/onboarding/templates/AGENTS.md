@@ -128,6 +128,9 @@ for the job:
 | `brain_write_raw_file` | Place a raw ingest artifact under `01_raw/<connector>/...` before turning it into a `source` page |
 | `brain_get_page_history` | List the Git commits that touched one page — pair with the next tool to roll back a bad overwrite |
 | `brain_restore_page` | Replace a page with the version at a given commit sha. Records a `revert: …` commit, never destructive |
+| `brain_rename_page` | A page has the **wrong id** (typo, wrong slug, wrong type directory). Moves it and rewrites every link to it across the vault |
+| `brain_merge_pages` | Two pages are **duplicates**. Appends the duplicate's body to the surviving page, redirects its links, removes the duplicate |
+| `brain_delete_page` | A page is **junk** and should not exist. Refuses while other pages link to it; `force: true` deletes anyway and turns those links into plain text. Recoverable via `brain_restore_page` |
 
 ### Bulk-Ingest Workflow
 
@@ -166,6 +169,41 @@ one, recover via:
 
 Confirm with the user before restoring if the change is non-trivial
 — restoring drops everything that came after the chosen sha.
+
+### Fixing a Wrong Page Name
+
+Never fix a wrong id by writing a second page and leaving the first one
+behind — every link keeps pointing at the old id. Instead:
+
+1. **Wrong id, right content** → `brain_rename_page` with `id` and
+   `new_id`. BRAIN moves the page, updates its frontmatter `id` (and
+   `type` if the type directory changes) and rewrites `[[old]]` /
+   `[[old|Alias]]` links in every page. If `new_id` already exists, the
+   two pages are duplicates — go to step 2.
+2. **Duplicate of an existing page** → `brain_merge_pages` with
+   `from_id` (the duplicate) and `into_id` (the page to keep). Then read
+   the surviving page and tidy the appended `## Merged from …` section
+   with `brain_patch_page`.
+3. **Junk that should not exist** → `brain_delete_page`. If it refuses
+   because other pages link to it, decide whether those links should
+   point somewhere else (rename or merge instead) before passing
+   `force: true`.
+
+Each of these records one commit (plus a `wiki: checkpoint before
+refactor` commit first if there were uncommitted changes). Nothing is
+lost: to bring back a deleted or merged page, call
+`brain_get_page_history` with the **old** id and pass
+`brain_restore_page` a sha from **before** the delete/merge commit — the
+topmost entry is the removal itself. After a rename, the history under
+the new id starts at the rename; older revisions are listed under the old
+id. Confirm with the user before deleting or merging pages they wrote
+themselves.
+
+Page ids for these tools must look like `entities/dan-shapiro`: a type
+directory, then letters, digits, `.`, `_` or `-` (no spaces or
+parentheses — they break markdown links). If a tool reports
+`commit: null` with a `note`, the change is already on disk; do not
+repeat it.
 
 ### Lint Output is Page-Scoped
 

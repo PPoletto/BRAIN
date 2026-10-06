@@ -6,6 +6,29 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Rename, merge and delete pages from Claude/Codex.** Three new MCP
+  tools let an agent clean up the wiki instead of leaving mistakes behind:
+  - `brain_rename_page` gives a page created under a wrong name its
+    correct id and updates every link to it across the vault — including
+    links with a custom label.
+  - `brain_merge_pages` folds a duplicate page into the page that should
+    stay: its text is appended under a "Merged from …" heading, tags are
+    combined, links are redirected and the duplicate is removed.
+  - `brain_delete_page` removes a junk page. It refuses while other pages
+    still link to it and names them; when forced, those links become plain
+    text.
+
+  Each change is saved as a single history entry. Any edits that were not
+  yet saved to the history are saved first, so a deleted or merged page —
+  including its latest unsaved edits — can always be restored from the
+  page history. If a change cannot be completed, the pages already touched
+  are put back as they were. Encrypted vaults keep page names out of file
+  names and history messages as before. Use
+  "Update vault templates" in Settings to give your agent the updated
+  instructions for these tools.
+
 ### Changed
 
 - **Semantic search understands where a passage belongs.** Pages are now

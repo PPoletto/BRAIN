@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 
 use crate::vault::layout::{raw_dir, wiki_dir};
 use crate::viewer::{graph, search, tree};
-use crate::wiki::{history as wiki_history, lint, page};
+use crate::wiki::{history as wiki_history, lint, page, refactor};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 // `serverInfo.name` shown in MCP `initialize` handshake responses. We use
@@ -727,6 +727,42 @@ fn tool_descriptors() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "brain_rename_page",
+            "description": "Give an existing page a new id — use this when a page was created under a WRONG id (typo, wrong slug, wrong type directory). Moves the page, sets its frontmatter `id` (and `type`, if the type directory changes) and rewrites every link to the old id in every page of the vault: `[[old]]` → `[[new]]`, `[[old|Alias]]` → `[[new|Alias]]`, `[Text](old)` → `[Text](new)`. Only exact-id links change (`[[old-2]]` is untouched); links inside code blocks are rewritten too. `new_id` must be `<type>/<slug>` with type one of entities, concepts, sources, topics, and a slug of letters, digits, `.`, `_`, `-` (no spaces or parentheses); it must not exist yet — if it does, the two pages are duplicates: use brain_merge_pages instead. A case-only rename (`Old` → `old`) works. Records one commit (after a checkpoint commit of any pending edits). Returns `{old_id, new_id, rewritten_pages, rewritten_links, commit}`; if `commit` is null with a `note`, the rename is already on disk — do not repeat it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "current page id, e.g. 'entities/dan-shapio'" },
+                    "new_id": { "type": "string", "description": "the correct page id, e.g. 'entities/dan-shapiro'" }
+                },
+                "required": ["id", "new_id"]
+            }
+        }),
+        json!({
+            "name": "brain_merge_pages",
+            "description": "Fold a DUPLICATE page into the page that should survive. Appends the body of `from_id` to `into_id` under a `## Merged from <from_id>` heading (target frontmatter and title kept, tags united), redirects every link to `from_id` in the vault to `into_id` (aliases kept), and removes `from_id`. Links between the two pages become plain text so the merged page never links to itself. Review and tidy the merged page afterwards with brain_patch_page — the appended section is a verbatim copy. Records one commit (after a checkpoint commit of any pending edits); the removed page stays recoverable: brain_get_page_history on `from_id`, then brain_restore_page with a sha from before the merge. Returns `{from_id, into_id, rewritten_pages, rewritten_links, commit}` (plus `note` if the commit is still pending).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "from_id": { "type": "string", "description": "the duplicate page to fold in and remove" },
+                    "into_id": { "type": "string", "description": "the page that survives and receives the content" }
+                },
+                "required": ["from_id", "into_id"]
+            }
+        }),
+        json!({
+            "name": "brain_delete_page",
+            "description": "Delete a page that should not exist at all (junk, test page, empty stub). Not for a wrong id — use brain_rename_page — and not for a duplicate — use brain_merge_pages. REFUSES while other pages link to it and lists those pages. With `force: true` it deletes anyway and turns every link to it into plain text (`[[id|Alias]]` → `Alias`, `[[id]]` → the page title). Records one commit (after a checkpoint commit of any pending edits), so the content is never lost: brain_get_page_history on the deleted id, then brain_restore_page with a sha from before the delete. Returns `{deleted, defused_in, defused_links, commit}` (plus `note` if the commit is still pending).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "page id to delete, e.g. 'entities/test-page'" },
+                    "force": { "type": "boolean", "description": "delete even while other pages link to it (links become plain text). Default false." }
+                },
+                "required": ["id"]
+            }
+        }),
+        json!({
             "name": "brain_write_batch",
             "description": "Atomic multi-page write. Pass `pages: [{id, content}, ...]` — all pages are parsed and normalised first (phase 1; if any one fails to parse, nothing is written), then all are written to disk (phase 2), then lint runs ONCE over the whole vault (phase 3) and the response is scoped to the union of paths in the batch. Use this when several pages reference each other and would cascade broken-link errors if written one-by-one. Response: `{wrote: [{id, previous_size_bytes, new_size_bytes, warnings}]}`. Errors abort with a structured message naming the offending id. Commit is delegated to the watcher (same as brain_write_page).",
             "inputSchema": {
@@ -878,6 +914,7 @@ fn call_tool(
         }
         "brain_get_page" => {
             let id = args.get("id").and_then(Value::as_str).unwrap_or("");
+            check_page_id(id)?;
             let page = tree::read_page(vault, id).map_err(|e| e.to_string())?;
             Ok(serde_json::to_string_pretty(&page).unwrap_or_default())
         }
@@ -899,6 +936,15 @@ fn call_tool(
                 .iter()
                 .map(|raw| {
                     let id = raw.as_str().unwrap_or("");
+                    // Same per-id error shape as a missing page; the guard
+                    // runs before any filesystem access.
+                    if let Err(e) = check_page_id(id) {
+                        return json!({
+                            "id": id,
+                            "found": false,
+                            "error": e,
+                        });
+                    }
                     match tree::read_page(vault, id) {
                         Ok(page) => json!({
                             "id": id,
@@ -929,13 +975,11 @@ fn call_tool(
             if id.is_empty() {
                 return Err("'id' must not be empty".to_string());
             }
-            // Same hardening as brain_write_raw_file: defend against
-            // path-traversal smuggled into the id (e.g. `../../etc/passwd`).
-            // Reject before joining onto the wiki dir so the resulting
-            // Path::is_file() check can never escape the vault root.
-            if id.contains("..") {
-                return Err("id may not contain '..'".to_string());
-            }
+            // Defend against path escapes smuggled into the id
+            // (`../../etc/passwd`, `C:/Users/x`). Reject before joining onto
+            // the wiki dir so the Path::is_file() check can never escape the
+            // vault root.
+            check_page_id(id)?;
             let target = crate::wiki::encryption::page_path(vault, id).map_err(|e| e.to_string())?;
             let exists = target.is_file();
             Ok(serde_json::to_string(&json!({
@@ -946,6 +990,7 @@ fn call_tool(
         }
         "brain_get_context" => {
             let id = args.get("id").and_then(Value::as_str).unwrap_or("");
+            check_page_id(id)?;
             let page = tree::read_page(vault, id).map_err(|e| e.to_string())?;
             // `tree::read_page` already strips the YAML frontmatter, so
             // `page::parse` would refuse the body with "missing frontmatter
@@ -966,6 +1011,7 @@ fn call_tool(
                 .get("id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "missing 'id'".to_string())?;
+            check_page_id(id)?;
             let content = args
                 .get("content")
                 .and_then(Value::as_str)
@@ -1059,9 +1105,7 @@ fn call_tool(
                 .get("id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "missing 'id'".to_string())?;
-            if id.contains("..") {
-                return Err("id may not contain '..'".to_string());
-            }
+            check_page_id(id)?;
             let heading = args
                 .get("heading")
                 .and_then(Value::as_str)
@@ -1092,9 +1136,7 @@ fn call_tool(
             if id.is_empty() {
                 return Err("'id' must not be empty".to_string());
             }
-            if id.contains("..") {
-                return Err("id may not contain '..'".to_string());
-            }
+            check_page_id(id.strip_suffix(".md").unwrap_or(id))?;
             let limit = args
                 .get("limit")
                 .and_then(Value::as_u64)
@@ -1130,9 +1172,7 @@ fn call_tool(
             if id.is_empty() {
                 return Err("'id' must not be empty".to_string());
             }
-            if id.contains("..") {
-                return Err("id may not contain '..'".to_string());
-            }
+            check_page_id(id.strip_suffix(".md").unwrap_or(id))?;
             if sha.is_empty() {
                 return Err("'sha' must not be empty".to_string());
             }
@@ -1152,6 +1192,32 @@ fn call_tool(
                 "from_sha": sha,
             }))
             .unwrap_or_default())
+        }
+        "brain_rename_page" => {
+            let id = required_str(&args, "id")?;
+            let new_id = required_str(&args, "new_id")?;
+            let outcome = refactor::rename_page(vault, id, new_id).map_err(|e| e.to_string())?;
+            forget_in_index(db, vault, &outcome.old_id);
+            Ok(serde_json::to_string(&outcome).unwrap_or_default())
+        }
+        "brain_merge_pages" => {
+            let from_id = required_str(&args, "from_id")?;
+            let into_id = required_str(&args, "into_id")?;
+            let outcome =
+                refactor::merge_pages(vault, from_id, into_id).map_err(|e| e.to_string())?;
+            forget_in_index(db, vault, &outcome.from_id);
+            Ok(serde_json::to_string(&outcome).unwrap_or_default())
+        }
+        "brain_delete_page" => {
+            let id = required_str(&args, "id")?;
+            let force = match args.get("force") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(b)) => *b,
+                Some(_) => return Err("force must be a boolean (true or false)".to_string()),
+            };
+            let outcome = refactor::delete_page(vault, id, force).map_err(|e| e.to_string())?;
+            forget_in_index(db, vault, &outcome.deleted);
+            Ok(serde_json::to_string(&outcome).unwrap_or_default())
         }
         "brain_write_batch" => {
             // Three phases — see the tool descriptor for the user-
@@ -1182,6 +1248,7 @@ fn call_tool(
                     .get("id")
                     .and_then(Value::as_str)
                     .ok_or_else(|| format!("pages[{idx}]: missing 'id'"))?;
+                check_page_id(id).map_err(|e| format!("pages[{idx}]: {e}"))?;
                 let content = entry
                     .get("content")
                     .and_then(Value::as_str)
@@ -1283,6 +1350,8 @@ fn call_tool(
             if rel.contains("..") {
                 return Err("relative_path may not contain '..'".to_string());
             }
+            check_relative_path("connector", connector)?;
+            check_relative_path("relative_path", rel)?;
             let target = raw_dir(vault).join(connector).join(rel);
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -1617,6 +1686,65 @@ fn patch_section(body: &str, heading: &str, new_content: &str) -> String {
     }
 }
 
+/// A required string argument: `missing '<key>'` when absent,
+/// `'<key>' must be a string` when present with another JSON type.
+fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Err(format!("missing '{key}'")),
+        Some(v) => v.as_str().ok_or_else(|| format!("'{key}' must be a string")),
+    }
+}
+
+/// The shared page-id guard ([`refactor::validate_page_id`]) for every
+/// tool that turns an id into a path: relative `<type>/<slug>` under the
+/// wiki, no drive letters, `..`, backslashes or control characters.
+/// Guarded arms: get_page, get_pages (per id), get_context, page_exists,
+/// write_page, write_batch (per page), patch_page, get_page_history,
+/// restore_page, rename_page, merge_pages, delete_page (the last three
+/// inside `wiki::refactor`). Any new arm that resolves a page id must call
+/// this first. `brain_write_raw_file` uses [`check_relative_path`].
+fn check_page_id(id: &str) -> Result<(), String> {
+    refactor::validate_page_id(id).map_err(|e| e.to_string())
+}
+
+/// Guard for a caller-supplied relative path under `01_raw/`: only plain
+/// relative components — no `..`, drive letters (`wiki.join("C:/x")`
+/// replaces the base on Windows), roots, `:` or control characters.
+fn check_relative_path(label: &str, rel: &str) -> Result<(), String> {
+    use std::path::Component;
+    let plain = !rel.is_empty()
+        && !rel.contains(':')
+        && !rel.chars().any(char::is_control)
+        && std::path::Path::new(rel)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)));
+    if plain {
+        Ok(())
+    } else {
+        Err(format!(
+            "{label} must be a plain relative path (no '..', drive letters, leading '/' or ':')"
+        ))
+    }
+}
+
+/// Best-effort removal of the index rows of a page id a refactor just
+/// removed from disk, so search/query in this process stop returning them. The
+/// refactor itself is already committed — an index hiccup (busy GUI
+/// writer, hung disk) is logged, never surfaced as a tool failure; the
+/// next full rebuild (GUI watcher, or the next mount) prunes them anyway.
+fn forget_in_index(
+    db: &mut Option<crate::db::DbHandle>,
+    vault: &std::path::Path,
+    id: &str,
+) {
+    let ids = vec![id.to_string()];
+    if let Err(err) = db_op(db, vault, "forget refactored page", move |conn| {
+        crate::db::pages_index::forget_pages(conn, &ids)
+    }) {
+        tracing::warn!(%err, "could not drop a refactored page id from the index");
+    }
+}
+
 /// Write `normalized_content` to the page's (opaque-aware) path, then run
 /// the page-scoped lint and build the standard write response. Mirrors the
 /// write+lint tail of `brain_write_page`; shared with `brain_patch_page`.
@@ -1795,6 +1923,9 @@ mod tests {
             "brain_write_raw_file",
             "brain_get_page_history",
             "brain_restore_page",
+            "brain_rename_page",
+            "brain_merge_pages",
+            "brain_delete_page",
             "brain_graph",
             "brain_query",
             "brain_list_tags",
@@ -2488,6 +2619,227 @@ mod tests {
         // The file on disk is now v1's content again.
         let after = std::fs::read_to_string(entities.join("alice.md")).unwrap();
         assert_eq!(after, "alice v1");
+    }
+
+    /// A git-backed vault with `entities/old` and `entities/alice`, where
+    /// alice links to old — the fixture for the refactor tool tests.
+    fn refactor_vault() -> tempfile::TempDir {
+        use crate::vault::layout::{ensure_skeleton, wiki_dir};
+        let tmp = tempfile::TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        seed_marker(tmp.path());
+        let wiki = wiki_dir(tmp.path());
+        crate::wiki::git::init_repo(&wiki).unwrap();
+        std::fs::write(
+            wiki.join("entities/old.md"),
+            "---\nid: entities/old\ntype: entity\ntitle: Old\n---\n\nBody.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            wiki.join("entities/alice.md"),
+            "---\nid: entities/alice\ntype: entity\ntitle: Alice\n---\n\nKnows [[entities/old|O]].\n",
+        )
+        .unwrap();
+        crate::wiki::git::commit_all(&wiki, "baseline").unwrap();
+        tmp
+    }
+
+    #[test]
+    fn brain_rename_page_returns_the_rewritten_pages_as_json() {
+        let tmp = refactor_vault();
+        let ok = call_tool(
+            &json!({
+                "name": "brain_rename_page",
+                "arguments": { "id": "entities/old", "new_id": "entities/new" }
+            }),
+            tmp.path(),
+            &mut None,
+        )
+        .expect("brain_rename_page must succeed");
+        let parsed: Value = serde_json::from_str(&ok).expect("JSON");
+        assert_eq!(parsed["rewritten_pages"], json!(["entities/alice"]));
+    }
+
+    #[test]
+    fn brain_merge_pages_reports_the_ids_under_the_input_key_names() {
+        let tmp = refactor_vault();
+        let ok = call_tool(
+            &json!({
+                "name": "brain_merge_pages",
+                "arguments": { "from_id": "entities/old", "into_id": "entities/alice" }
+            }),
+            tmp.path(),
+            &mut None,
+        )
+        .expect("brain_merge_pages must succeed");
+        let parsed: Value = serde_json::from_str(&ok).expect("JSON");
+        assert_eq!(
+            (&parsed["from_id"], &parsed["into_id"]),
+            (&json!("entities/old"), &json!("entities/alice"))
+        );
+    }
+
+    #[test]
+    fn brain_delete_page_refusal_names_the_referring_pages() {
+        let tmp = refactor_vault();
+        let err = call_tool(
+            &json!({
+                "name": "brain_delete_page",
+                "arguments": { "id": "entities/old" }
+            }),
+            tmp.path(),
+            &mut None,
+        )
+        .expect_err("a linked page must not be deleted without force");
+        assert!(err.contains("entities/alice"), "referrer missing from: {err}");
+    }
+
+    #[test]
+    fn brain_delete_page_rejects_a_non_boolean_force() {
+        let tmp = refactor_vault();
+        let err = call_tool(
+            &json!({
+                "name": "brain_delete_page",
+                "arguments": { "id": "entities/old", "force": "yes" }
+            }),
+            tmp.path(),
+            &mut None,
+        )
+        .expect_err("a string force must be refused");
+        assert!(err.contains("force must be a boolean"), "got: {err}");
+    }
+
+    #[test]
+    fn brain_rename_page_rejects_a_non_string_new_id() {
+        let tmp = refactor_vault();
+        let err = call_tool(
+            &json!({
+                "name": "brain_rename_page",
+                "arguments": { "id": "entities/old", "new_id": 42 }
+            }),
+            tmp.path(),
+            &mut None,
+        )
+        .expect_err("a numeric new_id must be refused");
+        assert!(err.contains("'new_id' must be a string"), "got: {err}");
+    }
+
+    #[test]
+    fn page_tools_reject_drive_letter_ids_before_touching_the_disk() {
+        // On Windows `wiki.join("C:/…")` replaces the base path entirely,
+        // so a drive-letter id would reach any file on any drive.
+        let tmp = refactor_vault();
+        let outside = tempfile::TempDir::new().unwrap();
+        let target = outside.path().join("notes.md");
+        std::fs::write(&target, "---\nid: entities/x\ntype: entity\n---\nkeep\n").unwrap();
+        let id = target.with_extension("").to_string_lossy().replace('\\', "/");
+        let page = "---\nid: entities/x\ntype: entity\n---\npwned\n";
+        let calls = [
+            ("brain_page_exists", json!({ "id": id })),
+            (
+                "brain_patch_page",
+                json!({ "id": id, "heading": "## X", "content": "pwned" }),
+            ),
+            ("brain_get_page_history", json!({ "id": id })),
+            ("brain_restore_page", json!({ "id": id, "sha": "deadbeef" })),
+            ("brain_write_page", json!({ "id": id, "content": page })),
+            ("brain_delete_page", json!({ "id": id, "force": true })),
+        ];
+        let accepted: Vec<&str> = calls
+            .iter()
+            .filter(|(name, args)| {
+                call_tool(
+                    &json!({ "name": name, "arguments": args }),
+                    tmp.path(),
+                    &mut None,
+                )
+                .is_ok()
+            })
+            .map(|(name, _)| *name)
+            .collect();
+        let content = std::fs::read_to_string(&target).unwrap_or_default();
+        assert!(
+            accepted.is_empty() && content.contains("keep"),
+            "accepted: {accepted:?}, outside file now: {content:?}"
+        );
+    }
+
+    #[test]
+    fn read_tools_reject_drive_letter_ids_and_never_return_the_outside_file() {
+        // Information-disclosure twin of the write-side guard: a drive-letter
+        // id must not let get_page / get_pages / get_context read an
+        // arbitrary `.md` file elsewhere on the machine.
+        let tmp = refactor_vault();
+        let outside = tempfile::TempDir::new().unwrap();
+        let target = outside.path().join("secret.md");
+        std::fs::write(
+            &target,
+            "---\nid: entities/x\ntype: entity\ntitle: T\n---\nOUTSIDE-SECRET-4711\n",
+        )
+        .unwrap();
+        let id = target.with_extension("").to_string_lossy().replace('\\', "/");
+        let results: Vec<(&str, Result<String, String>)> = vec![
+            (
+                "brain_get_page",
+                call_tool(
+                    &json!({ "name": "brain_get_page", "arguments": { "id": id } }),
+                    tmp.path(),
+                    &mut None,
+                ),
+            ),
+            (
+                "brain_get_pages",
+                call_tool(
+                    &json!({ "name": "brain_get_pages", "arguments": { "ids": [id] } }),
+                    tmp.path(),
+                    &mut None,
+                ),
+            ),
+            (
+                "brain_get_context",
+                call_tool(
+                    &json!({ "name": "brain_get_context", "arguments": { "id": id } }),
+                    tmp.path(),
+                    &mut None,
+                ),
+            ),
+        ];
+        let leaked: Vec<String> = results
+            .iter()
+            .filter_map(|(name, r)| {
+                let text = match r {
+                    Ok(ok) => ok.clone(),
+                    Err(err) => err.clone(),
+                };
+                let rejected = match (name, r) {
+                    // get_pages reports per id, like a missing page.
+                    (&"brain_get_pages", Ok(ok)) => {
+                        ok.contains("\"found\": false") && ok.contains("invalid page id")
+                    }
+                    (_, Err(err)) => err.contains("invalid page id"),
+                    _ => false,
+                };
+                (!rejected || text.contains("OUTSIDE-SECRET-4711"))
+                    .then(|| format!("{name}: {text}"))
+            })
+            .collect();
+        assert!(leaked.is_empty(), "not rejected or leaked: {leaked:?}");
+    }
+
+    #[test]
+    fn brain_write_raw_file_rejects_an_absolute_connector_path() {
+        let tmp = refactor_vault();
+        let outside = tempfile::TempDir::new().unwrap();
+        let connector = outside.path().to_string_lossy().replace('\\', "/");
+        let _ = call_tool(
+            &json!({
+                "name": "brain_write_raw_file",
+                "arguments": { "connector": connector, "relative_path": "x.txt", "content": "pwned" }
+            }),
+            tmp.path(),
+            &mut None,
+        );
+        assert!(!outside.path().join("x.txt").exists());
     }
 
     #[test]

@@ -116,7 +116,7 @@ pub fn looks_like_wiki_page_target(raw: &str) -> bool {
 /// what the Tauri webview expands a relative href to at click time, and
 /// older pages can sneak that into their bodies if a user copy-pasted
 /// from the address bar.
-fn page_id_from_markdown_target(raw: &str) -> Option<String> {
+pub(crate) fn page_id_from_markdown_target(raw: &str) -> Option<String> {
     if raw.is_empty() || raw.starts_with('#') || raw.starts_with('/') {
         return None;
     }

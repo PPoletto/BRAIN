@@ -11,6 +11,7 @@ pub mod history;
 pub mod lint;
 pub mod meta_files;
 pub mod page;
+pub mod refactor;
 pub mod sync;
 pub mod watcher;
 

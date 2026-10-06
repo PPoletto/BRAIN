@@ -283,15 +283,56 @@ fn prune_missing(tx: &rusqlite::Transaction, seen: &HashSet<String>) -> DbResult
     drop(stmt);
     for id in existing {
         if !seen.contains(&id) {
-            tx.execute("DELETE FROM pages WHERE id = ?1", params![&id])?;
-            tx.execute("DELETE FROM pages_fts WHERE id = ?1", params![&id])?;
-            tx.execute("DELETE FROM wiki_links WHERE src_id = ?1", params![&id])?;
-            tx.execute("DELETE FROM page_tags WHERE page_id = ?1", params![&id])?;
-            tx.execute("DELETE FROM chunks WHERE page_id = ?1", params![&id])?;
+            delete_page_rows(tx, &id)?;
         }
     }
-    // Mark broken outbound links so the search/graph can flag them.
-    tx.execute(
+    mark_broken_links(tx)
+}
+
+/// Drop every index row of the given page ids — `pages`, `pages_fts`,
+/// outbound `wiki_links`, `page_tags`, `chunks` and, when sqlite-vec is
+/// loaded, the matching `chunk_vectors` rows — then re-flag broken links.
+/// The targeted counterpart of the prune step in [`rebuild`]: used after
+/// an MCP refactor (rename, delete, merge) removed a page file, so the MCP
+/// process stops returning an id that no longer exists without paying for
+/// a full rebuild (which may have to embed). Rows of pages that were
+/// rewritten or newly created are refreshed by the next rebuild, as for
+/// every other MCP write.
+pub fn forget_pages(conn: &rusqlite::Connection, ids: &[String]) -> DbResult<()> {
+    let tx = conn.unchecked_transaction()?;
+    for id in ids {
+        delete_page_rows(&tx, id)?;
+    }
+    mark_broken_links(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Delete every index row of one page id. Vector rows go first, by the
+/// rowids of the page's chunks (the same pattern the re-index uses);
+/// best-effort, because `chunk_vectors` only exists with sqlite-vec.
+fn delete_page_rows(conn: &rusqlite::Connection, id: &str) -> DbResult<()> {
+    if super::migrations::chunk_vectors_available(conn) {
+        let chunk_ids: Vec<i64> = {
+            let mut stmt = conn.prepare("SELECT id FROM chunks WHERE page_id = ?1")?;
+            stmt.query_map(params![id], |row| row.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for cid in &chunk_ids {
+            let _ = conn.execute("DELETE FROM chunk_vectors WHERE rowid = ?1", params![cid]);
+        }
+    }
+    conn.execute("DELETE FROM pages WHERE id = ?1", params![id])?;
+    conn.execute("DELETE FROM pages_fts WHERE id = ?1", params![id])?;
+    conn.execute("DELETE FROM wiki_links WHERE src_id = ?1", params![id])?;
+    conn.execute("DELETE FROM page_tags WHERE page_id = ?1", params![id])?;
+    conn.execute("DELETE FROM chunks WHERE page_id = ?1", params![id])?;
+    Ok(())
+}
+
+/// Mark broken outbound links so the search/graph can flag them.
+fn mark_broken_links(conn: &rusqlite::Connection) -> DbResult<()> {
+    conn.execute(
         "UPDATE wiki_links SET broken = CASE \
             WHEN dst_id IN (SELECT id FROM pages) THEN 0 \
             ELSE 1 \
@@ -364,6 +405,67 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn forget_pages_removes_only_the_named_ids_from_the_index() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        write_page(tmp.path(), "entities", "alice", "x", &[]);
+        write_page(tmp.path(), "entities", "bob", "y", &[]);
+        let db = DbHandle::open(tmp.path()).unwrap();
+        rebuild(&db, tmp.path()).unwrap();
+        db.with(|conn| {
+            forget_pages(conn, &["entities/alice".to_string()])?;
+            let ids: Vec<String> = conn
+                .prepare("SELECT id FROM pages ORDER BY id")?
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            assert_eq!(ids, vec!["entities/bob".to_string()]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Rows left behind for `id` in every per-page index table (and in
+    /// `chunk_vectors`, counted via the vector rowids that no longer have
+    /// a chunk, when sqlite-vec is loaded).
+    fn leftover_rows(conn: &rusqlite::Connection, id: &str) -> i64 {
+        let count = |sql: &str| -> i64 {
+            conn.query_row(sql, params![id], |row| row.get(0)).unwrap()
+        };
+        let mut total = count("SELECT count(*) FROM pages_fts WHERE id = ?1")
+            + count("SELECT count(*) FROM chunks WHERE page_id = ?1")
+            + count("SELECT count(*) FROM page_tags WHERE page_id = ?1")
+            + count("SELECT count(*) FROM wiki_links WHERE src_id = ?1");
+        if crate::db::migrations::chunk_vectors_available(conn) {
+            total += conn
+                .query_row(
+                    "SELECT count(*) FROM chunk_vectors \
+                     WHERE rowid NOT IN (SELECT id FROM chunks)",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap();
+        }
+        total
+    }
+
+    #[test]
+    fn forget_pages_leaves_no_fts_chunk_tag_link_or_vector_rows_for_the_id() {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        write_page(tmp.path(), "entities", "alice", "Alice links [[entities/bob]].", &["t"]);
+        write_page(tmp.path(), "entities", "bob", "y", &[]);
+        let db = DbHandle::open(tmp.path()).unwrap();
+        rebuild(&db, tmp.path()).unwrap();
+        let left = db
+            .with(|conn| {
+                forget_pages(conn, &["entities/alice".to_string()])?;
+                Ok(leftover_rows(conn, "entities/alice"))
+            })
+            .unwrap();
+        assert_eq!(left, 0);
     }
 
     #[test]
