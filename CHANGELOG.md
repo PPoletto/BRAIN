@@ -6,6 +6,33 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.4] — 2026-10-06
+
+### Changed
+
+- **Search is fast everywhere, and the MCP search is finally semantic.**
+  Every search and every index rebuild used to load the 2.2 GB bge-m3
+  model from disk anew. In the app that meant a multi-second, UI-freezing
+  wait per search; in `brain mcp` the 8-second safety timeout cut the
+  load off and silently returned plain substring matches instead — the
+  MCP only *looked* fast. The model is now loaded once per process and
+  cached: the app warms it in the background when a vault mounts
+  ("Loading the embedding model" in the status bar), searches run on a
+  worker thread so the UI never blocks, re-indexing after a save no
+  longer reloads the model, and Claude/Codex get real hybrid
+  (full-text + semantic) results.
+- **Memory is released when you stop searching.** The cached model
+  (~2.2 GB) is dropped after 15 minutes without a search and reloaded
+  lazily on the next one — so BRAIN only holds it while you are actually
+  using it. Applies to the app and to each MCP client process.
+
+### Fixed
+
+- A half-downloaded or corrupt model file no longer costs a 2.2 GB read
+  on every search: failed loads are remembered until the files change,
+  and the tokenizer is checked before the weights so a bad download
+  fails cheaply. "Re-download model" clears the cache.
+
 ## [0.3.3] — 2026-09-03
 
 ### Fixed
