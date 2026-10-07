@@ -1770,6 +1770,7 @@ fn lint_session_prompt(focus: Option<&str>) -> String {
 - duplicate-candidate / alias-collision: read both pages (brain_get_pages); the same thing → brain_refactor action \"merge\" the weaker into the stronger; different things → add distinct_from (or fix the clashing alias).
 - orphan: link it from a related page or merge it; delete it (brain_refactor action \"delete\") only if it is junk.
 - missing-summary / missing-sources: read the page with brain_get_pages (response_format \"detailed\"), then add a one-to-two-sentence summary / the source pages with brain_write_page, body and every other frontmatter field unchanged.
+- missing-sources on a page created from a mail or calendar ingestion: the master-index topic page of that ingestion wave (e.g. topics/<…>-mail-ingestion) is an acceptable `sources` entry. Find it via the page's \"Verwandt im Brain\" link, or with brain_query (`prefix: \"topics/\"`, or query `type:topic AND title:ingestion`), then add it to `sources` with a detailed read + rewrite as above.
 - expired-but-linked: point the links at the successor.
 - invalid-date: write YYYY-MM-DD; valid_from must not lie after valid_to.
 - non-canonical-wiki-link / wikilink-pipe-in-table-cell: rewrite as [[type-dir/slug]] (no |alias inside table cells).
@@ -7142,6 +7143,12 @@ mod protocol_tests {
     fn the_lint_session_prompt_narrows_to_the_focus_kind() {
         let text = prompt_text("lint-session", json!({ "focus": "orphan" }));
         assert!(text.contains("only on findings of kind `orphan`"), "{text}");
+    }
+
+    #[test]
+    fn the_lint_session_prompt_accepts_the_ingestion_master_index_as_a_source() {
+        let text = prompt_text("lint-session", json!({}));
+        assert!(text.contains("master-index topic page"), "{text}");
     }
 
     #[test]

@@ -360,7 +360,13 @@ same findings live (concise: counts per kind; then `response_format:
 - `alias-collision` — two pages share a name via id or `aliases`. Merge
   them if they are the same thing; otherwise remove the clashing alias.
 - `missing-sources` — an entity or concept page names no `sources`. Add
-  the source pages its facts come from.
+  the source pages its facts come from. For a page created from a mail
+  or calendar ingestion, the master-index topic page of that ingestion
+  wave (e.g. `topics/<…>-mail-ingestion`) is an acceptable `sources`
+  entry: find it through the page's "Verwandt im Brain" link or with
+  `brain_query` (`prefix: "topics/"`, or `type:topic AND
+  title:ingestion`), then add it with a detailed read + rewrite (see
+  "Rewriting a Page").
 - `missing-summary` — the page has no `summary`. Write one or two
   sentences (start with the most-linked pages).
 - `broken-source` — a `sources` entry has no page. Fix the id or create

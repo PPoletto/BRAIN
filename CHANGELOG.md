@@ -49,6 +49,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`missing-sources` on ingested pages.** The `lint-session` prompt and
+  AGENTS.md now tell the agent that, for a page created from a mail or
+  calendar ingestion, the master-index topic page of that ingestion wave
+  counts as a source, and how to find it (the "Verwandt im Brain" link
+  or `brain_query`). Use "Update vault templates" to pass it on.
 - **Clearer error for a summary with a colon.** A `summary` or `title`
   whose unquoted value contains `: ` (e.g. "… (auch CIO COCKPIT):
   SaaS-Cockpit …") is invalid YAML. `brain_write_page` and
