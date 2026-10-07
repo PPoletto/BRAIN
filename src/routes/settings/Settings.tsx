@@ -1213,6 +1213,11 @@ function installStatusText(status: ClientInstallStatus, enabled: boolean): {
       };
     case "target-missing":
       return { text: "Client not found on this computer", color: "text-neutral-500" };
+    case "damaged":
+      return {
+        text: "Damaged — fix the BRAIN markers in this file by hand; BRAIN changes nothing until then",
+        color: "text-red-400",
+      };
   }
 }
 
@@ -1283,8 +1288,9 @@ function ClientInstallCard() {
           {rows.map((row) => {
             const { text, color } = installStatusText(row.status, row.enabled);
             const blocked =
-              !row.enabled &&
-              (row.status.state === "target-missing" || row.status.state === "foreign");
+              row.status.state === "damaged" ||
+              (!row.enabled &&
+                (row.status.state === "target-missing" || row.status.state === "foreign"));
             return (
               <li key={row.target} className="flex flex-col gap-1 px-3 py-2.5">
                 <label className="flex items-center gap-2">

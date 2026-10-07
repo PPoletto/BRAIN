@@ -32,7 +32,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   -->`) and keeps your own text around it byte for byte, line endings
   included; the skill file carries a marker too, and a `brain-wiki`
   folder BRAIN did not write is reported as foreign and left alone.
-  Switching off removes exactly what BRAIN wrote. After an app update
+  Switching off removes exactly what BRAIN wrote. Markers count only on
+  a line of their own; if they are broken (a start without an end, an
+  end without a start, or two blocks — e.g. after editing the file by
+  hand), the card shows "Damaged" and BRAIN changes nothing in that
+  file until the markers are fixed. After an app update
   BRAIN refreshes every switched-on install at start, so the prompt no
   longer goes stale silently. Claude Desktop keeps its instructions in
   the cloud and stays copy-paste ("Copy system prompt" on the Memory

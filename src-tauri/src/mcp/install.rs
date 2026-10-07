@@ -91,6 +91,10 @@ pub enum InstallStatus {
     Foreign,
     /// The client's directory does not exist (client not installed).
     TargetMissing,
+    /// BRAIN's markers in the instruction file are broken (a start without
+    /// an end, an end without a start, or more than one block). BRAIN
+    /// writes nothing until the user fixes them by hand.
+    Damaged,
 }
 
 /// The client directories, resolved once. Tests build it on a temp dir
@@ -192,27 +196,69 @@ struct BlockSpan {
     version: String,
 }
 
-fn find_block(text: &str, block_id: &str) -> Option<BlockSpan> {
+/// BRAIN's markers in a file are not one well-formed block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DamagedMarkers;
+
+/// The one marked block `block_id` in `text`. Markers count only on a
+/// line of their own (surrounding whitespace allowed), so a marker quoted
+/// inside the user's prose is ignored. `Ok(None)`: no marker line at all.
+/// [`DamagedMarkers`]: a start without an end, an end without a start, an
+/// end before its start, more than one block, or a start marker without
+/// a version — then nothing may be rewritten, because the span between
+/// the markers could hold the user's own text.
+fn find_block(text: &str, block_id: &str) -> Result<Option<BlockSpan>, DamagedMarkers> {
     let prefix = start_prefix(block_id);
-    let start = text.find(&prefix)?;
-    let after = &text[start + prefix.len()..];
-    let close = after.find(" -->")?;
-    let version = &after[..close];
-    if version.is_empty() || version.contains(['\n', '\r']) {
-        return None;
-    }
     let end_marker = end_marker(block_id);
-    let end = start + text[start..].find(&end_marker)? + end_marker.len();
-    Some(BlockSpan {
-        start,
-        end,
-        version: version.to_string(),
-    })
+    let mut starts: Vec<(usize, usize, String)> = Vec::new();
+    let mut ends: Vec<(usize, usize)> = Vec::new();
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let content = line.trim_end_matches(['\n', '\r']);
+        let trimmed = content.trim();
+        let start = offset + (content.len() - content.trim_start().len());
+        if let Some(rest) = trimmed.strip_prefix(&prefix) {
+            let version = rest.strip_suffix(" -->").unwrap_or("");
+            if version.is_empty() || version.contains(char::is_whitespace) {
+                return Err(DamagedMarkers);
+            }
+            starts.push((start, start + trimmed.len(), version.to_string()));
+        } else if trimmed == end_marker {
+            ends.push((start, start + trimmed.len()));
+        }
+        offset += line.len();
+    }
+    match (starts.as_slice(), ends.as_slice()) {
+        ([], []) => Ok(None),
+        ([(start, start_end, version)], [(end_start, end)]) if start_end <= end_start => {
+            Ok(Some(BlockSpan {
+                start: *start,
+                end: *end,
+                version: version.clone(),
+            }))
+        }
+        _ => Err(DamagedMarkers),
+    }
 }
 
-/// The version of BRAIN's block `block_id` in `text`, if there is one.
+fn damaged_error(file: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "BRAIN's markers in {} are damaged (a start or end marker without its partner, or \
+             more than one block) — fix them by hand; BRAIN writes nothing until then",
+            file.display()
+        ),
+    )
+}
+
+/// The version of BRAIN's block `block_id` in `text`, if there is exactly
+/// one well-formed block.
 pub fn block_version(text: &str, block_id: &str) -> Option<String> {
-    find_block(text, block_id).map(|span| span.version)
+    find_block(text, block_id)
+        .ok()
+        .flatten()
+        .map(|span| span.version)
 }
 
 /// The line ending of `text`: CRLF when it has any, else LF (also for an
@@ -261,7 +307,8 @@ pub fn upsert_marked_block(
     let text = existing.unwrap_or_default();
     let nl = newline_of(&text);
     let block = render_block(block_id, version, body, nl);
-    let new_text = if let Some(span) = find_block(&text, block_id) {
+    let span = find_block(&text, block_id).map_err(|_| damaged_error(file))?;
+    let new_text = if let Some(span) = span {
         format!("{}{block}{}", &text[..span.start], &text[span.end..])
     } else if text.is_empty() {
         format!("{block}{nl}")
@@ -309,7 +356,7 @@ pub fn remove_marked_block(
     let Some(text) = read_text(file)? else {
         return Ok(RemoveOutcome::NothingToRemove);
     };
-    let Some(span) = find_block(&text, block_id) else {
+    let Some(span) = find_block(&text, block_id).map_err(|_| damaged_error(file))? else {
         return Ok(RemoveOutcome::NothingToRemove);
     };
     let nl = newline_of(&text);
@@ -442,13 +489,11 @@ pub fn status(paths: &ClientPaths, target: Target, current_version: &str) -> Ins
         return InstallStatus::TargetMissing;
     }
     if let Some(file) = paths.prompt_file(target) {
-        return match read_text(&file)
-            .ok()
-            .flatten()
-            .and_then(|t| block_version(&t, MEMORY_BLOCK_ID))
-        {
-            Some(found) => versioned(found, current_version),
-            None => InstallStatus::NotInstalled,
+        let text = read_text(&file).ok().flatten().unwrap_or_default();
+        return match find_block(&text, MEMORY_BLOCK_ID) {
+            Ok(Some(span)) => versioned(span.version, current_version),
+            Ok(None) => InstallStatus::NotInstalled,
+            Err(DamagedMarkers) => InstallStatus::Damaged,
         };
     }
     let skills_dir = paths.skills_dir(target).unwrap_or_default();
@@ -475,6 +520,11 @@ pub enum InstallError {
          remove or rename that folder to let BRAIN install its skill"
     )]
     Foreign(String),
+    #[error(
+        "BRAIN's markers in {0} are damaged (a start or end marker without its partner, or more \
+         than one block) — fix them by hand; BRAIN changes nothing in that file until then"
+    )]
+    Damaged(String),
     #[error("io: {0}")]
     Io(#[from] io::Error),
 }
@@ -549,6 +599,11 @@ pub fn set_enabled(
     settings: &mut ClientInstallSettings,
     version: &str,
 ) -> Result<InstallStatus, InstallError> {
+    if status(paths, target, version) == InstallStatus::Damaged {
+        return Err(InstallError::Damaged(
+            paths.file(target).display().to_string(),
+        ));
+    }
     if enabled {
         let client_dir = paths.client_dir(target);
         if !client_dir.is_dir() {
@@ -806,6 +861,87 @@ mod tests {
         let file = tmp.path().join("CLAUDE.md");
         std::fs::write(&file, [0xff, 0xfe, 0x00]).unwrap();
         assert!(upsert_marked_block(&file, BLOCK, "1", "x").is_err());
+    }
+
+    #[test]
+    fn an_orphan_start_marker_followed_by_user_notes_blocks_the_rewrite() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("CLAUDE.md");
+        let original = "<!-- BRAIN:memory-prompt v1 -->\nold prompt\nMy own notes.\n";
+        std::fs::write(&file, original).unwrap();
+        let _ = upsert_marked_block(&file, BLOCK, "2", "new");
+        assert_eq!(read(&file), original);
+    }
+
+    #[test]
+    fn an_orphan_start_marker_before_a_fresh_block_blocks_the_rewrite() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("CLAUDE.md");
+        let original = "<!-- BRAIN:memory-prompt v1 -->\nMy notes.\n\n<!-- BRAIN:memory-prompt v1 -->\nx\n<!-- /BRAIN:memory-prompt -->\n";
+        std::fs::write(&file, original).unwrap();
+        let _ = upsert_marked_block(&file, BLOCK, "2", "new");
+        assert_eq!(read(&file), original);
+    }
+
+    #[test]
+    fn an_orphan_end_marker_is_reported_as_damaged() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("CLAUDE.md");
+        std::fs::write(&file, "notes\n<!-- /BRAIN:memory-prompt -->\n").unwrap();
+        assert!(upsert_marked_block(&file, BLOCK, "2", "new").is_err());
+    }
+
+    #[test]
+    fn two_blocks_are_reported_as_damaged() {
+        let block = "<!-- BRAIN:memory-prompt v1 -->\nx\n<!-- /BRAIN:memory-prompt -->\n";
+        let text = format!("{block}\n{block}");
+        assert_eq!(find_block(&text, BLOCK).err(), Some(DamagedMarkers));
+    }
+
+    #[test]
+    fn a_marker_quoted_inside_user_text_is_not_a_marker() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("CLAUDE.md");
+        std::fs::write(
+            &file,
+            "BRAIN wraps its prompt in `<!-- BRAIN:memory-prompt v1 -->` and `<!-- /BRAIN:memory-prompt -->`.\n",
+        )
+        .unwrap();
+        upsert_marked_block(&file, BLOCK, "2", "new").unwrap();
+        assert_eq!(block_version(&read(&file), BLOCK), Some("2".to_string()));
+    }
+
+    #[test]
+    fn removing_from_a_damaged_file_changes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("CLAUDE.md");
+        let original = "<!-- BRAIN:memory-prompt v1 -->\nnotes\n";
+        std::fs::write(&file, original).unwrap();
+        let _ = remove_marked_block(&file, BLOCK, true);
+        assert_eq!(read(&file), original);
+    }
+
+    #[test]
+    fn a_damaged_instruction_file_shows_as_damaged() {
+        let (_tmp, paths) = home();
+        with_clients(&paths);
+        let file = paths.prompt_file(Target::ClaudeCodePrompt).unwrap();
+        std::fs::write(&file, "<!-- BRAIN:memory-prompt v1 -->\nnotes\n").unwrap();
+        assert_eq!(
+            status(&paths, Target::ClaudeCodePrompt, "1"),
+            InstallStatus::Damaged
+        );
+    }
+
+    #[test]
+    fn switching_a_damaged_target_is_refused() {
+        let (_tmp, paths) = home();
+        with_clients(&paths);
+        let file = paths.prompt_file(Target::CodexPrompt).unwrap();
+        std::fs::write(&file, "notes\n<!-- /BRAIN:memory-prompt -->\n").unwrap();
+        let mut settings = ClientInstallSettings::default();
+        let result = set_enabled(&paths, Target::CodexPrompt, false, &mut settings, "1");
+        assert!(matches!(result, Err(InstallError::Damaged(_))));
     }
 
     #[test]

@@ -78,7 +78,8 @@ export type ClientInstallStatus =
   | { state: "installed"; version: string }
   | { state: "outdated"; version: string }
   | { state: "foreign" }
-  | { state: "target-missing" };
+  | { state: "target-missing" }
+  | { state: "damaged" };
 
 /** Rust `mcp::commands::ClientInstallRow`. */
 export type ClientInstallRow = {
