@@ -390,7 +390,7 @@ Review-Runden vor dem Release.
 | 4 | ✅ **erledigt (0.3.6)** — **Traum-Log auswerten.** Kleine Auswertung je Item-Art: wie oft done/skipped/deferred; Anzeige in Integrity oder als Resource. | Das strukturierte Log aus 0.3.5 liefert die Daten, genutzt werden sie noch nicht. | S |
 | 5 | ✅ **erledigt (0.3.6, nur Prompt/AGENTS.md)** — **`missing-sources` für Ingestion-Seiten** halbautomatisch: Lint-Session-Prompt schlägt den Master-Index der jeweiligen Mail-Ingestion als `sources`-Eintrag vor. | Fast jede aus Mails erzeugte Seite trägt die Warnung; von Hand ist das Fleißarbeit. | S |
 | 6 | **Repo-Hygiene:** repo-weites `cargo fmt` als eigener Commit, ungenutztes `axum`-Crate entfernen, flaky Windows-Test `viewer::eval::tests::concurrent_adds_keep_every_entry` (Datei-Lock-Rennen) stabilisieren. | Technische Schulden aus dem 0.3.5-Zyklus. | S |
-| 7 | **Spec-Addenda** S03 (Lint/Hygiene), S06 (MCP-Oberfläche/Protokoll), S09 (Index/Suche) als Entwürfe unter `docs/`, Übernahme nach `requirements/` durch Pascal. | CLAUDE.md verlangt Spec-Deckung für Verhaltensänderungen; `requirements/` ist für den Build-Agenten read-only. | M |
+| 7 | ✅ **Entwürfe liegen (0.3.6)** unter `docs/spec-addenda/` — **Spec-Addenda** S03 (Lint/Hygiene), S06 (MCP-Oberfläche/Protokoll), S09 (Index/Suche) als Entwürfe unter `docs/`, Übernahme nach `requirements/` durch Pascal. | CLAUDE.md verlangt Spec-Deckung für Verhaltensänderungen; `requirements/` ist für den Build-Agenten read-only. | M |
 | — | Slice E Reranker, Slice F Viewer, H4 lokaler LLM-Provider | wie in der Release-Tabelle: gated durch `brain eval`-Zahlen bzw. Alltagserfahrung | L |
 
 ## Nicht in diesem Plan (bewusst)
