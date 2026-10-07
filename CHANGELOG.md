@@ -108,7 +108,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   be listed or found by prefix. The query is no longer cut: `total` is
   the true number of matches, `limit` / `offset` page through all of
   them with `next_offset` while more remain, and the prefix filter sees
-  every match. The app's Query view and table still show the first 200.
+  every match. One call returns at most 500 hits (`limit` above that is
+  clamped; default 100). The app's Query view and table still show the
+  first 200.
 - **Adding eval questions from two sessions at once works on Windows.**
   Two concurrent `brain_eval` `add` calls could fail with "access
   denied" while the other one released its lock; the second one now

@@ -1271,7 +1271,7 @@ fn tool_specs() -> Vec<ToolSpec> {
                 "properties": {
                     "query": { "type": "string", "default": "*", "description": "filter expression; empty or '*' = all current pages" },
                     "prefix": { "type": "string", "description": "only ids starting with this, e.g. 'entities/acme'" },
-                    "limit": { "type": "integer", "minimum": 1, "default": 100, "description": "maximum hits returned; `total` says how many matched" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 100, "description": "maximum hits returned (at most 500 per call); `total` says how many matched" },
                     "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "skip this many hits (use `next_offset` of the previous call)" },
                     "facet": { "type": "string", "enum": ["tags"], "description": "'tags': return {tags: [{tag, count}]} over the matching pages instead of hits — use it to learn which tags exist before filtering with tag:" },
                     "response_format": response_format_schema("id, type and title per hit", "also path, updated_at, read/search-hit counters, validity fields, tags and summary")
@@ -2733,6 +2733,18 @@ const SEARCH_MAX_LIMIT: usize = 20;
 /// `brain_query` default page size.
 const QUERY_DEFAULT_LIMIT: usize = 100;
 
+/// Most hits one `brain_query` page returns; larger `limit`s are clamped
+/// (page with `offset` / `next_offset` instead).
+const QUERY_MAX_LIMIT: usize = 500;
+
+/// `brain_query`'s `limit`: default [`QUERY_DEFAULT_LIMIT`], at least 1,
+/// at most [`QUERY_MAX_LIMIT`].
+fn query_limit(args: &Value) -> Result<usize, String> {
+    Ok(optional_usize(args, "limit")?
+        .unwrap_or(QUERY_DEFAULT_LIMIT)
+        .clamp(1, QUERY_MAX_LIMIT))
+}
+
 /// `brain_lookup`: existence + probable duplicates, never page bodies.
 /// An argument with `/` is a page id (checks that id and its type); a bare
 /// name is checked against all four types, with `exact` entries for ids
@@ -2825,9 +2837,7 @@ fn query(
         );
     }
     let prefix = optional_str(args, "prefix")?.unwrap_or("");
-    let limit = optional_usize(args, "limit")?
-        .unwrap_or(QUERY_DEFAULT_LIMIT)
-        .max(1);
+    let limit = query_limit(args)?;
     let offset = optional_usize(args, "offset")?.unwrap_or(0);
     let facet = optional_str(args, "facet")?;
     if let Some(other) = facet.filter(|f| *f != "tags") {
@@ -4364,6 +4374,16 @@ mod tests {
         let db = crate::db::DbHandle::open(tmp.path()).unwrap();
         crate::db::pages_index::rebuild(&db, tmp.path()).unwrap();
         (tmp, db)
+    }
+
+    #[test]
+    fn a_query_limit_above_five_hundred_is_clamped_to_five_hundred() {
+        assert_eq!(query_limit(&json!({ "limit": 100000 })), Ok(500));
+    }
+
+    #[test]
+    fn a_query_without_a_limit_returns_at_most_one_hundred_hits() {
+        assert_eq!(query_limit(&json!({})), Ok(100));
     }
 
     #[test]
