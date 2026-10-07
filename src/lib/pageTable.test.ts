@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { compareRows, sortRows, toCsv, validityOf, type PageRow } from "./pageTable";
+import {
+  compareRows,
+  neutraliseFormula,
+  sortRows,
+  toCsv,
+  validityOf,
+  type PageRow,
+} from "./pageTable";
 
 const TODAY = "2026-10-07";
 
@@ -99,6 +106,35 @@ describe("toCsv", () => {
   it("quotes a field with a line break", () => {
     const csv = toCsv([row("a", { summary: "eins\nzwei" })], ["summary"], TODAY);
     expect(csv.endsWith('"eins\nzwei"')).toBe(true);
+  });
+
+  it("prefixes a cell starting with = so spreadsheets do not run it", () => {
+    const csv = toCsv([row("a", { title: "=HYPERLINK(1)" })], ["title"], TODAY);
+    expect(csv.split("\r\n")[1]).toBe("a,'=HYPERLINK(1)");
+  });
+
+  it("prefixes a cell starting with @", () => {
+    expect(neutraliseFormula("@SUM(A1)")).toBe("'@SUM(A1)");
+  });
+
+  it("prefixes a cell starting with +", () => {
+    expect(neutraliseFormula("+1")).toBe("'+1");
+  });
+
+  it("prefixes a cell starting with -", () => {
+    expect(neutraliseFormula("-2")).toBe("'-2");
+  });
+
+  it("prefixes a cell starting with a tab", () => {
+    expect(neutraliseFormula("\tx")).toBe("'\tx");
+  });
+
+  it("prefixes a cell starting with a carriage return", () => {
+    expect(neutraliseFormula("\rx")).toBe("'\rx");
+  });
+
+  it("leaves an ordinary cell alone", () => {
+    expect(neutraliseFormula("Kunde A")).toBe("Kunde A");
   });
 
   it("exports a superseded page with its successor", () => {

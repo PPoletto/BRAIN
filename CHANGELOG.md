@@ -76,8 +76,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reverse); hide columns with the checkboxes (remembered on this
   computer). The filter box takes the same query syntax (`*`, `type:`,
   `tag:`, `valid:all`, `sort:salience` …); "CSV kopieren" copies the
-  rows as shown to the clipboard. Structured queries (`query_pages`, and
-  `brain_query` with `response_format: "detailed"`) now also return each
+  rows as shown to the clipboard (cells that a spreadsheet would read
+  as a formula — starting with `=`, `+`, `-` or `@` — get a leading
+  `'`). Structured queries (`query_pages`, and `brain_query` with
+  `response_format: "detailed"`) now also return each
   page's tags and summary, and the Query view accepts `*` for "all
   current pages".
 

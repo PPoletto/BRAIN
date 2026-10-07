@@ -154,9 +154,22 @@ export function cellText(row: PageRow, key: ColumnKey, today: string): string {
   }
 }
 
-/** One CSV field (RFC 4180): quoted when it holds a comma, quote or line break. */
+/**
+ * A cell a spreadsheet would read as a formula (`=`, `+`, `-`, `@`, tab
+ * or carriage return at the start) gets a leading `'`, so pasting the
+ * CSV into Excel / LibreOffice shows text instead of running it.
+ */
+export function neutraliseFormula(value: string): string {
+  return /^[=+\-@\t\r]/.test(value) ? `'${value}` : value;
+}
+
+/**
+ * One CSV field: formula-neutralised, then quoted (RFC 4180) when it
+ * holds a comma, quote or line break.
+ */
 function csvField(value: string): string {
-  return /[",\r\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
+  const safe = neutraliseFormula(value);
+  return /[",\r\n]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
 }
 
 /**
