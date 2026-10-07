@@ -75,6 +75,8 @@ LINK SYNTAX — STRICT: when the body of a page references another page, ALWAYS 
 
 When the user asks about something they previously told you, call `brain_search` first, then `brain_get_pages` on the best hits, before answering from conversation context alone.
 
+Before creating a page, call `brain_lookup` with the planned id or name: if it reports an existing page or `matches`, extend that page (and add your name for it to its `aliases`) instead of creating a duplicate. Before rewriting an existing page, read it with `brain_get_pages` and `response_format: \"detailed\"` and keep every frontmatter field.
+
 Before writing a new page, briefly confirm: \"I'll save this to your BRAIN as `entities/<slug>` — okay?\"";
 
 /// Returns the shell command + env var that the user must put into a
