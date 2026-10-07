@@ -105,8 +105,16 @@ mod tests {
     fn save_then_load_roundtrips_a_set_of_positions() {
         let (_tmp, db) = fresh_db();
         let mut input = vec![
-            NodePosition { page_id: "entities/a".into(), x: 12.5, y: -3.0 },
-            NodePosition { page_id: "concepts/b".into(), x: 100.0, y: 200.0 },
+            NodePosition {
+                page_id: "entities/a".into(),
+                x: 12.5,
+                y: -3.0,
+            },
+            NodePosition {
+                page_id: "concepts/b".into(),
+                x: 100.0,
+                y: 200.0,
+            },
         ];
         save(&db, &input).unwrap();
         let mut got = load(&db).unwrap();
@@ -126,12 +134,20 @@ mod tests {
         let (_tmp, db) = fresh_db();
         save(
             &db,
-            &[NodePosition { page_id: "x".into(), x: 1.0, y: 1.0 }],
+            &[NodePosition {
+                page_id: "x".into(),
+                x: 1.0,
+                y: 1.0,
+            }],
         )
         .unwrap();
         save(
             &db,
-            &[NodePosition { page_id: "x".into(), x: 9.0, y: 9.0 }],
+            &[NodePosition {
+                page_id: "x".into(),
+                x: 9.0,
+                y: 9.0,
+            }],
         )
         .unwrap();
         let got = load(&db).unwrap();
@@ -157,8 +173,16 @@ mod tests {
         save(
             &db,
             &[
-                NodePosition { page_id: "x".into(), x: 1.0, y: 1.0 },
-                NodePosition { page_id: "y".into(), x: 2.0, y: 2.0 },
+                NodePosition {
+                    page_id: "x".into(),
+                    x: 1.0,
+                    y: 1.0,
+                },
+                NodePosition {
+                    page_id: "y".into(),
+                    x: 2.0,
+                    y: 2.0,
+                },
             ],
         )
         .unwrap();

@@ -4,8 +4,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::layout::{meta_dir, VAULT_SETTINGS_FILENAME};
 use super::VaultResult;
+use super::layout::{VAULT_SETTINGS_FILENAME, meta_dir};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultSettings {

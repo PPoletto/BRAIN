@@ -19,25 +19,49 @@ pub struct PageFrontmatter {
     /// Alternative names of the page (A2). Matched by
     /// `brain_lookup` / the create-duplicate check via [`slug_key`].
     /// Lenient: a single string or a list of scalars is accepted.
-    #[serde(default, deserialize_with = "de_string_list", skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "de_string_list",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub aliases: Vec<String>,
     /// First day the page's facts hold (`YYYY-MM-DD`, Slice C).
-    #[serde(default, deserialize_with = "de_opt_scalar", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "de_opt_scalar",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub valid_from: Option<String>,
     /// Last day the page's facts hold (`YYYY-MM-DD`, Slice C).
-    #[serde(default, deserialize_with = "de_opt_scalar", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "de_opt_scalar",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub valid_to: Option<String>,
     /// Id of the page that replaces this one (Slice C). `[[id]]` is
     /// accepted and stored as `id`.
-    #[serde(default, deserialize_with = "de_opt_page_ref", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "de_opt_page_ref",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub superseded_by: Option<String>,
     /// Ids of the source pages the facts come from (Slice C). `[[id]]`
     /// entries are accepted and stored as `id`.
-    #[serde(default, deserialize_with = "de_page_ref_list", skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "de_page_ref_list",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub sources: Vec<String>,
     /// Ids of pages that share a name with this one but are a different
     /// thing (A2): silences the `alias-collision` lint for those pairs.
-    #[serde(default, deserialize_with = "de_page_ref_list", skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "de_page_ref_list",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub distinct_from: Vec<String>,
     /// "Leave this page alone" (H2): the user decided an unlinked or
     /// unread page stays. Silences the `orphan` hygiene warning and the
@@ -53,7 +77,11 @@ pub struct PageFrontmatter {
     /// by the agent. Indexed as its own, higher-weighted FTS column and
     /// appended to every chunk's embedding context header. A list keeps
     /// its first entry; an empty value counts as absent.
-    #[serde(default, deserialize_with = "de_opt_scalar", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "de_opt_scalar",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub summary: Option<String>,
     /// Every other frontmatter key (e.g. `status`), kept so JSON views
     /// of the frontmatter (`brain_get_pages`, `pages.frontmatter`) do not
@@ -140,7 +168,13 @@ fn yaml_scalars(value: YamlValue, out: &mut Vec<String>) {
 
 fn clean_entries(raw: Vec<String>, page_ref: bool) -> Vec<String> {
     raw.into_iter()
-        .map(|s| if page_ref { strip_page_ref(&s) } else { s.trim().to_string() })
+        .map(|s| {
+            if page_ref {
+                strip_page_ref(&s)
+            } else {
+                s.trim().to_string()
+            }
+        })
         .filter(|s| !s.is_empty())
         .collect()
 }
@@ -154,7 +188,10 @@ fn strip_page_ref(raw: &str) -> String {
     s.strip_suffix(".md").unwrap_or(s).to_string()
 }
 
-fn de_list<'de, D: serde::Deserializer<'de>>(d: D, page_ref: bool) -> Result<Vec<String>, D::Error> {
+fn de_list<'de, D: serde::Deserializer<'de>>(
+    d: D,
+    page_ref: bool,
+) -> Result<Vec<String>, D::Error> {
     let value = Option::<YamlValue>::deserialize(d)?;
     let mut raw = Vec::new();
     if let Some(v) = value {
@@ -341,10 +378,7 @@ pub fn extract_wiki_links(body: &str) -> Vec<String> {
     }
 
     // Markdown-link syntax with a wiki-shaped destination.
-    let md = Regex::new(
-        r#"\[(?:[^\]]*)\]\(\s*([^)\s]+)(?:\s+"[^"]*")?\s*\)"#,
-    )
-    .expect("regex");
+    let md = Regex::new(r#"\[(?:[^\]]*)\]\(\s*([^)\s]+)(?:\s+"[^"]*")?\s*\)"#).expect("regex");
     for cap in md.captures_iter(body) {
         let raw = cap[1].trim();
         if let Some(id) = page_id_from_markdown_target(raw) {
@@ -388,10 +422,7 @@ pub(crate) fn page_id_from_markdown_target(raw: &str) -> Option<String> {
     }
 
     // Drop query/fragment.
-    let stripped = stripped
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(stripped);
+    let stripped = stripped.split(['?', '#']).next().unwrap_or(stripped);
     // Drop optional `.md` suffix so `entities/alice.md` and
     // `entities/alice` collapse to the same id.
     let stripped = stripped.strip_suffix(".md").unwrap_or(stripped);
@@ -419,10 +450,9 @@ pub(crate) fn page_id_from_markdown_target(raw: &str) -> Option<String> {
 /// Idempotent: running it twice produces the same output as running it
 /// once. New input that already uses `[[wiki-links]]` is unchanged.
 pub fn normalize_internal_links(body: &str) -> String {
-    let md_link = Regex::new(
-        r#"(?P<text>\[(?:[^\]]*)\])\(\s*(?P<target>[^)\s]+)(?:\s+"[^"]*")?\s*\)"#,
-    )
-    .expect("regex");
+    let md_link =
+        Regex::new(r#"(?P<text>\[(?:[^\]]*)\])\(\s*(?P<target>[^)\s]+)(?:\s+"[^"]*")?\s*\)"#)
+            .expect("regex");
 
     // Walk the body once and replace links only when we're outside any
     // code fence or backtick span. A small state machine is enough — we
@@ -435,10 +465,7 @@ pub fn normalize_internal_links(body: &str) -> String {
     while let Some(&(i, c)) = chars.peek() {
         // Detect fence boundaries (``` at start of line, optionally
         // preceded by whitespace).
-        if c == '`'
-            && body[i..].starts_with("```")
-            && (i == 0 || body[..i].ends_with('\n'))
-        {
+        if c == '`' && body[i..].starts_with("```") && (i == 0 || body[..i].ends_with('\n')) {
             // Flush buffered non-code chunk through the link regex.
             out.push_str(&rewrite_md_links_in(&body[buf_start..i], &md_link));
             // Find the matching end-of-fence.
@@ -473,9 +500,7 @@ pub fn normalize_internal_links(body: &str) -> String {
             // Flush.
             out.push_str(&rewrite_md_links_in(&body[buf_start..i], &md_link));
             let after = i + 1;
-            let close_rel = body[after..]
-                .find('`')
-                .map(|n| after + n + 1);
+            let close_rel = body[after..].find('`').map(|n| after + n + 1);
             match close_rel {
                 Some(end) => {
                     out.push_str(&body[i..end]);
@@ -702,8 +727,7 @@ mod tests {
 
     #[test]
     fn normalize_skips_links_inside_fenced_code_block() {
-        let body =
-            "Example:\n```markdown\n[Dan](entities/dan-shapiro)\n```\nLive: [Dan](entities/dan-shapiro)";
+        let body = "Example:\n```markdown\n[Dan](entities/dan-shapiro)\n```\nLive: [Dan](entities/dan-shapiro)";
         let out = normalize_internal_links(body);
         assert!(out.contains("```markdown\n[Dan](entities/dan-shapiro)\n```"));
         assert!(out.contains("Live: [[entities/dan-shapiro|Dan]]"));
@@ -802,9 +826,11 @@ Intro mentions [Dan](entities/dan-shapiro).
     // ---- A2 / C: name keys and optional frontmatter fields --------------
 
     fn frontmatter_with(extra: &str) -> PageFrontmatter {
-        parse(&format!("---\nid: entities/x\ntype: entity\n{extra}---\n\nbody\n"))
-            .unwrap()
-            .frontmatter
+        parse(&format!(
+            "---\nid: entities/x\ntype: entity\n{extra}---\n\nbody\n"
+        ))
+        .unwrap()
+        .frontmatter
     }
 
     #[test]
@@ -824,7 +850,10 @@ Intro mentions [Dan](entities/dan-shapiro).
 
     #[test]
     fn the_umlaut_folded_key_equates_ue_and_u() {
-        assert_eq!(umlaut_folded_key("mueller-gmbh"), umlaut_folded_key("muller-gmbh"));
+        assert_eq!(
+            umlaut_folded_key("mueller-gmbh"),
+            umlaut_folded_key("muller-gmbh")
+        );
     }
 
     #[test]
@@ -834,18 +863,26 @@ Intro mentions [Dan](entities/dan-shapiro).
 
     #[test]
     fn aliases_accept_a_single_string() {
-        assert_eq!(frontmatter_with("aliases: Acme Corp\n").aliases, vec!["Acme Corp"]);
+        assert_eq!(
+            frontmatter_with("aliases: Acme Corp\n").aliases,
+            vec!["Acme Corp"]
+        );
     }
 
     #[test]
     fn aliases_accept_a_list_with_numbers() {
-        assert_eq!(frontmatter_with("aliases: [Acme, 2024]\n").aliases, vec!["Acme", "2024"]);
+        assert_eq!(
+            frontmatter_with("aliases: [Acme, 2024]\n").aliases,
+            vec!["Acme", "2024"]
+        );
     }
 
     #[test]
     fn an_unquoted_wiki_link_in_superseded_by_is_read_as_the_page_id() {
         assert_eq!(
-            frontmatter_with("superseded_by: [[entities/b]]\n").superseded_by.as_deref(),
+            frontmatter_with("superseded_by: [[entities/b]]\n")
+                .superseded_by
+                .as_deref(),
             Some("entities/b")
         );
     }
@@ -876,14 +913,20 @@ Intro mentions [Dan](entities/dan-shapiro).
     #[test]
     fn the_summary_is_read_into_its_own_field() {
         assert_eq!(
-            frontmatter_with("summary: Kunde A buys GRASP.\n").summary.as_deref(),
+            frontmatter_with("summary: Kunde A buys GRASP.\n")
+                .summary
+                .as_deref(),
             Some("Kunde A buys GRASP.")
         );
     }
 
     #[test]
     fn the_summary_is_not_kept_a_second_time_among_the_extra_keys() {
-        assert!(!frontmatter_with("summary: Short.\n").extra.contains_key("summary"));
+        assert!(
+            !frontmatter_with("summary: Short.\n")
+                .extra
+                .contains_key("summary")
+        );
     }
 
     #[test]
@@ -899,7 +942,10 @@ Intro mentions [Dan](entities/dan-shapiro).
 
     #[test]
     fn a_numeric_frontmatter_key_does_not_fail_the_parse() {
-        assert_eq!(frontmatter_with("2025: revenue\n").extra["2025"], serde_json::json!("revenue"));
+        assert_eq!(
+            frontmatter_with("2025: revenue\n").extra["2025"],
+            serde_json::json!("revenue")
+        );
     }
 
     #[test]
@@ -954,7 +1000,10 @@ Intro mentions [Dan](entities/dan-shapiro).
     fn the_json_view_carries_keep_only_when_it_is_set() {
         let unset = serde_json::to_value(frontmatter_with("keep: false\n")).unwrap();
         let set = serde_json::to_value(frontmatter_with("keep: true\n")).unwrap();
-        assert_eq!((unset.get("keep").is_none(), set["keep"].clone()), (true, serde_json::json!(true)));
+        assert_eq!(
+            (unset.get("keep").is_none(), set["keep"].clone()),
+            (true, serde_json::json!(true))
+        );
     }
 
     #[test]
@@ -962,6 +1011,9 @@ Intro mentions [Dan](entities/dan-shapiro).
         let json = serde_json::to_value(frontmatter_with("")).unwrap();
         let mut keys: Vec<&String> = json.as_object().unwrap().keys().collect();
         keys.sort();
-        assert_eq!(keys, vec!["created", "id", "tags", "title", "type", "updated"]);
+        assert_eq!(
+            keys,
+            vec!["created", "id", "tags", "title", "type", "updated"]
+        );
     }
 }

@@ -111,7 +111,7 @@ fn check_git(wiki_path: &Path) -> CheckResult {
     let head = match repo.head() {
         Ok(h) => h,
         Err(err) => {
-            return CheckResult::Warn(format!("HEAD unreadable (probably empty repo): {err}"))
+            return CheckResult::Warn(format!("HEAD unreadable (probably empty repo): {err}"));
         }
     };
     let oid = match head.target() {
@@ -163,9 +163,9 @@ fn check_pages_vs_filesystem(vault: &Path, db: &DbHandle) -> CheckResult {
     });
     match result {
         Ok((total, 0)) => CheckResult::Ok(format!("all {total} indexed pages present on disk")),
-        Ok((total, missing)) => {
-            CheckResult::Warn(format!("{missing} of {total} indexed pages missing on disk"))
-        }
+        Ok((total, missing)) => CheckResult::Warn(format!(
+            "{missing} of {total} indexed pages missing on disk"
+        )),
         Err(err) => CheckResult::Error(format!("cross-check failed: {err}")),
     }
 }
@@ -212,10 +212,12 @@ mod tests {
         let report = check(tmp.path(), Some(&db));
         assert!(matches!(report.pages, CheckResult::Warn(_)));
         assert!(!report.clean);
-        assert!(report
-            .suggestions
-            .iter()
-            .any(|s| s.id == "rebuild-pages-index"));
+        assert!(
+            report
+                .suggestions
+                .iter()
+                .any(|s| s.id == "rebuild-pages-index")
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::vault::layout::{wiki_dir, WIKI_SUBDIRS};
+use crate::vault::layout::{WIKI_SUBDIRS, wiki_dir};
 use crate::wiki::page::parse;
 
 use super::ViewerResult;
@@ -63,8 +63,9 @@ pub fn build_graph(vault: &Path, filters: &GraphFilters) -> ViewerResult<GraphDa
         .map(|(source, target)| GraphEdge { source, target })
         .collect();
     // Stable order so the output is deterministic across runs.
-    edges.sort_by(|a, b| (a.source.as_str(), a.target.as_str())
-        .cmp(&(b.source.as_str(), b.target.as_str())));
+    edges.sort_by(|a, b| {
+        (a.source.as_str(), a.target.as_str()).cmp(&(b.source.as_str(), b.target.as_str()))
+    });
 
     let id_set: std::collections::HashSet<&String> = nodes.iter().map(|n| &n.id).collect();
     edges.retain(|e| id_set.contains(&e.target) && id_set.contains(&e.source));
@@ -128,10 +129,24 @@ mod tests {
     use crate::vault::layout::ensure_skeleton;
     use tempfile::TempDir;
 
-    fn write_page(vault: &Path, sub: &str, slug: &str, page_type: &str, body: &str, tags: &[&str], updated: &str) {
+    fn write_page(
+        vault: &Path,
+        sub: &str,
+        slug: &str,
+        page_type: &str,
+        body: &str,
+        tags: &[&str],
+        updated: &str,
+    ) {
         let dir = wiki_dir(vault).join(sub);
         std::fs::create_dir_all(&dir).unwrap();
-        let tags_yaml = format!("[{}]", tags.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(","));
+        let tags_yaml = format!(
+            "[{}]",
+            tags.iter()
+                .map(|t| format!("\"{t}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
         std::fs::write(
             dir.join(format!("{slug}.md")),
             format!(
@@ -145,8 +160,24 @@ mod tests {
     fn build_graph_returns_all_nodes_and_resolved_edges_when_no_filter() {
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
-        write_page(tmp.path(), "entities", "alice", "entity", "see [[entities/bob]]", &[], "2026-04-29");
-        write_page(tmp.path(), "entities", "bob", "entity", "hi", &[], "2026-04-29");
+        write_page(
+            tmp.path(),
+            "entities",
+            "alice",
+            "entity",
+            "see [[entities/bob]]",
+            &[],
+            "2026-04-29",
+        );
+        write_page(
+            tmp.path(),
+            "entities",
+            "bob",
+            "entity",
+            "hi",
+            &[],
+            "2026-04-29",
+        );
         let g = build_graph(tmp.path(), &GraphFilters::default()).unwrap();
         assert_eq!(g.nodes.len(), 2);
         assert_eq!(g.edges.len(), 1);
@@ -171,8 +202,24 @@ mod tests {
             &[],
             "2026-04-29",
         );
-        write_page(tmp.path(), "entities", "bob", "entity", "hi", &[], "2026-04-29");
-        write_page(tmp.path(), "concepts", "x", "concept", "hi", &[], "2026-04-29");
+        write_page(
+            tmp.path(),
+            "entities",
+            "bob",
+            "entity",
+            "hi",
+            &[],
+            "2026-04-29",
+        );
+        write_page(
+            tmp.path(),
+            "concepts",
+            "x",
+            "concept",
+            "hi",
+            &[],
+            "2026-04-29",
+        );
         let g = build_graph(tmp.path(), &GraphFilters::default()).unwrap();
         let alice_to_bob: usize = g
             .edges
@@ -190,7 +237,15 @@ mod tests {
     fn build_graph_drops_edges_pointing_to_unknown_targets() {
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
-        write_page(tmp.path(), "entities", "alice", "entity", "see [[entities/missing]]", &[], "2026-04-29");
+        write_page(
+            tmp.path(),
+            "entities",
+            "alice",
+            "entity",
+            "see [[entities/missing]]",
+            &[],
+            "2026-04-29",
+        );
         let g = build_graph(tmp.path(), &GraphFilters::default()).unwrap();
         assert_eq!(g.nodes.len(), 1);
         assert!(g.edges.is_empty());
@@ -200,8 +255,24 @@ mod tests {
     fn build_graph_filters_by_type() {
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
-        write_page(tmp.path(), "entities", "alice", "entity", "x", &[], "2026-04-29");
-        write_page(tmp.path(), "concepts", "nlspec", "concept", "x", &[], "2026-04-29");
+        write_page(
+            tmp.path(),
+            "entities",
+            "alice",
+            "entity",
+            "x",
+            &[],
+            "2026-04-29",
+        );
+        write_page(
+            tmp.path(),
+            "concepts",
+            "nlspec",
+            "concept",
+            "x",
+            &[],
+            "2026-04-29",
+        );
         let g = build_graph(
             tmp.path(),
             &GraphFilters {
@@ -218,8 +289,24 @@ mod tests {
     fn build_graph_filters_by_tag_intersection() {
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
-        write_page(tmp.path(), "entities", "alice", "entity", "x", &["nis2"], "2026-04-29");
-        write_page(tmp.path(), "entities", "bob", "entity", "x", &["other"], "2026-04-29");
+        write_page(
+            tmp.path(),
+            "entities",
+            "alice",
+            "entity",
+            "x",
+            &["nis2"],
+            "2026-04-29",
+        );
+        write_page(
+            tmp.path(),
+            "entities",
+            "bob",
+            "entity",
+            "x",
+            &["other"],
+            "2026-04-29",
+        );
         let g = build_graph(
             tmp.path(),
             &GraphFilters {
@@ -250,9 +337,22 @@ mod tests {
              see [[concepts/glowforge]]\n",
         )
         .unwrap();
-        write_page(tmp.path(), "concepts", "glowforge", "concept", "x", &[], "2026-04-29");
+        write_page(
+            tmp.path(),
+            "concepts",
+            "glowforge",
+            "concept",
+            "x",
+            &[],
+            "2026-04-29",
+        );
         let g = build_graph(tmp.path(), &GraphFilters::default()).unwrap();
-        assert_eq!(g.nodes.len(), 2, "nested page must be picked up: {:#?}", g.nodes);
+        assert_eq!(
+            g.nodes.len(),
+            2,
+            "nested page must be picked up: {:#?}",
+            g.nodes
+        );
         assert_eq!(g.edges.len(), 1, "edge must resolve to nested source");
     }
 
@@ -260,8 +360,24 @@ mod tests {
     fn build_graph_filters_by_updated_after_date() {
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
-        write_page(tmp.path(), "entities", "old", "entity", "x", &[], "2025-01-01");
-        write_page(tmp.path(), "entities", "new", "entity", "x", &[], "2026-04-29");
+        write_page(
+            tmp.path(),
+            "entities",
+            "old",
+            "entity",
+            "x",
+            &[],
+            "2025-01-01",
+        );
+        write_page(
+            tmp.path(),
+            "entities",
+            "new",
+            "entity",
+            "x",
+            &[],
+            "2026-04-29",
+        );
         let g = build_graph(
             tmp.path(),
             &GraphFilters {

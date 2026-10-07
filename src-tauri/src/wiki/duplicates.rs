@@ -136,7 +136,11 @@ pub fn similar(a: &str, b: &str) -> bool {
     if umlaut_folded_key(a) == umlaut_folded_key(b) {
         return true;
     }
-    let max = if shorter < SIMILAR_LONG_KEY_CHARS { 1 } else { 2 };
+    let max = if shorter < SIMILAR_LONG_KEY_CHARS {
+        1
+    } else {
+        2
+    };
     la.abs_diff(lb) <= max && levenshtein(a, b) <= max
 }
 
@@ -210,8 +214,11 @@ pub fn load_entries(conn: &rusqlite::Connection) -> DbResult<Vec<NameEntry>> {
             );
         }
     }
-    let mut stmt = conn.prepare("SELECT page_id, alias FROM page_aliases ORDER BY page_id, alias")?;
-    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+    let mut stmt =
+        conn.prepare("SELECT page_id, alias FROM page_aliases ORDER BY page_id, alias")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
     for row in rows {
         let (id, alias) = row?;
         if let Some(entry) = entries.get_mut(&id) {
@@ -404,13 +411,19 @@ mod tests {
         ];
         assert_eq!(
             name_collisions(&pages),
-            vec![("entities/acme".to_string(), "entities/acme-corp".to_string())]
+            vec![(
+                "entities/acme".to_string(),
+                "entities/acme-corp".to_string()
+            )]
         );
     }
 
     #[test]
     fn two_ids_equal_only_after_umlaut_folding_do_not_collide() {
-        let pages = [entry("entities/mueller-gmbh", &[]), entry("entities/muller-gmbh", &[])];
+        let pages = [
+            entry("entities/mueller-gmbh", &[]),
+            entry("entities/muller-gmbh", &[]),
+        ];
         assert!(name_collisions(&pages).is_empty());
     }
 

@@ -189,8 +189,8 @@ mod tests {
     fn with_timeout_returns_the_result_for_a_fast_operation() {
         let tmp = TempDir::new().unwrap();
         let handle = DbHandle::open(tmp.path()).unwrap();
-        let out: Result<DbResult<i64>, DbTimeout> =
-            handle.with_timeout(Duration::from_secs(5), |conn| {
+        let out: Result<DbResult<i64>, DbTimeout> = handle
+            .with_timeout(Duration::from_secs(5), |conn| {
                 Ok(conn.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))?)
             });
         assert_eq!(out.unwrap().unwrap(), 1);
@@ -227,8 +227,8 @@ mod tests {
         // Simulate `*db = None` + reopen.
         drop(stale);
         let fresh = DbHandle::open(tmp.path()).unwrap();
-        let out: Result<DbResult<i64>, DbTimeout> =
-            fresh.with_timeout(Duration::from_secs(5), |conn| {
+        let out: Result<DbResult<i64>, DbTimeout> = fresh
+            .with_timeout(Duration::from_secs(5), |conn| {
                 Ok(conn.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))?)
             });
         assert_eq!(out.unwrap().unwrap(), 1);
@@ -271,7 +271,9 @@ mod tests {
         assert!(is_connection_fatal(&cantopen));
         assert!(!is_connection_fatal(&constraint));
         // A non-rusqlite error is never a reopen trigger.
-        assert!(!is_connection_fatal(&DbError::Io(std::io::Error::other("x"))));
+        assert!(!is_connection_fatal(&DbError::Io(std::io::Error::other(
+            "x"
+        ))));
     }
 
     #[test]

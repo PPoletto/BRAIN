@@ -218,7 +218,11 @@ mod macos {
                     format!("{id} ({content})")
                 },
                 size_bytes: size as u64,
-                filesystem: if content.is_empty() { None } else { Some(content) },
+                filesystem: if content.is_empty() {
+                    None
+                } else {
+                    Some(content)
+                },
                 volume_label: label,
                 is_system: is_internal,
                 is_removable: !is_internal,
@@ -293,7 +297,12 @@ mod linux {
     pub fn list() -> OnboardingResult<Vec<DiskInfo>> {
         let raw = run_command(
             "lsblk",
-            &["-J", "-b", "-o", "NAME,SIZE,TYPE,TRAN,RM,FSTYPE,LABEL,MOUNTPOINT"],
+            &[
+                "-J",
+                "-b",
+                "-o",
+                "NAME,SIZE,TYPE,TRAN,RM,FSTYPE,LABEL,MOUNTPOINT",
+            ],
         )?;
         let parsed: LsblkRoot = serde_json::from_str(&raw)
             .map_err(|err| OnboardingError::DiskNotFound(format!("lsblk json: {err}")))?;
@@ -305,10 +314,13 @@ mod linux {
             let size = dev
                 .size
                 .as_ref()
-                .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok())))
+                .and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                })
                 .unwrap_or(0);
-            let removable = dev.rm.unwrap_or(false)
-                || matches!(dev.tran.as_deref(), Some("usb") | Some("mmc"));
+            let removable =
+                dev.rm.unwrap_or(false) || matches!(dev.tran.as_deref(), Some("usb") | Some("mmc"));
             let primary_child = dev
                 .children
                 .as_ref()
@@ -321,7 +333,10 @@ mod linux {
                 .or(dev.mountpoint)
                 .filter(|s| !s.is_empty());
             let is_system = mount.as_deref() == Some("/")
-                || mount.as_deref().map(|m| m.starts_with("/boot")).unwrap_or(false);
+                || mount
+                    .as_deref()
+                    .map(|m| m.starts_with("/boot"))
+                    .unwrap_or(false);
             out.push(DiskInfo {
                 id: format!("/dev/{}", dev.name),
                 name: format!("/dev/{}", dev.name),

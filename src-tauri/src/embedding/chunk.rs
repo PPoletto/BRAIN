@@ -248,7 +248,10 @@ mod tests {
     use super::*;
 
     fn words(n: usize) -> String {
-        (0..n).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" ")
+        (0..n)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     #[test]
@@ -360,10 +363,14 @@ mod tests {
     }
 
     #[test]
-    fn contextual_text_renders_title_type_and_heading_path_on_one_line_then_a_blank_line_then_the_chunk() {
+    fn contextual_text_renders_title_type_and_heading_path_on_one_line_then_a_blank_line_then_the_chunk()
+     {
         let path = vec!["Vertrag".to_string(), "Laufzeit".to_string()];
         let t = contextual_text("Kunde A", "entity", &path, None, "renews for 12 months");
-        assert_eq!(t, "Kunde A (entity) › Vertrag › Laufzeit\n\nrenews for 12 months");
+        assert_eq!(
+            t,
+            "Kunde A (entity) › Vertrag › Laufzeit\n\nrenews for 12 months"
+        );
     }
 
     #[test]
@@ -383,8 +390,17 @@ mod tests {
     #[test]
     fn contextual_text_with_a_summary_appends_it_after_the_heading_path() {
         let path = vec!["Vertrag".to_string()];
-        let t = contextual_text("Kunde A", "entity", &path, Some("Customer since 2024."), "body");
-        assert_eq!(t, "Kunde A (entity) › Vertrag — Customer since 2024.\n\nbody");
+        let t = contextual_text(
+            "Kunde A",
+            "entity",
+            &path,
+            Some("Customer since 2024."),
+            "body",
+        );
+        assert_eq!(
+            t,
+            "Kunde A (entity) › Vertrag — Customer since 2024.\n\nbody"
+        );
     }
 
     #[test]
@@ -408,7 +424,10 @@ mod tests {
     fn an_overlong_title_without_a_summary_keeps_the_old_160_character_header() {
         let long = "x".repeat(500);
         let header = contextual_text(&long, "entity", &[], None, "body");
-        assert_eq!(header, format!("{}…\n\nbody", "x".repeat(MAX_HEADER_CHARS - 1)));
+        assert_eq!(
+            header,
+            format!("{}…\n\nbody", "x".repeat(MAX_HEADER_CHARS - 1))
+        );
     }
 
     #[test]

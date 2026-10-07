@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use crate::crypto::gitfilter;
 use crate::crypto::keychain::{self, KeyringStore, MasterKeyStore};
-use crate::crypto::{filter_clean, filter_smudge, DerivedKeys, MasterKey};
+use crate::crypto::{DerivedKeys, MasterKey, filter_clean, filter_smudge};
 use crate::vault::layout::{opaque_relpath_for_id, page_relpath_for_id, wiki_dir};
 
 use super::{WikiError, WikiResult};
@@ -194,7 +194,12 @@ pub(crate) fn commit_encrypted_snapshot_as_new_root_with_store(
     let vault = wiki.parent().unwrap_or(wiki);
     stage_raw_mirror(vault, &mut index, Some(&keys))?;
     stage_meta_mirror(vault, &mut index, Some(&keys))?;
-    crate::wiki::git::commit_index_as_new_root(&repo, &mut index, message, PRE_ENCRYPTION_BACKUP_REF)
+    crate::wiki::git::commit_index_as_new_root(
+        &repo,
+        &mut index,
+        message,
+        PRE_ENCRYPTION_BACKUP_REF,
+    )
 }
 
 /// Turn a committed blob into the bytes that belong in the working tree.
@@ -211,9 +216,7 @@ pub(crate) fn blob_to_worktree_with_store(
     store: &impl MasterKeyStore,
 ) -> WikiResult<Vec<u8>> {
     match resolve_keys(wiki, store)? {
-        Some(keys) => {
-            filter_smudge(&keys, blob).map_err(|e| WikiError::Encryption(e.to_string()))
-        }
+        Some(keys) => filter_smudge(&keys, blob).map_err(|e| WikiError::Encryption(e.to_string())),
         None => Ok(blob.to_vec()),
     }
 }
@@ -244,7 +247,8 @@ fn resolve_keys_for_vault(
     if !is_encrypted(vault) {
         return Ok(None);
     }
-    let account = keychain::vault_account(vault).map_err(|e| WikiError::Encryption(e.to_string()))?;
+    let account =
+        keychain::vault_account(vault).map_err(|e| WikiError::Encryption(e.to_string()))?;
     let key = keychain::load_master_key(store, &account)
         .map_err(|e| WikiError::Encryption(e.to_string()))?
         .ok_or_else(|| {
@@ -368,8 +372,8 @@ pub(crate) fn smudge_worktree_from_head_with_store(
     })?;
     for (rel, oid) in targets {
         let blob = repo.find_blob(oid)?;
-        let plaintext =
-            filter_smudge(&keys, blob.content()).map_err(|e| WikiError::Encryption(e.to_string()))?;
+        let plaintext = filter_smudge(&keys, blob.content())
+            .map_err(|e| WikiError::Encryption(e.to_string()))?;
         let abs = wiki.join(&rel);
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent)?;
@@ -415,7 +419,10 @@ pub(crate) fn stage_raw_mirror(
     let mut desired: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut manifest = serde_json::Map::new();
     for (rel, abs) in &files {
-        if std::fs::metadata(abs).map(|m| m.len() > MAX_RAW_SYNC_BYTES).unwrap_or(false) {
+        if std::fs::metadata(abs)
+            .map(|m| m.len() > MAX_RAW_SYNC_BYTES)
+            .unwrap_or(false)
+        {
             tracing::warn!(path = %abs.display(), "raw file exceeds the sync size limit — kept local only");
             continue;
         }
@@ -424,13 +431,19 @@ pub(crate) fn stage_raw_mirror(
             Some(keys) => {
                 let token = keys.filename_token(rel);
                 manifest.insert(token.clone(), serde_json::Value::String(rel.clone()));
-                (format!("{RAW_MIRROR_DIR}/{token}"), filter_clean(keys, &bytes))
+                (
+                    format!("{RAW_MIRROR_DIR}/{token}"),
+                    filter_clean(keys, &bytes),
+                )
             }
             None => (format!("{RAW_MIRROR_DIR}/{rel}"), bytes),
         };
         // Stat-zero entry (same as encrypted pages): the mirror has no
         // worktree file, so git must never consult stat data for it.
-        index.add_frombuffer(&encrypted_index_entry(mirror_rel.clone().into_bytes()), &blob)?;
+        index.add_frombuffer(
+            &encrypted_index_entry(mirror_rel.clone().into_bytes()),
+            &blob,
+        )?;
         desired.insert(mirror_rel);
     }
     if let Some(keys) = keys {
@@ -457,11 +470,7 @@ pub(crate) fn stage_raw_mirror(
     Ok(())
 }
 
-fn collect_raw_files(
-    root: &Path,
-    dir: &Path,
-    out: &mut Vec<(String, PathBuf)>,
-) -> WikiResult<()> {
+fn collect_raw_files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> WikiResult<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -543,7 +552,10 @@ pub(crate) fn materialise_raw_from_head_with_store(
                     continue;
                 }
                 let Some(rel) = manifest.get(name).and_then(|v| v.as_str()) else {
-                    tracing::warn!(token = name, "raw mirror entry missing from the manifest — skipped");
+                    tracing::warn!(
+                        token = name,
+                        "raw mirror entry missing from the manifest — skipped"
+                    );
                     continue;
                 };
                 let Some(dest) = safe_raw_dest(&raw_root, rel) else {
@@ -620,7 +632,10 @@ pub(crate) fn stage_meta_mirror(
             ),
             None => (format!("{META_MIRROR_DIR}/{name}"), bytes),
         };
-        index.add_frombuffer(&encrypted_index_entry(mirror_rel.clone().into_bytes()), &blob)?;
+        index.add_frombuffer(
+            &encrypted_index_entry(mirror_rel.clone().into_bytes()),
+            &blob,
+        )?;
         desired.insert(mirror_rel);
     }
     let prefix = format!("{META_MIRROR_DIR}/");
@@ -675,8 +690,11 @@ pub(crate) fn materialise_meta_from_head_with_store(
         };
         let blob = repo.find_blob(entry.id())?;
         let bytes = if decrypt {
-            filter_smudge(keys.as_ref().expect("keys present when decrypting"), blob.content())
-                .map_err(|e| WikiError::Encryption(format!("meta {name}: {e}")))?
+            filter_smudge(
+                keys.as_ref().expect("keys present when decrypting"),
+                blob.content(),
+            )
+            .map_err(|e| WikiError::Encryption(format!("meta {name}: {e}")))?
         } else {
             blob.content().to_vec()
         };
@@ -690,7 +708,9 @@ pub(crate) fn materialise_meta_from_head_with_store(
 /// not implicitly trusted, AEAD or not.
 fn safe_raw_dest(raw_root: &Path, rel: &str) -> Option<PathBuf> {
     let rel_path = Path::new(rel);
-    let ok = rel_path.components().all(|c| matches!(c, std::path::Component::Normal(_)));
+    let ok = rel_path
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)));
     if !ok || rel.is_empty() {
         return None;
     }
@@ -888,9 +908,9 @@ fn encrypted_index_entry(path: Vec<u8>) -> git2::IndexEntry {
 mod tests {
     use super::*;
     use crate::crypto::keychain::KeychainError;
-    use crate::crypto::{looks_encrypted, MasterKey};
+    use crate::crypto::{MasterKey, looks_encrypted};
     use crate::vault::layout::ensure_skeleton;
-    use crate::vault::marker::{write_marker, VaultMarker};
+    use crate::vault::marker::{VaultMarker, write_marker};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -949,7 +969,10 @@ mod tests {
             assert!(looks_encrypted(&cleaned), "clean output must be ciphertext");
             assert_ne!(&cleaned, original, "ciphertext must differ from plaintext");
             let smudged = filter_smudge(&keys, &cleaned).expect("smudge must succeed");
-            assert_eq!(&smudged, original, "content must survive the round-trip exactly");
+            assert_eq!(
+                &smudged, original,
+                "content must survive the round-trip exactly"
+            );
         }
     }
 
@@ -958,8 +981,11 @@ mod tests {
         let tmp = TempDirLike::new();
         ensure_skeleton(tmp.path()).unwrap();
         assert!(!is_encrypted(tmp.path()), "fresh vault is not encrypted");
-        gitfilter::write_canary(&wiki_dir(tmp.path()), &MasterKey::from_bytes([1u8; 32]).derive())
-            .unwrap();
+        gitfilter::write_canary(
+            &wiki_dir(tmp.path()),
+            &MasterKey::from_bytes([1u8; 32]).derive(),
+        )
+        .unwrap();
         assert!(is_encrypted(tmp.path()), "canary present => encrypted");
     }
 
@@ -972,16 +998,22 @@ mod tests {
         let key = enable_encryption(tmp.path(), &store, &exe).unwrap();
 
         let account = keychain::vault_account(tmp.path()).unwrap();
-        let loaded = keychain::load_master_key(&store, &account).unwrap().unwrap();
+        let loaded = keychain::load_master_key(&store, &account)
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.to_hex(), key.to_hex());
         assert!(is_encrypted(tmp.path()));
-        assert!(gitfilter::canary_matches(&wiki_dir(tmp.path()), &key.derive()));
+        assert!(gitfilter::canary_matches(
+            &wiki_dir(tmp.path()),
+            &key.derive()
+        ));
         let repo = git2::Repository::open(wiki_dir(tmp.path())).unwrap();
-        assert!(repo
-            .config()
-            .unwrap()
-            .get_bool("filter.brain-crypt.required")
-            .unwrap());
+        assert!(
+            repo.config()
+                .unwrap()
+                .get_bool("filter.brain-crypt.required")
+                .unwrap()
+        );
     }
 
     #[test]
@@ -996,7 +1028,9 @@ mod tests {
         std::fs::create_dir_all(raw.join("email/work")).unwrap();
         std::fs::write(raw.join("email/work/kunde-a.eml"), b"vertraulicher Inhalt").unwrap();
 
-        commit_wiki_with_store(&wiki_dir(tmp.path()), "wiki: raw", &store).unwrap().unwrap();
+        commit_wiki_with_store(&wiki_dir(tmp.path()), "wiki: raw", &store)
+            .unwrap()
+            .unwrap();
 
         let repo = git2::Repository::open(wiki_dir(tmp.path())).unwrap();
         let tree = repo.head().unwrap().peel_to_tree().unwrap();
@@ -1004,15 +1038,22 @@ mod tests {
         let token = keys.filename_token("email/work/kunde-a.eml");
         let entry = tree.get_path(Path::new(&format!("raw/{token}"))).unwrap();
         let blob = repo.find_blob(entry.id()).unwrap();
-        assert!(looks_encrypted(blob.content()), "raw blob must be ciphertext");
         assert!(
-            tree.get_path(Path::new("raw/email/work/kunde-a.eml")).is_err(),
+            looks_encrypted(blob.content()),
+            "raw blob must be ciphertext"
+        );
+        assert!(
+            tree.get_path(Path::new("raw/email/work/kunde-a.eml"))
+                .is_err(),
             "the clear attachment path must not appear in the tree"
         );
         // The manifest exists, is encrypted, and maps token → clear path.
         let m = tree.get_path(Path::new("raw/.manifest")).unwrap();
         let m_blob = repo.find_blob(m.id()).unwrap();
-        assert!(looks_encrypted(m_blob.content()), "manifest must be ciphertext");
+        assert!(
+            looks_encrypted(m_blob.content()),
+            "manifest must be ciphertext"
+        );
         let json = filter_smudge(&keys, m_blob.content()).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
         assert_eq!(v[&token], "email/work/kunde-a.eml");
@@ -1026,13 +1067,19 @@ mod tests {
         std::fs::create_dir_all(raw.join("docs")).unwrap();
         std::fs::write(raw.join("docs/notiz.txt"), b"klartext").unwrap();
 
-        commit_wiki_with_store(&wiki_dir(tmp.path()), "wiki: raw", &store).unwrap().unwrap();
+        commit_wiki_with_store(&wiki_dir(tmp.path()), "wiki: raw", &store)
+            .unwrap()
+            .unwrap();
 
         let repo = git2::Repository::open(wiki_dir(tmp.path())).unwrap();
         let tree = repo.head().unwrap().peel_to_tree().unwrap();
         let entry = tree.get_path(Path::new("raw/docs/notiz.txt")).unwrap();
         let blob = repo.find_blob(entry.id()).unwrap();
-        assert_eq!(blob.content(), b"klartext", "plaintext vault mirrors verbatim");
+        assert_eq!(
+            blob.content(),
+            b"klartext",
+            "plaintext vault mirrors verbatim"
+        );
     }
 
     #[test]
@@ -1045,10 +1092,14 @@ mod tests {
         std::fs::create_dir_all(&raw).unwrap();
         std::fs::write(raw.join("old.bin"), b"bytes").unwrap();
         let wiki = wiki_dir(tmp.path());
-        commit_wiki_with_store(&wiki, "add", &store).unwrap().unwrap();
+        commit_wiki_with_store(&wiki, "add", &store)
+            .unwrap()
+            .unwrap();
 
         std::fs::remove_file(raw.join("old.bin")).unwrap();
-        commit_wiki_with_store(&wiki, "del", &store).unwrap().unwrap();
+        commit_wiki_with_store(&wiki, "del", &store)
+            .unwrap()
+            .unwrap();
 
         let repo = git2::Repository::open(&wiki).unwrap();
         let tree = repo.head().unwrap().peel_to_tree().unwrap();
@@ -1072,7 +1123,9 @@ mod tests {
         let meta = crate::vault::layout::meta_dir(tmp.path());
         std::fs::write(meta.join("AGENTS.md"), b"# custom agent rules").unwrap();
 
-        commit_wiki_with_store(&wiki_dir(tmp.path()), "wiki: meta", &store).unwrap().unwrap();
+        commit_wiki_with_store(&wiki_dir(tmp.path()), "wiki: meta", &store)
+            .unwrap()
+            .unwrap();
 
         let repo = git2::Repository::open(wiki_dir(tmp.path())).unwrap();
         let tree = repo.head().unwrap().peel_to_tree().unwrap();
@@ -1080,8 +1133,14 @@ mod tests {
         let token = keys.filename_token("00_meta/AGENTS.md");
         let entry = tree.get_path(Path::new(&format!("meta/{token}"))).unwrap();
         let blob = repo.find_blob(entry.id()).unwrap();
-        assert!(looks_encrypted(blob.content()), "meta blob must be ciphertext");
-        assert_eq!(filter_smudge(&keys, blob.content()).unwrap(), b"# custom agent rules");
+        assert!(
+            looks_encrypted(blob.content()),
+            "meta blob must be ciphertext"
+        );
+        assert_eq!(
+            filter_smudge(&keys, blob.content()).unwrap(),
+            b"# custom agent rules"
+        );
         assert!(
             tree.get_path(Path::new("meta/AGENTS.md")).is_err(),
             "the clear meta filename must not appear in an encrypted tree"
@@ -1097,7 +1156,9 @@ mod tests {
         let meta = crate::vault::layout::meta_dir(tmp.path());
         std::fs::write(meta.join("eval-queries.yaml"), b"- id: q1\n").unwrap();
 
-        commit_wiki_with_store(&wiki_dir(tmp.path()), "wiki: meta", &store).unwrap().unwrap();
+        commit_wiki_with_store(&wiki_dir(tmp.path()), "wiki: meta", &store)
+            .unwrap()
+            .unwrap();
 
         let repo = git2::Repository::open(wiki_dir(tmp.path())).unwrap();
         let tree = repo.head().unwrap().peel_to_tree().unwrap();
@@ -1117,7 +1178,9 @@ mod tests {
         let meta = crate::vault::layout::meta_dir(tmp.path());
         std::fs::write(meta.join("SKILL.md"), b"---\nname: brain-wiki\n---\n").unwrap();
 
-        commit_wiki_with_store(&wiki_dir(tmp.path()), "wiki: meta", &store).unwrap().unwrap();
+        commit_wiki_with_store(&wiki_dir(tmp.path()), "wiki: meta", &store)
+            .unwrap()
+            .unwrap();
 
         let repo = git2::Repository::open(wiki_dir(tmp.path())).unwrap();
         let tree = repo.head().unwrap().peel_to_tree().unwrap();
@@ -1147,7 +1210,9 @@ mod tests {
         std::fs::write(meta.join("AGENTS.md"), b"rules").unwrap();
         let wiki = wiki_dir(tmp.path());
         // Plaintext era commit — mirrors land at clear .md paths.
-        commit_wiki_with_store(&wiki, "plaintext era", &store).unwrap().unwrap();
+        commit_wiki_with_store(&wiki, "plaintext era", &store)
+            .unwrap()
+            .unwrap();
 
         let key =
             enable_encryption(tmp.path(), &store, &PathBuf::from("/opt/brain/brain")).unwrap();
@@ -1157,13 +1222,25 @@ mod tests {
 
         let repo = git2::Repository::open(&wiki).unwrap();
         let tree = repo.head().unwrap().peel_to_tree().unwrap();
-        assert!(tree.get_path(Path::new("raw/notes/plan.md")).is_err(), "clear raw path gone");
-        assert!(tree.get_path(Path::new("meta/AGENTS.md")).is_err(), "clear meta path gone");
+        assert!(
+            tree.get_path(Path::new("raw/notes/plan.md")).is_err(),
+            "clear raw path gone"
+        );
+        assert!(
+            tree.get_path(Path::new("meta/AGENTS.md")).is_err(),
+            "clear meta path gone"
+        );
         let keys = key.derive();
         let raw_token = keys.filename_token("notes/plan.md");
-        assert!(tree.get_path(Path::new(&format!("raw/{raw_token}"))).is_ok());
+        assert!(
+            tree.get_path(Path::new(&format!("raw/{raw_token}")))
+                .is_ok()
+        );
         let meta_token = keys.filename_token("00_meta/AGENTS.md");
-        assert!(tree.get_path(Path::new(&format!("meta/{meta_token}"))).is_ok());
+        assert!(
+            tree.get_path(Path::new(&format!("meta/{meta_token}")))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1179,7 +1256,9 @@ mod tests {
         let page = "---\nid: entities/geheim\ntype: entity\ntitle: Geheim\n---\n\nKlartext.\n";
         std::fs::create_dir_all(wiki.join("entities")).unwrap();
         std::fs::write(wiki.join("entities/geheim.md"), page).unwrap();
-        commit_wiki_with_store(&wiki, "wiki: plaintext era", &store).unwrap().unwrap();
+        commit_wiki_with_store(&wiki, "wiki: plaintext era", &store)
+            .unwrap()
+            .unwrap();
         assert!(crate::wiki::git::commit_count(&wiki).unwrap() >= 1);
 
         let key =
@@ -1198,15 +1277,22 @@ mod tests {
             "the human-named path must be gone from the pushable history"
         );
         let token = key.derive().filename_token("entities/geheim");
-        let entry = head_tree.get_path(Path::new(&format!("entities/{token}.md"))).unwrap();
+        let entry = head_tree
+            .get_path(Path::new(&format!("entities/{token}.md")))
+            .unwrap();
         let blob = repo.find_blob(entry.id()).unwrap();
-        assert!(looks_encrypted(blob.content()), "the committed blob must be ciphertext");
+        assert!(
+            looks_encrypted(blob.content()),
+            "the committed blob must be ciphertext"
+        );
 
         // The plaintext era still exists, but only on the local backup ref.
         let backup = repo.find_reference(PRE_ENCRYPTION_BACKUP_REF).unwrap();
         let backup_tree = backup.peel_to_tree().unwrap();
         assert!(
-            backup_tree.get_path(Path::new("entities/geheim.md")).is_ok(),
+            backup_tree
+                .get_path(Path::new("entities/geheim.md"))
+                .is_ok(),
             "the backup ref preserves the pre-encryption history"
         );
     }
@@ -1224,10 +1310,15 @@ mod tests {
         // is what lets a second machine join an existing vault and merge.
         assert_eq!(key.to_hex(), provided.to_hex());
         let account = keychain::vault_account(tmp.path()).unwrap();
-        let loaded = keychain::load_master_key(&store, &account).unwrap().unwrap();
+        let loaded = keychain::load_master_key(&store, &account)
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.to_hex(), provided.to_hex());
         assert!(is_encrypted(tmp.path()));
-        assert!(gitfilter::canary_matches(&wiki_dir(tmp.path()), &provided.derive()));
+        assert!(gitfilter::canary_matches(
+            &wiki_dir(tmp.path()),
+            &provided.derive()
+        ));
     }
 
     #[test]
@@ -1241,7 +1332,10 @@ mod tests {
             Ok(_) => panic!("a malformed recovery key must be rejected"),
             Err(e) => e,
         };
-        assert!(format!("{err:#}").contains("64 hex"), "clear error: {err:#}");
+        assert!(
+            format!("{err:#}").contains("64 hex"),
+            "clear error: {err:#}"
+        );
         // Nothing was written — the vault stays plaintext.
         assert!(!is_encrypted(tmp.path()));
     }
@@ -1264,7 +1358,8 @@ mod tests {
     fn commit_wiki_stores_ciphertext_that_decrypts_to_the_original() {
         let tmp = vault_with_repo();
         let wiki = wiki_dir(tmp.path());
-        let page = b"---\nid: entities/x\ntype: entity\n---\n\n# X\n\nPII +49 201 000, [[entities/y]].\n";
+        let page =
+            b"---\nid: entities/x\ntype: entity\n---\n\n# X\n\nPII +49 201 000, [[entities/y]].\n";
         std::fs::write(wiki.join("entities").join("x.md"), page).unwrap();
         crate::wiki::git::commit_all(&wiki, "plaintext baseline").unwrap();
 
@@ -1279,10 +1374,21 @@ mod tests {
         assert!(sha.is_some(), "encryption must produce a commit");
 
         // The page is now at its opaque path (commit_wiki renames it).
-        let blob = head_blob(&wiki, &format!("entities/{}.md", keys.filename_token("entities/x")));
+        let blob = head_blob(
+            &wiki,
+            &format!("entities/{}.md", keys.filename_token("entities/x")),
+        );
         assert!(looks_encrypted(&blob), "committed page must be ciphertext");
-        assert_ne!(blob.as_slice(), page, "committed page must not be plaintext");
-        assert_eq!(&filter_smudge(&keys, &blob).unwrap(), page, "decrypt restores original");
+        assert_ne!(
+            blob.as_slice(),
+            page,
+            "committed page must not be plaintext"
+        );
+        assert_eq!(
+            &filter_smudge(&keys, &blob).unwrap(),
+            page,
+            "decrypt restores original"
+        );
 
         // .gitattributes stays plaintext (not a *.md file).
         let ga = head_blob(&wiki, ".gitattributes");
@@ -1297,7 +1403,8 @@ mod tests {
         let tmp = vault_with_repo();
         let wiki = wiki_dir(tmp.path());
         let store = MemStore::default();
-        let key = enable_encryption(tmp.path(), &store, &PathBuf::from("/opt/brain/brain")).unwrap();
+        let key =
+            enable_encryption(tmp.path(), &store, &PathBuf::from("/opt/brain/brain")).unwrap();
         let keys = key.derive();
         std::fs::write(
             wiki.join("entities").join("michael-simon.md"),
@@ -1310,28 +1417,47 @@ mod tests {
         let repo = git2::Repository::open(&wiki).unwrap();
         let tree = repo.head().unwrap().peel_to_tree().unwrap();
         assert!(
-            tree.get_path(Path::new("entities/michael-simon.md")).is_err(),
+            tree.get_path(Path::new("entities/michael-simon.md"))
+                .is_err(),
             "the human-named path must not appear in the committed tree"
         );
-        let opaque = format!("entities/{}.md", keys.filename_token("entities/michael-simon"));
-        let entry = tree.get_path(Path::new(&opaque)).expect("opaque path committed");
+        let opaque = format!(
+            "entities/{}.md",
+            keys.filename_token("entities/michael-simon")
+        );
+        let entry = tree
+            .get_path(Path::new(&opaque))
+            .expect("opaque path committed");
         let blob = repo.find_blob(entry.id()).unwrap();
-        assert!(looks_encrypted(blob.content()), "committed at the opaque path as ciphertext");
+        assert!(
+            looks_encrypted(blob.content()),
+            "committed at the opaque path as ciphertext"
+        );
     }
 
     #[test]
     fn commit_wiki_is_noop_when_nothing_changed_in_encrypted_vault() {
         let tmp = vault_with_repo();
         let wiki = wiki_dir(tmp.path());
-        std::fs::write(wiki.join("entities").join("x.md"), b"---\nid: entities/x\n---\nbody\n")
-            .unwrap();
+        std::fs::write(
+            wiki.join("entities").join("x.md"),
+            b"---\nid: entities/x\n---\nbody\n",
+        )
+        .unwrap();
         crate::wiki::git::commit_all(&wiki, "baseline").unwrap();
         let store = MemStore::default();
         enable_encryption(tmp.path(), &store, &PathBuf::from("/opt/brain/brain")).unwrap();
 
-        assert!(commit_wiki_with_store(&wiki, "encrypt", &store).unwrap().is_some(), "first encrypts");
         assert!(
-            commit_wiki_with_store(&wiki, "again", &store).unwrap().is_none(),
+            commit_wiki_with_store(&wiki, "encrypt", &store)
+                .unwrap()
+                .is_some(),
+            "first encrypts"
+        );
+        assert!(
+            commit_wiki_with_store(&wiki, "again", &store)
+                .unwrap()
+                .is_none(),
             "re-run with identical content must not create an empty commit \
              (deterministic nonce => identical ciphertext => identical tree)"
         );
@@ -1343,17 +1469,30 @@ mod tests {
     fn commit_wiki_errors_when_encrypted_but_key_missing() {
         let tmp = vault_with_repo();
         let wiki = wiki_dir(tmp.path());
-        std::fs::write(wiki.join("entities").join("x.md"), b"---\nid: entities/x\n---\nsecret\n")
-            .unwrap();
+        std::fs::write(
+            wiki.join("entities").join("x.md"),
+            b"---\nid: entities/x\n---\nsecret\n",
+        )
+        .unwrap();
         crate::wiki::git::commit_all(&wiki, "baseline").unwrap();
         // Set up encryption with one store, then commit with an EMPTY one.
-        enable_encryption(tmp.path(), &MemStore::default(), &PathBuf::from("/opt/brain/brain"))
-            .unwrap();
-        std::fs::write(wiki.join("entities").join("x.md"), b"---\nid: entities/x\n---\nchanged\n")
-            .unwrap();
+        enable_encryption(
+            tmp.path(),
+            &MemStore::default(),
+            &PathBuf::from("/opt/brain/brain"),
+        )
+        .unwrap();
+        std::fs::write(
+            wiki.join("entities").join("x.md"),
+            b"---\nid: entities/x\n---\nchanged\n",
+        )
+        .unwrap();
         let empty = MemStore::default();
         assert!(
-            matches!(commit_wiki_with_store(&wiki, "should fail", &empty), Err(WikiError::Encryption(_))),
+            matches!(
+                commit_wiki_with_store(&wiki, "should fail", &empty),
+                Err(WikiError::Encryption(_))
+            ),
             "must refuse to commit plaintext into an encrypted vault without the key"
         );
     }
@@ -1362,12 +1501,18 @@ mod tests {
     fn commit_wiki_writes_plaintext_when_vault_not_encrypted() {
         let tmp = vault_with_repo();
         let wiki = wiki_dir(tmp.path());
-        std::fs::write(wiki.join("entities").join("x.md"), b"---\nid: entities/x\n---\nplain\n")
-            .unwrap();
+        std::fs::write(
+            wiki.join("entities").join("x.md"),
+            b"---\nid: entities/x\n---\nplain\n",
+        )
+        .unwrap();
         let store = MemStore::default();
         commit_wiki_with_store(&wiki, "plain commit", &store).unwrap();
         let blob = head_blob(&wiki, "entities/x.md");
-        assert!(!looks_encrypted(&blob), "plaintext vault stores plaintext blobs");
+        assert!(
+            !looks_encrypted(&blob),
+            "plaintext vault stores plaintext blobs"
+        );
     }
 
     #[test]
@@ -1384,11 +1529,19 @@ mod tests {
     fn page_relpath_is_opaque_token_when_vault_encrypted() {
         let tmp = vault_with_repo();
         let store = MemStore::default();
-        let key = enable_encryption(tmp.path(), &store, &PathBuf::from("/opt/brain/brain")).unwrap();
+        let key =
+            enable_encryption(tmp.path(), &store, &PathBuf::from("/opt/brain/brain")).unwrap();
         let token = key.derive().filename_token("entities/michael-simon");
         let rel = page_relpath_with_store(tmp.path(), "entities/michael-simon", &store).unwrap();
-        assert_eq!(rel, format!("entities/{token}.md"), "opaque layout is <type>/<token>.md");
-        assert!(!rel.contains("michael"), "person name must not leak into the path");
+        assert_eq!(
+            rel,
+            format!("entities/{token}.md"),
+            "opaque layout is <type>/<token>.md"
+        );
+        assert!(
+            !rel.contains("michael"),
+            "person name must not leak into the path"
+        );
     }
 
     #[test]
@@ -1398,7 +1551,8 @@ mod tests {
         let page = "---\nid: entities/michael-simon\ntype: entity\ntitle: Michael\n---\n\nbody\n";
         std::fs::write(wiki.join("entities").join("michael-simon.md"), page).unwrap();
         let store = MemStore::default();
-        let key = enable_encryption(tmp.path(), &store, &PathBuf::from("/opt/brain/brain")).unwrap();
+        let key =
+            enable_encryption(tmp.path(), &store, &PathBuf::from("/opt/brain/brain")).unwrap();
         let keys = key.derive();
 
         assert_eq!(rename_pages_to_opaque(&wiki, &keys).unwrap(), 1);
@@ -1411,9 +1565,16 @@ mod tests {
         assert!(opaque.exists(), "file must now live at the opaque path");
         // Content untouched, id still recoverable from frontmatter (reversible).
         let raw = std::fs::read_to_string(&opaque).unwrap();
-        assert!(raw.contains("id: entities/michael-simon"), "id stays in frontmatter");
+        assert!(
+            raw.contains("id: entities/michael-simon"),
+            "id stays in frontmatter"
+        );
         // Idempotent.
-        assert_eq!(rename_pages_to_opaque(&wiki, &keys).unwrap(), 0, "second run is a no-op");
+        assert_eq!(
+            rename_pages_to_opaque(&wiki, &keys).unwrap(),
+            0,
+            "second run is a no-op"
+        );
     }
 
     #[test]
@@ -1433,7 +1594,10 @@ mod tests {
 
         disable_encryption_with_store(tmp.path(), &store).unwrap();
 
-        assert!(!is_encrypted(tmp.path()), "canary gone → vault reports plaintext");
+        assert!(
+            !is_encrypted(tmp.path()),
+            "canary gone → vault reports plaintext"
+        );
         assert!(
             wiki.join("entities").join("alice.md").exists(),
             "plaintext filename restored in the working tree"
@@ -1442,8 +1606,15 @@ mod tests {
         let tree = repo.head().unwrap().peel_to_tree().unwrap();
         let entry = tree.get_path(Path::new("entities/alice.md")).unwrap();
         let blob = repo.find_blob(entry.id()).unwrap();
-        assert!(!looks_encrypted(blob.content()), "committed blob is plaintext again");
-        assert!(std::str::from_utf8(blob.content()).unwrap().contains("id: entities/alice"));
+        assert!(
+            !looks_encrypted(blob.content()),
+            "committed blob is plaintext again"
+        );
+        assert!(
+            std::str::from_utf8(blob.content())
+                .unwrap()
+                .contains("id: entities/alice")
+        );
     }
 
     #[test]
@@ -1451,13 +1622,18 @@ mod tests {
         let tmp = vault_with_repo();
         let wiki = wiki_dir(tmp.path());
         let store = MemStore::default();
-        let key = enable_encryption(tmp.path(), &store, &PathBuf::from("/opt/brain/brain")).unwrap();
+        let key =
+            enable_encryption(tmp.path(), &store, &PathBuf::from("/opt/brain/brain")).unwrap();
         let keys = key.derive();
         let page = b"---\nid: entities/x\n---\nplaintext body\n";
         let ct = filter_clean(&keys, page);
         assert!(looks_encrypted(&ct));
         let out = blob_to_worktree_with_store(&wiki, &ct, &store).unwrap();
-        assert_eq!(out.as_slice(), page, "restore must decrypt the blob to plaintext");
+        assert_eq!(
+            out.as_slice(),
+            page,
+            "restore must decrypt the blob to plaintext"
+        );
     }
 
     struct TempDirLike(tempfile::TempDir);

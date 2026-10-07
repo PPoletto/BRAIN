@@ -158,12 +158,17 @@ pub fn run_remote_add(vault_arg: Option<&str>, url: Option<&str>) -> i32 {
 pub fn run_clone(url: Option<&str>, target: Option<&str>) -> i32 {
     configure_libgit2();
     let (Some(url), Some(target)) = (url, target) else {
-        eprintln!("usage: brain clone <url> <target-vault-dir>   (recovery key on stdin line 1, optional PAT on line 2)");
+        eprintln!(
+            "usage: brain clone <url> <target-vault-dir>   (recovery key on stdin line 1, optional PAT on line 2)"
+        );
         return 2;
     };
     let vault = std::path::Path::new(target);
     if vault::layout::wiki_dir(vault).exists() {
-        eprintln!("clone: '{}/02_wiki' already exists — refusing to overwrite", vault.display());
+        eprintln!(
+            "clone: '{}/02_wiki' already exists — refusing to overwrite",
+            vault.display()
+        );
         return 3;
     }
     let mut stdin_buf = String::new();
@@ -413,9 +418,11 @@ pub fn run() {
             // search reloads it lazily. `evict_idle_embedders` logs at info
             // level when it evicts and skips a round instead of waiting
             // behind an in-progress load.
-            std::thread::spawn(|| loop {
-                std::thread::sleep(std::time::Duration::from_secs(60));
-                embedding::evict_idle_embedders(embedding::EMBEDDER_IDLE_TTL);
+            std::thread::spawn(|| {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(60));
+                    embedding::evict_idle_embedders(embedding::EMBEDDER_IDLE_TTL);
+                }
             });
             Ok(())
         })

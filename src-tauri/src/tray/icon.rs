@@ -71,7 +71,10 @@ mod tests {
             let bytes = kind.bytes();
             assert!(bytes.len() > 50, "icon for {:?} too small", kind);
             // PNG signature
-            assert_eq!(&bytes[..8], &[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+            assert_eq!(
+                &bytes[..8],
+                &[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
+            );
         }
     }
 }

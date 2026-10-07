@@ -9,7 +9,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use super::layout::{meta_dir, BRAIN_MARKER_FILENAME};
+use super::layout::{BRAIN_MARKER_FILENAME, meta_dir};
 use super::{VaultError, VaultResult};
 
 pub const BRAIN_FORMAT_V1: &str = "brain-v1";

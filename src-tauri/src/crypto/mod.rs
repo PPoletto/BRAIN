@@ -191,8 +191,8 @@ impl DerivedKeys {
     }
 
     fn deterministic_nonce(&self, plaintext: &[u8]) -> [u8; NONCE_LEN] {
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.nonce)
-            .expect("HMAC accepts any key length");
+        let mut mac =
+            <HmacSha256 as Mac>::new_from_slice(&self.nonce).expect("HMAC accepts any key length");
         mac.update(plaintext);
         let full = mac.finalize().into_bytes(); // 32 bytes
         let mut nonce = [0u8; NONCE_LEN];

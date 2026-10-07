@@ -287,19 +287,23 @@ mod tests {
         // `-text` is the property that keeps ciphertext from being
         // CRLF-mangled — assert it explicitly, not just by line match.
         assert!(
-            attrs.lines().any(|l| l.contains("*.md") && l.contains("-text")),
+            attrs
+                .lines()
+                .any(|l| l.contains("*.md") && l.contains("-text")),
             "*.md must be marked -text so git never eol-converts ciphertext"
         );
         let repo = git2::Repository::open(wiki).unwrap();
         let cfg = repo.config().unwrap();
-        assert!(cfg
-            .get_string("filter.brain-crypt.clean")
-            .unwrap()
-            .contains("git-filter clean"));
-        assert!(cfg
-            .get_string("filter.brain-crypt.smudge")
-            .unwrap()
-            .contains("git-filter smudge"));
+        assert!(
+            cfg.get_string("filter.brain-crypt.clean")
+                .unwrap()
+                .contains("git-filter clean")
+        );
+        assert!(
+            cfg.get_string("filter.brain-crypt.smudge")
+                .unwrap()
+                .contains("git-filter smudge")
+        );
         assert!(cfg.get_bool("filter.brain-crypt.required").unwrap());
     }
 

@@ -152,7 +152,7 @@ pub fn unmount(state: &AppState, force: bool) -> MountResult<()> {
 mod tests {
     use super::*;
     use crate::vault::layout::ensure_skeleton;
-    use crate::vault::marker::{write_marker, VaultMarker};
+    use crate::vault::marker::{VaultMarker, write_marker};
     use tempfile::TempDir;
 
     fn prepare_vault(tmp: &TempDir) -> &Path {
@@ -259,8 +259,7 @@ mod tests {
         // Delete the marker — same end-state as a yanked drive from
         // the perspective of `is_vault`.
         std::fs::remove_file(
-            crate::vault::layout::meta_dir(path)
-                .join(crate::vault::layout::BRAIN_MARKER_FILENAME),
+            crate::vault::layout::meta_dir(path).join(crate::vault::layout::BRAIN_MARKER_FILENAME),
         )
         .unwrap();
         assert!(handle_vault_disappearance(&state));

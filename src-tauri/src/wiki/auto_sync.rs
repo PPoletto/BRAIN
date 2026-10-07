@@ -43,7 +43,11 @@ impl AutoSyncHandle {
 
 /// Spawn the scheduler for `vault`. Store the returned handle so it can be
 /// aborted (unmount / toggle-off).
-pub fn spawn<R: Runtime>(app: AppHandle<R>, state: Arc<AppState>, vault: PathBuf) -> AutoSyncHandle {
+pub fn spawn<R: Runtime>(
+    app: AppHandle<R>,
+    state: Arc<AppState>,
+    vault: PathBuf,
+) -> AutoSyncHandle {
     AutoSyncHandle {
         handle: tauri::async_runtime::spawn(run_loop(app, state, vault)),
     }
@@ -80,7 +84,10 @@ async fn run_loop<R: Runtime>(app: AppHandle<R>, state: Arc<AppState>, vault: Pa
                     })
                     .await;
                 }
-                if let MergeOutcome::Merged { conflicted_pages, .. } = &other {
+                if let MergeOutcome::Merged {
+                    conflicted_pages, ..
+                } = &other
+                {
                     if !conflicted_pages.is_empty() {
                         // Surface conflicts so the UI can prompt the user
                         // to resolve them (same as a manual Sync now).

@@ -33,5 +33,5 @@ pub enum MountError {
 
 pub type MountResult<T> = Result<T, MountError>;
 
-pub use lifecycle::{mount_source, unmount, UncleanFlag};
+pub use lifecycle::{UncleanFlag, mount_source, unmount};
 pub use watcher::{ChangeEvent, SourceWatcher};

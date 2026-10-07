@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use notify::{RecursiveMode, Watcher as _};
-use notify_debouncer_full::{new_debouncer, DebounceEventResult};
+use notify_debouncer_full::{DebounceEventResult, new_debouncer};
 use tauri::{AppHandle, Emitter, Runtime};
 use tokio::sync::mpsc;
 
@@ -43,11 +43,7 @@ pub fn spawn<R: Runtime>(
     WikiWatcher { handle }
 }
 
-async fn run_loop<R: Runtime>(
-    app: AppHandle<R>,
-    state: Arc<AppState>,
-    vault_path: PathBuf,
-) {
+async fn run_loop<R: Runtime>(app: AppHandle<R>, state: Arc<AppState>, vault_path: PathBuf) {
     let wiki = wiki_dir(&vault_path);
     if let Err(err) = std::fs::create_dir_all(&wiki) {
         tracing::error!(?err, "wiki watcher: cannot create wiki dir");
@@ -62,10 +58,8 @@ async fn run_loop<R: Runtime>(
 
     let watcher_tx = tx.clone();
     let meta_root = crate::vault::layout::meta_dir(&vault_path);
-    let mut debouncer = match new_debouncer(
-        DEBOUNCE_IDLE,
-        None,
-        move |result: DebounceEventResult| {
+    let mut debouncer =
+        match new_debouncer(DEBOUNCE_IDLE, None, move |result: DebounceEventResult| {
             if let Ok(events) = result {
                 let relevant = events
                     .iter()
@@ -75,19 +69,15 @@ async fn run_loop<R: Runtime>(
                     let _ = watcher_tx.try_send(());
                 }
             }
-        },
-    ) {
-        Ok(d) => d,
-        Err(err) => {
-            tracing::error!(?err, "wiki watcher: cannot start debouncer");
-            return;
-        }
-    };
+        }) {
+            Ok(d) => d,
+            Err(err) => {
+                tracing::error!(?err, "wiki watcher: cannot start debouncer");
+                return;
+            }
+        };
 
-    if let Err(err) = debouncer
-        .watcher()
-        .watch(&wiki, RecursiveMode::Recursive)
-    {
+    if let Err(err) = debouncer.watcher().watch(&wiki, RecursiveMode::Recursive) {
         tracing::error!(?err, "wiki watcher: cannot watch wiki dir");
         return;
     }
@@ -100,14 +90,23 @@ async fn run_loop<R: Runtime>(
     let raw = crate::vault::layout::raw_dir(&vault_path);
     let _ = std::fs::create_dir_all(&raw);
     if let Err(err) = debouncer.watcher().watch(&raw, RecursiveMode::Recursive) {
-        tracing::warn!(?err, "wiki watcher: cannot watch 01_raw — raw changes commit lazily");
+        tracing::warn!(
+            ?err,
+            "wiki watcher: cannot watch 01_raw — raw changes commit lazily"
+        );
     }
 
     // Watch 00_meta (flat) for edits/resets of the synced meta files
     // (AGENTS.md, CLAUDE.md) — the callback filters everything else out.
     let meta = crate::vault::layout::meta_dir(&vault_path);
-    if let Err(err) = debouncer.watcher().watch(&meta, RecursiveMode::NonRecursive) {
-        tracing::warn!(?err, "wiki watcher: cannot watch 00_meta — meta changes commit lazily");
+    if let Err(err) = debouncer
+        .watcher()
+        .watch(&meta, RecursiveMode::NonRecursive)
+    {
+        tracing::warn!(
+            ?err,
+            "wiki watcher: cannot watch 00_meta — meta changes commit lazily"
+        );
     }
 
     while rx.recv().await.is_some() {
@@ -134,7 +133,9 @@ async fn run_loop<R: Runtime>(
 /// audit reports under `00_meta/audit/`, the eval history and the dream
 /// queue/log are written by BRAIN itself and would churn events forever.
 pub(crate) fn is_relevant_event_path(meta_root: &Path, p: &Path) -> bool {
-    if p.components().any(|c| c.as_os_str() == std::ffi::OsStr::new(".git")) {
+    if p.components()
+        .any(|c| c.as_os_str() == std::ffi::OsStr::new(".git"))
+    {
         return false;
     }
     if p.starts_with(meta_root) {
@@ -320,7 +321,10 @@ mod tests {
     #[test]
     fn writing_an_audit_report_does_not_wake_the_auto_committer() {
         let meta = Path::new("/vault/00_meta");
-        assert!(!is_relevant_event_path(meta, &meta.join("audit").join("2026-10-06.md")));
+        assert!(!is_relevant_event_path(
+            meta,
+            &meta.join("audit").join("2026-10-06.md")
+        ));
     }
 
     #[test]
@@ -338,7 +342,10 @@ mod tests {
     #[test]
     fn editing_the_synced_eval_set_wakes_the_auto_committer() {
         let meta = Path::new("/vault/00_meta");
-        assert!(is_relevant_event_path(meta, &meta.join("eval-queries.yaml")));
+        assert!(is_relevant_event_path(
+            meta,
+            &meta.join("eval-queries.yaml")
+        ));
     }
 
     #[test]
@@ -356,7 +363,10 @@ mod tests {
     #[test]
     fn editing_a_wiki_page_wakes_the_auto_committer() {
         let meta = Path::new("/vault/00_meta");
-        assert!(is_relevant_event_path(meta, Path::new("/vault/02_wiki/entities/a.md")));
+        assert!(is_relevant_event_path(
+            meta,
+            Path::new("/vault/02_wiki/entities/a.md")
+        ));
     }
 
     #[test]
@@ -371,7 +381,10 @@ mod tests {
         assert_eq!(msg, "wiki: 2 changes");
         assert!(!msg.contains("michael"), "no page name may appear: {msg}");
         assert!(!msg.contains(".md"), "no paths at all: {msg}");
-        assert_eq!(commit_message(&["entities/a.md".to_string()], true), "wiki: 1 change");
+        assert_eq!(
+            commit_message(&["entities/a.md".to_string()], true),
+            "wiki: 1 change"
+        );
     }
 
     #[test]

@@ -61,7 +61,10 @@ pub fn compile_query(expr: Expr, today: &str) -> Result<CompiledQuery, QueryErro
         None => "1".to_string(),
     };
     if !filter.as_ref().is_some_and(mentions_valid) {
-        where_clause = format!("({where_clause}) AND ({})", valid_now_sql(&mut params, today));
+        where_clause = format!(
+            "({where_clause}) AND ({})",
+            valid_now_sql(&mut params, today)
+        );
     }
     let order = match sort.unwrap_or(Sort::Updated) {
         Sort::Updated => ORDER_BY_UPDATED,
@@ -98,7 +101,11 @@ fn mentions_valid(expr: &Expr) -> bool {
 fn split_sort(expr: Expr) -> Result<(Option<Expr>, Option<Sort>), QueryError> {
     match expr {
         Expr::Clause(c) if c.field == Field::Sort => {
-            let sort = if c.value == "salience" { Sort::Salience } else { Sort::Updated };
+            let sort = if c.value == "salience" {
+                Sort::Salience
+            } else {
+                Sort::Updated
+            };
             Ok((None, Some(sort)))
         }
         Expr::And(a, b) => {
@@ -161,7 +168,9 @@ fn clause_sql(c: &Clause, params: &mut Vec<SqlValue>, today: &str) -> String {
         (Field::Tag, Op::Eq) => {
             params.push(value);
             let n = params.len();
-            format!("EXISTS (SELECT 1 FROM page_tags pt WHERE pt.page_id = pages.id AND pt.tag = ?{n})")
+            format!(
+                "EXISTS (SELECT 1 FROM page_tags pt WHERE pt.page_id = pages.id AND pt.tag = ?{n})"
+            )
         }
         (Field::Tag, _) => "0 /* tag only supports `:` equality */".to_string(),
         (Field::Title, Op::Eq) => {
@@ -242,13 +251,21 @@ mod tests {
     #[test]
     fn valid_all_switches_the_default_validity_filter_off() {
         let q = compile_query(parse("type:entity AND valid:all").unwrap(), "2026-10-06").unwrap();
-        assert!(!q.sql.contains("COALESCE(pages.superseded_by"), "sql: {}", q.sql);
+        assert!(
+            !q.sql.contains("COALESCE(pages.superseded_by"),
+            "sql: {}",
+            q.sql
+        );
     }
 
     #[test]
     fn sort_salience_orders_by_reads_and_search_hits() {
         let q = compile_query(parse("sort:salience").unwrap(), "2026-10-06").unwrap();
-        assert!(q.sql.contains("ORDER BY (COALESCE(pa.reads, 0) * 2"), "sql: {}", q.sql);
+        assert!(
+            q.sql.contains("ORDER BY (COALESCE(pa.reads, 0) * 2"),
+            "sql: {}",
+            q.sql
+        );
     }
 
     #[test]

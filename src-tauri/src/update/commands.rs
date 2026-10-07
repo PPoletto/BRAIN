@@ -81,7 +81,9 @@ pub async fn apply_update(app: AppHandle) -> BrainResult<()> {
         .await
         .map_err(|err| BrainError::Internal(format!("update check failed: {err}")))?;
     let Some(update) = info else {
-        return Err(BrainError::Internal("no update is currently available".into()));
+        return Err(BrainError::Internal(
+            "no update is currently available".into(),
+        ));
     };
     update
         .download_and_install(|_chunk_size, _total_size| {}, || {})

@@ -23,10 +23,7 @@ pub fn list_wiki_tree(state: State<Arc<crate::state::AppState>>) -> BrainResult<
 }
 
 #[tauri::command]
-pub fn read_page(
-    state: State<Arc<crate::state::AppState>>,
-    id: String,
-) -> BrainResult<PageView> {
+pub fn read_page(state: State<Arc<crate::state::AppState>>, id: String) -> BrainResult<PageView> {
     let vault = current_vault(&state)?;
     tree::read_page(&vault, &id).map_err(BrainError::from)
 }
@@ -79,8 +76,7 @@ pub fn query_pages(
     let db = state
         .db()
         .ok_or_else(|| BrainError::Internal("no SQLite index is open".into()))?;
-    super::query::executor::run(&db, &query)
-        .map_err(|err| BrainError::Internal(err.to_string()))
+    super::query::executor::run(&db, &query).map_err(|err| BrainError::Internal(err.to_string()))
 }
 
 /// B1: run the retrieval eval of the mounted vault (Settings → "Search
@@ -126,9 +122,7 @@ pub async fn run_retrieval_eval(
 /// this run (an interrupted forced run resumes like a format upgrade).
 /// Reports batch progress on the op label ("… (120/843)").
 #[tauri::command]
-pub async fn rebuild_index(
-    state: State<'_, Arc<crate::state::AppState>>,
-) -> BrainResult<u32> {
+pub async fn rebuild_index(state: State<'_, Arc<crate::state::AppState>>) -> BrainResult<u32> {
     let vault = current_vault(&state)?;
     let db = state
         .db()
@@ -161,14 +155,8 @@ pub async fn rebuild_index(
         .db()
         .map(|db| {
             db.with(|conn| {
-                conn.query_row::<i64, _, _>(
-                    "SELECT COUNT(*) FROM pages",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(|e| {
-                    crate::db::DbError::Io(std::io::Error::other(e.to_string()))
-                })
+                conn.query_row::<i64, _, _>("SELECT COUNT(*) FROM pages", [], |row| row.get(0))
+                    .map_err(|e| crate::db::DbError::Io(std::io::Error::other(e.to_string())))
             })
             .unwrap_or(0)
         })
@@ -211,9 +199,7 @@ pub fn save_graph_positions(
 /// "Re-layout" button — one click reverts to fcose, and the next
 /// drag/save will re-populate the table.
 #[tauri::command]
-pub fn clear_graph_positions(
-    state: State<Arc<crate::state::AppState>>,
-) -> BrainResult<()> {
+pub fn clear_graph_positions(state: State<Arc<crate::state::AppState>>) -> BrainResult<()> {
     let db = state
         .db()
         .ok_or_else(|| BrainError::Internal("no SQLite index is open".into()))?;

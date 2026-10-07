@@ -109,7 +109,9 @@ pub fn ensure_skeleton(vault: &Path) -> VaultResult<()> {
             format!("vault path does not exist: {}", vault.display()),
         )));
     }
-    let top_dirs = [META_DIR, RAW_DIR, WIKI_DIR, DB_DIR, MODELS_DIR, CACHE_DIR, LOGS_DIR];
+    let top_dirs = [
+        META_DIR, RAW_DIR, WIKI_DIR, DB_DIR, MODELS_DIR, CACHE_DIR, LOGS_DIR,
+    ];
     for d in top_dirs {
         std::fs::create_dir_all(vault.join(d))?;
     }
@@ -133,7 +135,10 @@ mod tests {
         // layout lands (S11), this test is the tripwire that forces a
         // conscious decision rather than a silent behaviour change.
         assert_eq!(page_relpath_for_id("entities/alice"), "entities/alice.md");
-        assert_eq!(page_relpath_for_id("concepts/nl-spec"), "concepts/nl-spec.md");
+        assert_eq!(
+            page_relpath_for_id("concepts/nl-spec"),
+            "concepts/nl-spec.md"
+        );
     }
 
     #[test]
@@ -151,7 +156,10 @@ mod tests {
         // by the opaque token.
         let p = opaque_relpath_for_id("entities/michael-simon", "deadbeef");
         assert_eq!(p, "entities/deadbeef.md");
-        assert!(!p.contains("michael"), "person name must not leak into the path");
+        assert!(
+            !p.contains("michael"),
+            "person name must not leak into the path"
+        );
     }
 
     #[test]
@@ -173,11 +181,16 @@ mod tests {
     fn ensure_skeleton_creates_all_top_dirs_and_wiki_subdirs() {
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
-        for d in [META_DIR, RAW_DIR, WIKI_DIR, DB_DIR, MODELS_DIR, CACHE_DIR, LOGS_DIR] {
+        for d in [
+            META_DIR, RAW_DIR, WIKI_DIR, DB_DIR, MODELS_DIR, CACHE_DIR, LOGS_DIR,
+        ] {
             assert!(tmp.path().join(d).is_dir(), "missing top dir {d}");
         }
         for sub in WIKI_SUBDIRS {
-            assert!(wiki_dir(tmp.path()).join(sub).is_dir(), "missing wiki sub {sub}");
+            assert!(
+                wiki_dir(tmp.path()).join(sub).is_dir(),
+                "missing wiki sub {sub}"
+            );
         }
     }
 
@@ -188,7 +201,12 @@ mod tests {
         // touch a file — must not be deleted on second run
         std::fs::write(wiki_dir(tmp.path()).join("entities").join("keep.md"), "hi").unwrap();
         ensure_skeleton(tmp.path()).unwrap();
-        assert!(wiki_dir(tmp.path()).join("entities").join("keep.md").exists());
+        assert!(
+            wiki_dir(tmp.path())
+                .join("entities")
+                .join("keep.md")
+                .exists()
+        );
     }
 
     #[test]

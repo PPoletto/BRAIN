@@ -22,10 +22,10 @@ use crate::vault::{self, VaultMarker};
 /// the result when it is NOT in the OS temp dir) rather than here,
 /// so this helper stays a pure "is there a marker?" check that's
 /// trivial to test.
-fn find_attached_vault(
-    paths: impl Iterator<Item = PathBuf>,
-) -> Option<PathBuf> {
-    paths.into_iter().find(|p| crate::vault::layout::is_vault(p))
+fn find_attached_vault(paths: impl Iterator<Item = PathBuf>) -> Option<PathBuf> {
+    paths
+        .into_iter()
+        .find(|p| crate::vault::layout::is_vault(p))
 }
 
 /// Returns true when `path` is somewhere inside the OS's temp directory.
@@ -73,13 +73,8 @@ fn is_under_temp_dir(path: &Path) -> bool {
     // keeps the check OS-agnostic.
     let lower = path.to_string_lossy().to_lowercase();
     let normalised = lower.replace('\\', "/");
-    let parts: Vec<&str> = normalised
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .collect();
-    parts
-        .windows(3)
-        .any(|w| w == ["appdata", "local", "temp"])
+    let parts: Vec<&str> = normalised.split('/').filter(|s| !s.is_empty()).collect();
+    parts.windows(3).any(|w| w == ["appdata", "local", "temp"])
 }
 
 use super::disks::{self, DiskInfo};
@@ -164,9 +159,13 @@ pub async fn clone_vault(
         let marker = VaultMarker::new(env!("CARGO_PKG_VERSION"));
         crate::vault::marker::write_marker(&vault, &marker).map_err(|e| e.to_string())?;
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("brain"));
-        if let Err(e) =
-            crate::wiki::sync::clone_and_prepare(&url, pat.as_deref(), &vault, recovery_key.trim(), &exe)
-        {
+        if let Err(e) = crate::wiki::sync::clone_and_prepare(
+            &url,
+            pat.as_deref(),
+            &vault,
+            recovery_key.trim(),
+            &exe,
+        ) {
             // Nothing was stored in the keychain (the canary check runs
             // before that); remove the partial clone so a retry works.
             let _ = std::fs::remove_dir_all(crate::vault::layout::wiki_dir(&vault));
@@ -265,10 +264,7 @@ pub struct BootstrapResult {
 /// vault data on disk is untouched — the user can re-open the same path
 /// later and pick up exactly where they left off.
 #[tauri::command]
-pub fn reset_brain(
-    state: State<Arc<crate::state::AppState>>,
-    app: AppHandle,
-) -> BrainResult<()> {
+pub fn reset_brain(state: State<Arc<crate::state::AppState>>, app: AppHandle) -> BrainResult<()> {
     let _ = lifecycle::unmount(&state, true);
     let _ = mcp_register::unregister_brain_from_supported_clients();
     state.set_db(None);
@@ -486,14 +482,21 @@ fn spawn_bootstrap_background_work(
     spawn_embedder_warm_up(state.clone(), vault.clone());
     // Daily wiki audit → 00_meta/audit/<date>.md (first run shortly after
     // this re-index). Replaces (aborts) the scheduler of a previous mount.
-    state.set_audit_task(Some(crate::wiki::audit::spawn(state.clone(), vault.clone())));
+    state.set_audit_task(Some(crate::wiki::audit::spawn(
+        state.clone(),
+        vault.clone(),
+    )));
 
     std::thread::spawn(move || {
         const OP: &str = "Preparing the vault (index + MCP)";
         state.begin_op(OP);
-        struct OpGuard<'a> { state: &'a crate::state::AppState }
+        struct OpGuard<'a> {
+            state: &'a crate::state::AppState,
+        }
         impl Drop for OpGuard<'_> {
-            fn drop(&mut self) { self.state.end_op(OP); }
+            fn drop(&mut self) {
+                self.state.end_op(OP);
+            }
         }
         let _guard = OpGuard { state: &state };
 
@@ -549,7 +552,10 @@ fn spawn_embedder_warm_up(state: Arc<crate::state::AppState>, vault: PathBuf) {
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = guard;
         let embedder = crate::embedding::cached_for_vault(&vault);
-        tracing::info!(embedder = embedder.name(), "embedding model warm-up finished");
+        tracing::info!(
+            embedder = embedder.name(),
+            "embedding model warm-up finished"
+        );
     });
 }
 
@@ -666,9 +672,7 @@ mod tests {
         // 8.3 short-name form pointing into Local\Temp\ for a stale user.
         // The path no longer exists on disk, so canonicalize() can't
         // help. The component-pattern heuristic must still flag it.
-        let stale = PathBuf::from(
-            r"C:\Users\PASCAL~1.POL\AppData\Local\Temp\.tmp2oZT2Y",
-        );
+        let stale = PathBuf::from(r"C:\Users\PASCAL~1.POL\AppData\Local\Temp\.tmp2oZT2Y");
         assert!(
             is_under_temp_dir(&stale),
             "stale Windows AppData\\Local\\Temp path must be flagged"
@@ -683,9 +687,7 @@ mod tests {
         // split on `\` — without explicit separator-normalisation the
         // earlier all-backslash test passed only on Windows. Asserting
         // the forward-slash form locks in the cross-platform contract.
-        let stale = PathBuf::from(
-            "C:/Users/PASCAL~1.POL/AppData/Local/Temp/.tmp2oZT2Y",
-        );
+        let stale = PathBuf::from("C:/Users/PASCAL~1.POL/AppData/Local/Temp/.tmp2oZT2Y");
         assert!(
             is_under_temp_dir(&stale),
             "stale AppData/Local/Temp path with forward slashes must also be flagged"
@@ -701,8 +703,7 @@ mod tests {
         assert!(none);
 
         let nonexistent = find_attached_vault(
-            vec![PathBuf::from("D:/never-existed"), PathBuf::from("/tmp/no")]
-                .into_iter(),
+            vec![PathBuf::from("D:/never-existed"), PathBuf::from("/tmp/no")].into_iter(),
         );
         assert!(nonexistent.is_none());
     }
@@ -714,7 +715,7 @@ mod tests {
         // it via the marker file and returns its mount path so the
         // caller can mount + persist.
         use crate::vault::layout::ensure_skeleton;
-        use crate::vault::marker::{write_marker, VaultMarker};
+        use crate::vault::marker::{VaultMarker, write_marker};
         let with_vault = tempfile::TempDir::new().unwrap();
         ensure_skeleton(with_vault.path()).unwrap();
         write_marker(with_vault.path(), &VaultMarker::new("test")).unwrap();

@@ -63,9 +63,7 @@ pub fn spawn<R: Runtime>(app: AppHandle<R>, state: Arc<AppState>) {
                         }),
                     );
                     last_tag = String::new();
-                } else if let Some(path) =
-                    crate::mount::lifecycle::try_auto_reconnect(&state)
-                {
+                } else if let Some(path) = crate::mount::lifecycle::try_auto_reconnect(&state) {
                     // Disk is back online. `try_auto_reconnect` already
                     // ran `mount_source` (which sets state +
                     // vault_path); we still need to (re-)open the DB,
@@ -121,11 +119,7 @@ pub fn spawn<R: Runtime>(app: AppHandle<R>, state: Arc<AppState>) {
 /// helper just flips the in-memory mount state; this puts the rest of
 /// the app's state machinery back into "mounted" mode the same way
 /// `bootstrap_app` and `finish_onboarding` do.
-fn finish_auto_reconnect<R: Runtime>(
-    app: &AppHandle<R>,
-    state: &Arc<AppState>,
-    path: PathBuf,
-) {
+fn finish_auto_reconnect<R: Runtime>(app: &AppHandle<R>, state: &Arc<AppState>, path: PathBuf) {
     if let Ok(db) = crate::db::DbHandle::open(&path) {
         state.set_db(Some(db));
     }
@@ -139,8 +133,8 @@ fn finish_auto_reconnect<R: Runtime>(
     let path_for_register = path.clone();
     let app_for_register = app.clone();
     let state_for_register = state.clone();
-    std::thread::spawn(move || {
-        match crate::mcp::registration::register_brain_in_supported_clients(
+    std::thread::spawn(
+        move || match crate::mcp::registration::register_brain_in_supported_clients(
             &path_for_register,
         ) {
             Ok(report) => {
@@ -150,8 +144,8 @@ fn finish_auto_reconnect<R: Runtime>(
             Err(err) => {
                 tracing::warn!(?err, "MCP re-registration on auto-reconnect failed");
             }
-        }
-    });
+        },
+    );
 
     // Background pages-index rebuild — same pattern as bootstrap_app,
     // so the user sees the viewer immediately and any indexing work
@@ -162,9 +156,17 @@ fn finish_auto_reconnect<R: Runtime>(
     std::thread::spawn(move || {
         const OP: &str = "Rebuilding the index";
         state_for_rebuild.begin_op(OP);
-        struct Guard<'a> { s: &'a AppState }
-        impl Drop for Guard<'_> { fn drop(&mut self) { self.s.end_op(OP); } }
-        let _g = Guard { s: &state_for_rebuild };
+        struct Guard<'a> {
+            s: &'a AppState,
+        }
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.s.end_op(OP);
+            }
+        }
+        let _g = Guard {
+            s: &state_for_rebuild,
+        };
         if let Some(db) = state_for_rebuild.db() {
             let progress =
                 |done: usize, total: usize| state_for_rebuild.set_op_progress(OP, done, total);

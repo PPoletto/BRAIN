@@ -9,12 +9,10 @@ use minisign_verify::{PublicKey, Signature};
 use super::{UpdateError, UpdateResult};
 
 pub fn verify_bundle(public_key: &str, bundle: &[u8], signature: &str) -> UpdateResult<()> {
-    let pk = PublicKey::decode(public_key).map_err(|err| {
-        UpdateError::Network(format!("invalid embedded public key: {err}"))
-    })?;
-    let sig = Signature::decode(signature).map_err(|err| {
-        UpdateError::Network(format!("invalid signature encoding: {err}"))
-    })?;
+    let pk = PublicKey::decode(public_key)
+        .map_err(|err| UpdateError::Network(format!("invalid embedded public key: {err}")))?;
+    let sig = Signature::decode(signature)
+        .map_err(|err| UpdateError::Network(format!("invalid signature encoding: {err}")))?;
     pk.verify(bundle, &sig, false)
         .map_err(|_| UpdateError::SignatureMismatch)
 }

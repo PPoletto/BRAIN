@@ -6,8 +6,8 @@ pub mod layout;
 pub mod marker;
 pub mod settings;
 
-pub use layout::{ensure_skeleton, is_vault, BRAIN_MARKER_FILENAME, MCP_CONFIG_FILENAME};
-pub use marker::{read_marker, write_marker, VaultMarker, BRAIN_FORMAT_V1};
+pub use layout::{BRAIN_MARKER_FILENAME, MCP_CONFIG_FILENAME, ensure_skeleton, is_vault};
+pub use marker::{BRAIN_FORMAT_V1, VaultMarker, read_marker, write_marker};
 
 use std::path::PathBuf;
 use thiserror::Error;

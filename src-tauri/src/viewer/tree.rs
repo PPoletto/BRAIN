@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::vault::layout::{wiki_dir, WIKI_SUBDIRS};
+use crate::vault::layout::{WIKI_SUBDIRS, wiki_dir};
 use crate::wiki::page::parse;
 
 use super::{ViewerError, ViewerResult};
@@ -87,8 +87,8 @@ pub fn read_page(vault: &Path, id: &str) -> ViewerResult<PageView> {
         .title
         .clone()
         .unwrap_or_else(|| id.to_string());
-    let frontmatter_json = serde_json::to_string_pretty(&parsed.frontmatter)
-        .unwrap_or_else(|_| String::new());
+    let frontmatter_json =
+        serde_json::to_string_pretty(&parsed.frontmatter).unwrap_or_else(|_| String::new());
     Ok(PageView {
         id: id.to_string(),
         title,

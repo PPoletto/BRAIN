@@ -73,7 +73,10 @@ pub fn append_log(vault: &Path, entry: &LogEntry) -> MetaFilesResult<()> {
         let lines: Vec<&str> = existing.lines().collect();
         let keep_from = lines.len() / 10;
         let kept = lines[keep_from..].join("\n");
-        std::fs::write(&target, format!("# Brain Log — append-only, do not edit\n\n{kept}\n"))?;
+        std::fs::write(
+            &target,
+            format!("# Brain Log — append-only, do not edit\n\n{kept}\n"),
+        )?;
     } else {
         std::fs::write(&target, existing)?;
     }

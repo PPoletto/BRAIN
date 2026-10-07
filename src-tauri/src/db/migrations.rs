@@ -119,7 +119,8 @@ pub fn apply(conn: &Connection) -> DbResult<()> {
         // One IMMEDIATE transaction: a second process (GUI + MCP server
         // open the same file) waits instead of racing the column probes,
         // and a failure leaves the version at 4 with nothing half-applied.
-        let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
         // A2 aliases, C validity/provenance, H3 salience.
         //  - `page_aliases` / `page_sources` and the three `pages`
         //    columns are derived from the frontmatter by `pages_index`
@@ -160,7 +161,8 @@ pub fn apply(conn: &Connection) -> DbResult<()> {
     }
     if current < 6 {
         // Same single-IMMEDIATE-transaction pattern as v5.
-        let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
         apply_v6(&tx)?;
         tx.execute(
             "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('version', '6')",
@@ -169,7 +171,8 @@ pub fn apply(conn: &Connection) -> DbResult<()> {
         tx.commit()?;
     }
     if current < 7 {
-        let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
         apply_v7(&tx)?;
         tx.execute(
             "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('version', '7')",
@@ -361,7 +364,10 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         let wanted = ["valid_from", "valid_to", "superseded_by"];
-        assert!(wanted.iter().all(|w| cols.iter().any(|c| c == w)), "columns: {cols:?}");
+        assert!(
+            wanted.iter().all(|w| cols.iter().any(|c| c == w)),
+            "columns: {cols:?}"
+        );
     }
 
     #[test]
@@ -383,8 +389,11 @@ mod tests {
     fn re_running_the_v5_migration_on_a_v5_schema_succeeds() {
         let conn = Connection::open_in_memory().unwrap();
         apply(&conn).unwrap();
-        conn.execute("UPDATE schema_meta SET value = '4' WHERE key = 'version'", [])
-            .unwrap();
+        conn.execute(
+            "UPDATE schema_meta SET value = '4' WHERE key = 'version'",
+            [],
+        )
+        .unwrap();
         assert!(apply(&conn).is_ok());
     }
 
@@ -399,7 +408,11 @@ mod tests {
         .unwrap();
         apply(&conn).unwrap();
         let ids: i64 = conn
-            .query_row("SELECT count(*) FROM pages WHERE valid_to IS NULL", [], |row| row.get(0))
+            .query_row(
+                "SELECT count(*) FROM pages WHERE valid_to IS NULL",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(ids, 1);
     }
@@ -419,21 +432,32 @@ mod tests {
         apply(&conn).unwrap();
         let cols = columns_of(&conn, "pages");
         let wanted = ["summary", "body_hash", "summary_body_hash"];
-        assert!(wanted.iter().all(|w| cols.iter().any(|c| c == w)), "columns: {cols:?}");
+        assert!(
+            wanted.iter().all(|w| cols.iter().any(|c| c == w)),
+            "columns: {cols:?}"
+        );
     }
 
     #[test]
     fn apply_v6_gives_the_fts_table_a_summary_column() {
         let conn = Connection::open_in_memory().unwrap();
         apply(&conn).unwrap();
-        assert!(columns_of(&conn, "pages_fts").iter().any(|c| c == "summary"));
+        assert!(
+            columns_of(&conn, "pages_fts")
+                .iter()
+                .any(|c| c == "summary")
+        );
     }
 
     #[test]
     fn apply_v6_creates_the_page_vectors_table() {
         let conn = Connection::open_in_memory().unwrap();
         apply(&conn).unwrap();
-        assert!(columns_of(&conn, "page_vectors").iter().any(|c| c == "embedding"));
+        assert!(
+            columns_of(&conn, "page_vectors")
+                .iter()
+                .any(|c| c == "embedding")
+        );
     }
 
     #[test]
@@ -465,7 +489,11 @@ mod tests {
     fn apply_v7_adds_the_summary_indexed_hash_column_to_pages() {
         let conn = Connection::open_in_memory().unwrap();
         apply(&conn).unwrap();
-        assert!(columns_of(&conn, "pages").iter().any(|c| c == "summary_indexed_hash"));
+        assert!(
+            columns_of(&conn, "pages")
+                .iter()
+                .any(|c| c == "summary_indexed_hash")
+        );
     }
 
     #[test]
@@ -479,7 +507,9 @@ mod tests {
         .unwrap();
         apply(&conn).unwrap();
         let hash: Option<String> = conn
-            .query_row("SELECT summary_indexed_hash FROM pages", [], |row| row.get(0))
+            .query_row("SELECT summary_indexed_hash FROM pages", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(hash.as_deref(), Some("h1"));
     }

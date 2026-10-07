@@ -118,7 +118,7 @@ pub fn looks_like_brain_source(path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::vault::layout::ensure_skeleton;
-    use crate::vault::marker::{write_marker, VaultMarker};
+    use crate::vault::marker::{VaultMarker, write_marker};
     use tempfile::TempDir;
 
     #[test]

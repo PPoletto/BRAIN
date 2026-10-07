@@ -64,12 +64,12 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Transaction, TransactionBehavior};
+use rusqlite::{Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
-use crate::embedding::{chunk as chunker, vec_to_bytes, Embedder};
-use crate::vault::layout::{wiki_dir, WIKI_SUBDIRS};
-use crate::wiki::page::{parse, ParsedPage};
+use crate::embedding::{Embedder, chunk as chunker, vec_to_bytes};
+use crate::vault::layout::{WIKI_SUBDIRS, wiki_dir};
+use crate::wiki::page::{ParsedPage, parse};
 
 use super::{DbHandle, DbResult};
 
@@ -291,9 +291,8 @@ fn rebuild_batched<E: Embedder + ?Sized>(
         }
 
         // 2. Which pages can take the fast path? Short lock.
-        let unchanged: Vec<bool> = db.with(|conn| {
-            prepared.iter().map(|p| is_unchanged(conn, p)).collect()
-        })?;
+        let unchanged: Vec<bool> =
+            db.with(|conn| prepared.iter().map(|p| is_unchanged(conn, p)).collect())?;
 
         // 3. Embed the changed pages, no lock held.
         let writes: Vec<PageWrite> = prepared
@@ -350,7 +349,10 @@ fn rebuild_batched<E: Embedder + ?Sized>(
         }
         write_meta(&tx, VERSION_KEY, &INDEX_FORMAT_VERSION.to_string())?;
         write_meta(&tx, META_VERSION_KEY, &META_FORMAT_VERSION.to_string())?;
-        tx.execute("DELETE FROM schema_meta WHERE key = ?1", params![PENDING_KEY])?;
+        tx.execute(
+            "DELETE FROM schema_meta WHERE key = ?1",
+            params![PENDING_KEY],
+        )?;
         tx.commit()?;
         Ok(())
     })
@@ -665,7 +667,11 @@ fn write_page(
 
 /// Replace the `page_vectors` row of `id` (H1): the L2-normalised mean
 /// of its chunk vectors, or no row when the page has no usable vector.
-fn store_page_vector(conn: &rusqlite::Connection, id: &str, vector: Option<Vec<f32>>) -> DbResult<()> {
+fn store_page_vector(
+    conn: &rusqlite::Connection,
+    id: &str,
+    vector: Option<Vec<f32>>,
+) -> DbResult<()> {
     conn.execute("DELETE FROM page_vectors WHERE page_id = ?1", params![id])?;
     if let Some(v) = vector {
         conn.execute(
@@ -818,7 +824,11 @@ pub const PAGE_ACCESS_GC_DAYS: i64 = 30;
 /// for a while (moved out and back, a sync in progress, an interrupted
 /// rebuild) keeps its counts; the rebuild's prune step never touches
 /// `page_access`. Rows never read (`last_read_at` NULL) count as old.
-pub fn gc_page_access(conn: &rusqlite::Connection, absent_for_days: i64, now_unix: i64) -> DbResult<usize> {
+pub fn gc_page_access(
+    conn: &rusqlite::Connection,
+    absent_for_days: i64,
+    now_unix: i64,
+) -> DbResult<usize> {
     let cutoff = now_unix - absent_for_days * 24 * 60 * 60;
     let n = conn.execute(
         "DELETE FROM page_access \
@@ -918,7 +928,13 @@ mod tests {
     fn rebuild_indexes_pages_into_sqlite_with_fts5_searchable_body() {
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
-        write_page(tmp.path(), "entities", "alice", "Alice talks about NLSpec.", &["spec"]);
+        write_page(
+            tmp.path(),
+            "entities",
+            "alice",
+            "Alice talks about NLSpec.",
+            &["spec"],
+        );
         let db = DbHandle::open(tmp.path()).unwrap();
         rebuild(&db, tmp.path()).unwrap();
         db.with(|conn| {
@@ -978,9 +994,8 @@ mod tests {
     /// `chunk_vectors`, counted via the vector rowids that no longer have
     /// a chunk, when sqlite-vec is loaded).
     fn leftover_rows(conn: &rusqlite::Connection, id: &str) -> i64 {
-        let count = |sql: &str| -> i64 {
-            conn.query_row(sql, params![id], |row| row.get(0)).unwrap()
-        };
+        let count =
+            |sql: &str| -> i64 { conn.query_row(sql, params![id], |row| row.get(0)).unwrap() };
         let mut total = count("SELECT count(*) FROM pages_fts WHERE id = ?1")
             + count("SELECT count(*) FROM chunks WHERE page_id = ?1")
             + count("SELECT count(*) FROM page_tags WHERE page_id = ?1")
@@ -1006,7 +1021,13 @@ mod tests {
     fn forget_pages_leaves_no_fts_chunk_tag_link_or_vector_rows_for_the_id() {
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
-        write_page(tmp.path(), "entities", "alice", "Alice links [[entities/bob]].", &["t"]);
+        write_page(
+            tmp.path(),
+            "entities",
+            "alice",
+            "Alice links [[entities/bob]].",
+            &["t"],
+        );
         write_page(tmp.path(), "entities", "bob", "y", &[]);
         let db = DbHandle::open(tmp.path()).unwrap();
         rebuild(&db, tmp.path()).unwrap();
@@ -1024,7 +1045,13 @@ mod tests {
     fn rebuild_marks_outbound_links_to_missing_pages_as_broken() {
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
-        write_page(tmp.path(), "entities", "alice", "see [[entities/missing]]", &[]);
+        write_page(
+            tmp.path(),
+            "entities",
+            "alice",
+            "see [[entities/missing]]",
+            &[],
+        );
         let db = DbHandle::open(tmp.path()).unwrap();
         rebuild(&db, tmp.path()).unwrap();
         db.with(|conn| {
@@ -1075,8 +1102,12 @@ mod tests {
             calls: AtomicUsize,
         }
         impl Embedder for CountingEmbedder {
-            fn dim(&self) -> usize { crate::embedding::EMBED_DIM }
-            fn name(&self) -> &'static str { "counting" }
+            fn dim(&self) -> usize {
+                crate::embedding::EMBED_DIM
+            }
+            fn name(&self) -> &'static str {
+                "counting"
+            }
             fn embed(&self, _text: &str) -> Vec<f32> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 vec![0.0; crate::embedding::EMBED_DIM]
@@ -1089,7 +1120,9 @@ mod tests {
         write_page(tmp.path(), "concepts", "nlspec", "NLSpec body.", &[]);
         let db = DbHandle::open(tmp.path()).unwrap();
 
-        let embedder = CountingEmbedder { calls: AtomicUsize::new(0) };
+        let embedder = CountingEmbedder {
+            calls: AtomicUsize::new(0),
+        };
         rebuild_with(&db, tmp.path(), &embedder).unwrap();
         let first_run = embedder.calls.load(Ordering::SeqCst);
         assert!(
@@ -1101,7 +1134,8 @@ mod tests {
         rebuild_with(&db, tmp.path(), &embedder).unwrap();
         let second_run = embedder.calls.load(Ordering::SeqCst);
         assert_eq!(
-            second_run, first_run,
+            second_run,
+            first_run,
             "rebuild over unchanged vault re-embedded ({} new calls)",
             second_run - first_run
         );
@@ -1117,10 +1151,16 @@ mod tests {
         use crate::embedding::Embedder;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        struct CountingEmbedder { calls: AtomicUsize }
+        struct CountingEmbedder {
+            calls: AtomicUsize,
+        }
         impl Embedder for CountingEmbedder {
-            fn dim(&self) -> usize { crate::embedding::EMBED_DIM }
-            fn name(&self) -> &'static str { "counting" }
+            fn dim(&self) -> usize {
+                crate::embedding::EMBED_DIM
+            }
+            fn name(&self) -> &'static str {
+                "counting"
+            }
             fn embed(&self, _t: &str) -> Vec<f32> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 vec![0.0; crate::embedding::EMBED_DIM]
@@ -1131,7 +1171,9 @@ mod tests {
         ensure_skeleton(tmp.path()).unwrap();
         write_page(tmp.path(), "entities", "alice", "body", &[]);
         let db = DbHandle::open(tmp.path()).unwrap();
-        let embedder = CountingEmbedder { calls: AtomicUsize::new(0) };
+        let embedder = CountingEmbedder {
+            calls: AtomicUsize::new(0),
+        };
 
         rebuild_with(&db, tmp.path(), &embedder).unwrap();
         let baseline = embedder.calls.load(Ordering::SeqCst);
@@ -1164,10 +1206,16 @@ mod tests {
         use crate::embedding::Embedder;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        struct CountingEmbedder { calls: AtomicUsize }
+        struct CountingEmbedder {
+            calls: AtomicUsize,
+        }
         impl Embedder for CountingEmbedder {
-            fn dim(&self) -> usize { crate::embedding::EMBED_DIM }
-            fn name(&self) -> &'static str { "counting" }
+            fn dim(&self) -> usize {
+                crate::embedding::EMBED_DIM
+            }
+            fn name(&self) -> &'static str {
+                "counting"
+            }
             fn embed(&self, _text: &str) -> Vec<f32> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 vec![0.0; crate::embedding::EMBED_DIM]
@@ -1180,7 +1228,9 @@ mod tests {
         write_page(tmp.path(), "concepts", "nlspec", "Untouched.", &[]);
         let db = DbHandle::open(tmp.path()).unwrap();
 
-        let embedder = CountingEmbedder { calls: AtomicUsize::new(0) };
+        let embedder = CountingEmbedder {
+            calls: AtomicUsize::new(0),
+        };
         rebuild_with(&db, tmp.path(), &embedder).unwrap();
         let initial = embedder.calls.load(Ordering::SeqCst);
 
@@ -1208,15 +1258,21 @@ mod tests {
     }
     impl RecordingEmbedder {
         fn new() -> Self {
-            Self { inputs: std::sync::Mutex::new(Vec::new()) }
+            Self {
+                inputs: std::sync::Mutex::new(Vec::new()),
+            }
         }
         fn count(&self) -> usize {
             self.inputs.lock().unwrap().len()
         }
     }
     impl crate::embedding::Embedder for RecordingEmbedder {
-        fn dim(&self) -> usize { crate::embedding::EMBED_DIM }
-        fn name(&self) -> &'static str { "recording" }
+        fn dim(&self) -> usize {
+            crate::embedding::EMBED_DIM
+        }
+        fn name(&self) -> &'static str {
+            "recording"
+        }
         fn embed(&self, text: &str) -> Vec<f32> {
             self.inputs.lock().unwrap().push(text.to_string());
             vec![0.0; crate::embedding::EMBED_DIM]
@@ -1240,9 +1296,12 @@ the contract renews for 12 months";
         let inputs = embedder.inputs.lock().unwrap().clone();
         assert_eq!(
             inputs,
-            vec!["T (entity) › Vertrag › Laufzeit
+            vec![
+                "T (entity) › Vertrag › Laufzeit
 
-the contract renews for 12 months".to_string()]
+the contract renews for 12 months"
+                    .to_string()
+            ]
         );
     }
 
@@ -1262,7 +1321,10 @@ the contract renews for 12 months".to_string()]
                 Ok(rows)
             })
             .unwrap();
-        assert_eq!(stored, vec!["the contract renews for 12 months".to_string()]);
+        assert_eq!(
+            stored,
+            vec!["the contract renews for 12 months".to_string()]
+        );
     }
 
     /// Upgrade path: an index written by the pre-contextual indexer (format
@@ -1312,8 +1374,12 @@ the contract renews for 12 months".to_string()]
         fail_on: &'static str,
     }
     impl crate::embedding::Embedder for FailingEmbedder {
-        fn dim(&self) -> usize { crate::embedding::EMBED_DIM }
-        fn name(&self) -> &'static str { "failing" }
+        fn dim(&self) -> usize {
+            crate::embedding::EMBED_DIM
+        }
+        fn name(&self) -> &'static str {
+            "failing"
+        }
         fn embed(&self, text: &str) -> Vec<f32> {
             assert!(!text.contains(self.fail_on), "simulated embedder failure");
             vec![0.0; crate::embedding::EMBED_DIM]
@@ -1336,11 +1402,16 @@ the contract renews for 12 months".to_string()]
     /// Runs a rebuild that dies on page 70 (second batch of 50). The
     /// panic happens while embedding, i.e. with the connection unlocked.
     fn interrupted_rebuild(db: &DbHandle, vault: &Path) {
-        let failing = FailingEmbedder { fail_on: "page-070" };
+        let failing = FailingEmbedder {
+            fail_on: "page-070",
+        };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             rebuild_with(db, vault, &failing)
         }));
-        assert!(outcome.is_err(), "the failing embedder must abort the rebuild");
+        assert!(
+            outcome.is_err(),
+            "the failing embedder must abort the rebuild"
+        );
     }
 
     #[test]
@@ -1359,8 +1430,14 @@ the contract renews for 12 months".to_string()]
                 .unwrap();
             visible.lock().unwrap().push(pages);
         };
-        rebuild_with_batches(&db, tmp.path(), &RecordingEmbedder::new(), 50, Some(&progress))
-            .unwrap();
+        rebuild_with_batches(
+            &db,
+            tmp.path(),
+            &RecordingEmbedder::new(),
+            50,
+            Some(&progress),
+        )
+        .unwrap();
         assert_eq!(*visible.lock().unwrap(), vec![50, 100, 120]);
     }
 
@@ -1372,9 +1449,18 @@ the contract renews for 12 months".to_string()]
         let db = DbHandle::open(tmp.path()).unwrap();
         let reports = std::sync::Mutex::new(Vec::new());
         let progress = |done: usize, total: usize| reports.lock().unwrap().push((done, total));
-        rebuild_with_batches(&db, tmp.path(), &RecordingEmbedder::new(), 50, Some(&progress))
-            .unwrap();
-        assert_eq!(*reports.lock().unwrap(), vec![(50, 120), (100, 120), (120, 120)]);
+        rebuild_with_batches(
+            &db,
+            tmp.path(),
+            &RecordingEmbedder::new(),
+            50,
+            Some(&progress),
+        )
+        .unwrap();
+        assert_eq!(
+            *reports.lock().unwrap(),
+            vec![(50, 120), (100, 120), (120, 120)]
+        );
     }
 
     #[test]
@@ -1437,11 +1523,11 @@ the contract renews for 12 months".to_string()]
         rebuild_with(&db, tmp.path(), &RecordingEmbedder::new()).unwrap();
         let pages_with_chunks: i64 = db
             .with(|conn| {
-                Ok(conn.query_row(
-                    "SELECT count(DISTINCT page_id) FROM chunks",
-                    [],
-                    |r| r.get(0),
-                )?)
+                Ok(
+                    conn.query_row("SELECT count(DISTINCT page_id) FROM chunks", [], |r| {
+                        r.get(0)
+                    })?,
+                )
             })
             .unwrap();
         assert_eq!(pages_with_chunks, 120);
@@ -1502,8 +1588,14 @@ the contract renews for 12 months".to_string()]
             }
         };
         db.with(invalidate_all_pages).unwrap();
-        rebuild_with_batches(&db, tmp.path(), &RecordingEmbedder::new(), 50, Some(&progress))
-            .unwrap();
+        rebuild_with_batches(
+            &db,
+            tmp.path(),
+            &RecordingEmbedder::new(),
+            50,
+            Some(&progress),
+        )
+        .unwrap();
         let pages: i64 = db
             .with(|conn| Ok(conn.query_row("SELECT count(*) FROM pages", [], |r| r.get(0))?))
             .unwrap();
@@ -1532,8 +1624,12 @@ the contract renews for 12 months".to_string()]
     /// Fake embedder with a chosen name (e.g. "bge-m3").
     struct NamedEmbedder(&'static str);
     impl crate::embedding::Embedder for NamedEmbedder {
-        fn dim(&self) -> usize { crate::embedding::EMBED_DIM }
-        fn name(&self) -> &'static str { self.0 }
+        fn dim(&self) -> usize {
+            crate::embedding::EMBED_DIM
+        }
+        fn name(&self) -> &'static str {
+            self.0
+        }
         fn embed(&self, _text: &str) -> Vec<f32> {
             vec![0.0; crate::embedding::EMBED_DIM]
         }
@@ -1558,7 +1654,10 @@ the contract renews for 12 months".to_string()]
         rebuild_with(&db, tmp.path(), &NamedEmbedder("hashed-fh-1024")).unwrap();
         write_page(tmp.path(), "entities", "page-001", "Edited body.", &[]);
         rebuild_with(&db, tmp.path(), &NamedEmbedder("bge-m3")).unwrap();
-        assert_eq!(stored_meta(&db, EMBEDDER_KEY), Some(MIXED_EMBEDDERS.to_string()));
+        assert_eq!(
+            stored_meta(&db, EMBEDDER_KEY),
+            Some(MIXED_EMBEDDERS.to_string())
+        );
     }
 
     #[test]
@@ -1602,7 +1701,13 @@ the contract renews for 12 months".to_string()]
     fn a_link_to_a_heading_is_indexed_as_a_link_to_the_page() {
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
-        write_page(tmp.path(), "entities", "alice", "see [[entities/bob#Contract]]", &[]);
+        write_page(
+            tmp.path(),
+            "entities",
+            "alice",
+            "see [[entities/bob#Contract]]",
+            &[],
+        );
         write_page(tmp.path(), "entities", "bob", "hi", &[]);
         let db = DbHandle::open(tmp.path()).unwrap();
         rebuild_with(&db, tmp.path(), &RecordingEmbedder::new()).unwrap();
@@ -1613,15 +1718,23 @@ the contract renews for 12 months".to_string()]
     fn a_link_to_a_heading_of_an_existing_page_is_not_marked_broken() {
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
-        write_page(tmp.path(), "entities", "alice", "see [[entities/bob#Contract]]", &[]);
+        write_page(
+            tmp.path(),
+            "entities",
+            "alice",
+            "see [[entities/bob#Contract]]",
+            &[],
+        );
         write_page(tmp.path(), "entities", "bob", "hi", &[]);
         let db = DbHandle::open(tmp.path()).unwrap();
         rebuild_with(&db, tmp.path(), &RecordingEmbedder::new()).unwrap();
         let broken: i64 = db
             .with(|conn| {
-                Ok(conn.query_row("SELECT count(*) FROM wiki_links WHERE broken = 1", [], |r| {
-                    r.get(0)
-                })?)
+                Ok(conn.query_row(
+                    "SELECT count(*) FROM wiki_links WHERE broken = 1",
+                    [],
+                    |r| r.get(0),
+                )?)
             })
             .unwrap();
         assert_eq!(broken, 0);
@@ -1631,14 +1744,22 @@ the contract renews for 12 months".to_string()]
     fn indexing_a_heading_link_leaves_the_page_text_untouched() {
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
-        write_page(tmp.path(), "entities", "alice", "see [[entities/bob#Contract]]", &[]);
+        write_page(
+            tmp.path(),
+            "entities",
+            "alice",
+            "see [[entities/bob#Contract]]",
+            &[],
+        );
         let db = DbHandle::open(tmp.path()).unwrap();
         rebuild_with(&db, tmp.path(), &RecordingEmbedder::new()).unwrap();
         let body: String = db
             .with(|conn| {
-                Ok(conn.query_row("SELECT body FROM pages WHERE id = 'entities/alice'", [], |r| {
-                    r.get(0)
-                })?)
+                Ok(conn.query_row(
+                    "SELECT body FROM pages WHERE id = 'entities/alice'",
+                    [],
+                    |r| r.get(0),
+                )?)
             })
             .unwrap();
         assert!(body.contains("[[entities/bob#Contract]]"), "{body}");
@@ -1673,7 +1794,11 @@ the contract renews for 12 months".to_string()]
         let id = id.to_string();
         db.with(move |conn| {
             Ok(conn
-                .query_row("SELECT reads FROM page_access WHERE page_id = ?1", params![id], |r| r.get(0))
+                .query_row(
+                    "SELECT reads FROM page_access WHERE page_id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
                 .unwrap_or(0))
         })
         .unwrap()
@@ -1683,11 +1808,18 @@ the contract renews for 12 months".to_string()]
     fn rebuild_indexes_the_aliases_of_a_page() {
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
-        write_page_with(tmp.path(), "entities/acme", "aliases: [ACME Corp, Acme Inc]\n");
+        write_page_with(
+            tmp.path(),
+            "entities/acme",
+            "aliases: [ACME Corp, Acme Inc]\n",
+        );
         let db = DbHandle::open(tmp.path()).unwrap();
         rebuild(&db, tmp.path()).unwrap();
         assert_eq!(
-            strings(&db, "SELECT alias FROM page_aliases WHERE page_id = 'entities/acme' ORDER BY alias"),
+            strings(
+                &db,
+                "SELECT alias FROM page_aliases WHERE page_id = 'entities/acme' ORDER BY alias"
+            ),
             vec!["ACME Corp", "Acme Inc"]
         );
     }
@@ -1696,7 +1828,11 @@ the contract renews for 12 months".to_string()]
     fn rebuild_indexes_the_sources_of_a_page() {
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
-        write_page_with(tmp.path(), "entities/acme", "sources: [sources/a, \"[[sources/b]]\"]\n");
+        write_page_with(
+            tmp.path(),
+            "entities/acme",
+            "sources: [sources/a, \"[[sources/b]]\"]\n",
+        );
         let db = DbHandle::open(tmp.path()).unwrap();
         rebuild(&db, tmp.path()).unwrap();
         assert_eq!(
@@ -1732,7 +1868,8 @@ the contract renews for 12 months".to_string()]
         write_page(tmp.path(), "entities", "alice", "x", &[]);
         let db = DbHandle::open(tmp.path()).unwrap();
         rebuild(&db, tmp.path()).unwrap();
-        db.with(|conn| record_reads(conn, &["entities/alice".to_string()], 1)).unwrap();
+        db.with(|conn| record_reads(conn, &["entities/alice".to_string()], 1))
+            .unwrap();
         db.with(invalidate_all_pages).unwrap();
         rebuild(&db, tmp.path()).unwrap();
         assert_eq!(reads_of(&db, "entities/alice"), 1);
@@ -1746,7 +1883,8 @@ the contract renews for 12 months".to_string()]
         let db = DbHandle::open(tmp.path()).unwrap();
         rebuild(&db, tmp.path()).unwrap();
         let now = chrono::Utc::now().timestamp();
-        db.with(|conn| record_reads(conn, &["entities/alice".to_string()], now)).unwrap();
+        db.with(|conn| record_reads(conn, &["entities/alice".to_string()], now))
+            .unwrap();
         std::fs::remove_file(wiki_dir(tmp.path()).join("entities/alice.md")).unwrap();
         rebuild(&db, tmp.path()).unwrap();
         assert_eq!(reads_of(&db, "entities/alice"), 1);
@@ -1760,7 +1898,8 @@ the contract renews for 12 months".to_string()]
         let db = DbHandle::open(tmp.path()).unwrap();
         rebuild(&db, tmp.path()).unwrap();
         let long_ago = chrono::Utc::now().timestamp() - 31 * 24 * 60 * 60;
-        db.with(|conn| record_reads(conn, &["entities/alice".to_string()], long_ago)).unwrap();
+        db.with(|conn| record_reads(conn, &["entities/alice".to_string()], long_ago))
+            .unwrap();
         std::fs::remove_file(wiki_dir(tmp.path()).join("entities/alice.md")).unwrap();
         rebuild(&db, tmp.path()).unwrap();
         assert_eq!(reads_of(&db, "entities/alice"), 0);
@@ -1808,7 +1947,11 @@ the contract renews for 12 months".to_string()]
         let db = DbHandle::open(tmp.path()).unwrap();
         db.with(|conn| {
             record_reads(conn, &["entities/a".to_string()], 5)?;
-            record_reads(conn, &["entities/b".to_string(), "entities/b".to_string()], 9)?;
+            record_reads(
+                conn,
+                &["entities/b".to_string(), "entities/b".to_string()],
+                9,
+            )?;
             carry_page_access(conn, "entities/a", "entities/b")
         })
         .unwrap();
@@ -1822,7 +1965,10 @@ the contract renews for 12 months".to_string()]
         rebuild(db, tmp.path()).unwrap();
         db.with(|conn| {
             conn.execute("DELETE FROM page_aliases", [])?;
-            conn.execute("DELETE FROM schema_meta WHERE key = ?1", params![META_VERSION_KEY])?;
+            conn.execute(
+                "DELETE FROM schema_meta WHERE key = ?1",
+                params![META_VERSION_KEY],
+            )?;
             Ok(())
         })
         .unwrap();
@@ -1835,7 +1981,10 @@ the contract renews for 12 months".to_string()]
         let db = DbHandle::open(tmp.path()).unwrap();
         index_without_metadata(&tmp, &db);
         rebuild(&db, tmp.path()).unwrap();
-        assert_eq!(strings(&db, "SELECT alias FROM page_aliases"), vec!["ACME Corp"]);
+        assert_eq!(
+            strings(&db, "SELECT alias FROM page_aliases"),
+            vec!["ACME Corp"]
+        );
     }
 
     #[test]
@@ -1855,19 +2004,29 @@ the contract renews for 12 months".to_string()]
     fn rebuild_embeds_a_page_with_a_summary_with_the_summary_in_the_context_header() {
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
-        write_page_with(tmp.path(), "entities/acme", "summary: Customer since 2024.\n");
+        write_page_with(
+            tmp.path(),
+            "entities/acme",
+            "summary: Customer since 2024.\n",
+        );
         let db = DbHandle::open(tmp.path()).unwrap();
         let embedder = RecordingEmbedder::new();
         rebuild_with(&db, tmp.path(), &embedder).unwrap();
         let inputs = embedder.inputs.lock().unwrap().clone();
-        assert_eq!(inputs, vec!["T (entity) — Customer since 2024.\n\nBody.".to_string()]);
+        assert_eq!(
+            inputs,
+            vec!["T (entity) — Customer since 2024.\n\nBody.".to_string()]
+        );
     }
 
     /// The index as the pre-summary build left it: summaries not indexed,
     /// metadata version 1.
     fn index_without_summaries(db: &DbHandle) {
         db.with(|conn| {
-            conn.execute("UPDATE pages SET summary = NULL, summary_body_hash = NULL", [])?;
+            conn.execute(
+                "UPDATE pages SET summary = NULL, summary_body_hash = NULL",
+                [],
+            )?;
             write_meta(conn, META_VERSION_KEY, "1")
         })
         .unwrap();
@@ -1890,7 +2049,11 @@ the contract renews for 12 months".to_string()]
     fn the_summary_upgrade_re_embeds_an_existing_page_that_has_a_summary() {
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
-        write_page_with(tmp.path(), "entities/acme", "summary: Customer since 2024.\n");
+        write_page_with(
+            tmp.path(),
+            "entities/acme",
+            "summary: Customer since 2024.\n",
+        );
         let db = DbHandle::open(tmp.path()).unwrap();
         rebuild_with(&db, tmp.path(), &RecordingEmbedder::new()).unwrap();
         index_without_summaries(&db);
@@ -1903,7 +2066,11 @@ the contract renews for 12 months".to_string()]
     fn a_rebuild_after_the_summary_upgrade_does_not_re_embed_the_summary_page_again() {
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
-        write_page_with(tmp.path(), "entities/acme", "summary: Customer since 2024.\n");
+        write_page_with(
+            tmp.path(),
+            "entities/acme",
+            "summary: Customer since 2024.\n",
+        );
         let db = DbHandle::open(tmp.path()).unwrap();
         rebuild_with(&db, tmp.path(), &RecordingEmbedder::new()).unwrap();
         index_without_summaries(&db);
@@ -1917,11 +2084,18 @@ the contract renews for 12 months".to_string()]
     fn rebuild_writes_the_summary_into_the_fts_summary_column() {
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
-        write_page_with(tmp.path(), "entities/acme", "summary: Tiefkühlpizza supplier.\n");
+        write_page_with(
+            tmp.path(),
+            "entities/acme",
+            "summary: Tiefkühlpizza supplier.\n",
+        );
         let db = DbHandle::open(tmp.path()).unwrap();
         rebuild(&db, tmp.path()).unwrap();
         assert_eq!(
-            strings(&db, "SELECT id FROM pages_fts WHERE pages_fts MATCH 'summary : tiefkuhlpizza'"),
+            strings(
+                &db,
+                "SELECT id FROM pages_fts WHERE pages_fts MATCH 'summary : tiefkuhlpizza'"
+            ),
             vec!["entities/acme"]
         );
     }
@@ -2013,7 +2187,10 @@ the contract renews for 12 months".to_string()]
         let db = DbHandle::open(tmp.path()).unwrap();
         rebuild(&db, tmp.path()).unwrap();
         assert_eq!(
-            strings(&db, "SELECT CASE WHEN file_hash = summary_indexed_hash THEN 'same' END FROM pages"),
+            strings(
+                &db,
+                "SELECT CASE WHEN file_hash = summary_indexed_hash THEN 'same' END FROM pages"
+            ),
             vec!["same"]
         );
     }
@@ -2026,7 +2203,8 @@ the contract renews for 12 months".to_string()]
         let db = DbHandle::open(tmp.path()).unwrap();
         rebuild(&db, tmp.path()).unwrap();
         write_summary_page(tmp.path(), "S1.", "Body two.");
-        db.with(|conn| confirm_summary(conn, "entities/acme", "Body two.\n")).unwrap();
+        db.with(|conn| confirm_summary(conn, "entities/acme", "Body two.\n"))
+            .unwrap();
         rebuild(&db, tmp.path()).unwrap();
         let (body_hash, summary_body_hash) = summary_hashes(&db);
         assert_eq!(body_hash, summary_body_hash);
@@ -2085,7 +2263,12 @@ the contract renews for 12 months".to_string()]
         let long_body = format!("# A\n{}\n# B\nsecond section words", "w ".repeat(300));
         write_page(tmp.path(), "entities", "alice", &long_body, &[]);
         let db = DbHandle::open(tmp.path()).unwrap();
-        rebuild_with(&db, tmp.path(), &crate::embedding::hashed::HashedEmbedder::new()).unwrap();
+        rebuild_with(
+            &db,
+            tmp.path(),
+            &crate::embedding::hashed::HashedEmbedder::new(),
+        )
+        .unwrap();
         let stored = stored_page_vector(&db, "entities/alice");
         assert!(stored.is_some() && stored == mean_of_stored_chunks(&db, "entities/alice"));
     }
@@ -2094,7 +2277,13 @@ the contract renews for 12 months".to_string()]
     fn the_metadata_refresh_fills_the_page_vector_of_an_unchanged_page() {
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
-        write_page(tmp.path(), "entities", "alice", "Alice talks about NLSpec.", &[]);
+        write_page(
+            tmp.path(),
+            "entities",
+            "alice",
+            "Alice talks about NLSpec.",
+            &[],
+        );
         let db = DbHandle::open(tmp.path()).unwrap();
         let hashed = crate::embedding::hashed::HashedEmbedder::new();
         rebuild_with(&db, tmp.path(), &hashed).unwrap();
@@ -2111,10 +2300,22 @@ the contract renews for 12 months".to_string()]
     fn forget_pages_removes_the_page_vector() {
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
-        write_page(tmp.path(), "entities", "alice", "Alice talks about NLSpec.", &[]);
+        write_page(
+            tmp.path(),
+            "entities",
+            "alice",
+            "Alice talks about NLSpec.",
+            &[],
+        );
         let db = DbHandle::open(tmp.path()).unwrap();
-        rebuild_with(&db, tmp.path(), &crate::embedding::hashed::HashedEmbedder::new()).unwrap();
-        db.with(|conn| forget_pages(conn, &["entities/alice".to_string()])).unwrap();
+        rebuild_with(
+            &db,
+            tmp.path(),
+            &crate::embedding::hashed::HashedEmbedder::new(),
+        )
+        .unwrap();
+        db.with(|conn| forget_pages(conn, &["entities/alice".to_string()]))
+            .unwrap();
         assert!(stored_page_vector(&db, "entities/alice").is_none());
     }
 }

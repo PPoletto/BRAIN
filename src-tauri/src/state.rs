@@ -113,7 +113,10 @@ impl AppState {
 
     /// Store the running auto-sync scheduler, aborting any previous one.
     pub fn set_auto_sync_task(&self, task: Option<AutoSyncHandle>) {
-        let mut guard = self.auto_sync_task.write().expect("auto_sync_task write lock");
+        let mut guard = self
+            .auto_sync_task
+            .write()
+            .expect("auto_sync_task write lock");
         if let Some(old) = guard.take() {
             old.abort();
         }
@@ -131,7 +134,10 @@ impl AppState {
 
     /// Whether an auto-sync scheduler is currently running.
     pub fn auto_sync_running(&self) -> bool {
-        self.auto_sync_task.read().expect("auto_sync_task read lock").is_some()
+        self.auto_sync_task
+            .read()
+            .expect("auto_sync_task read lock")
+            .is_some()
     }
 
     /// Store the running watcher, aborting any previous one first.
@@ -150,21 +156,18 @@ impl AppState {
     }
 
     pub fn disk_cache(&self) -> Option<Vec<DiskInfo>> {
-        self.disk_cache.read().expect("disk_cache read lock").clone()
+        self.disk_cache
+            .read()
+            .expect("disk_cache read lock")
+            .clone()
     }
 
     pub fn set_disk_cache(&self, disks: Vec<DiskInfo>) {
-        *self
-            .disk_cache
-            .write()
-            .expect("disk_cache write lock") = Some(disks);
+        *self.disk_cache.write().expect("disk_cache write lock") = Some(disks);
     }
 
     pub fn clear_disk_cache(&self) {
-        *self
-            .disk_cache
-            .write()
-            .expect("disk_cache write lock") = None;
+        *self.disk_cache.write().expect("disk_cache write lock") = None;
     }
 
     pub fn last_registration(&self) -> Option<RegistrationReport> {
@@ -198,7 +201,10 @@ impl AppState {
     }
 
     pub fn vault_path(&self) -> Option<PathBuf> {
-        self.vault_path.read().expect("vault path read lock").clone()
+        self.vault_path
+            .read()
+            .expect("vault path read lock")
+            .clone()
     }
 
     pub fn set_vault_path(&self, path: Option<PathBuf>) {
@@ -383,13 +389,16 @@ mod tests {
             }
             let _ = tx.send(());
         });
-        assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok(), "op bookkeeping deadlocked");
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "op bookkeeping deadlocked"
+        );
     }
 
     #[test]
     fn set_audit_task_aborts_the_previous_scheduler() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
         struct DropFlag(Arc<AtomicBool>);
         impl Drop for DropFlag {
             fn drop(&mut self) {

@@ -4,12 +4,12 @@
 
 use std::path::Path;
 
-use crate::vault::layout::ensure_skeleton;
-use crate::vault::marker::{read_marker, write_marker, VaultMarker};
 use crate::vault::VaultResult;
+use crate::vault::layout::ensure_skeleton;
+use crate::vault::marker::{VaultMarker, read_marker, write_marker};
 
-use super::template;
 use super::OnboardingResult;
+use super::template;
 
 /// Crate version pulled in at compile time.
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -49,7 +49,7 @@ fn write_gitignore_if_missing(vault: &Path) -> VaultResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vault::layout::{is_vault, wiki_dir, BRAIN_MARKER_FILENAME};
+    use crate::vault::layout::{BRAIN_MARKER_FILENAME, is_vault, wiki_dir};
     use tempfile::TempDir;
 
     #[test]
@@ -58,11 +58,12 @@ mod tests {
         let m = initialize(tmp.path()).unwrap();
         assert!(is_vault(tmp.path()));
         assert_eq!(m.format, "brain-v1");
-        assert!(tmp
-            .path()
-            .join("00_meta")
-            .join(BRAIN_MARKER_FILENAME)
-            .exists());
+        assert!(
+            tmp.path()
+                .join("00_meta")
+                .join(BRAIN_MARKER_FILENAME)
+                .exists()
+        );
         assert!(wiki_dir(tmp.path()).join(".gitignore").exists());
     }
 

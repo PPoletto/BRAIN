@@ -10,9 +10,9 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::db::{migrations, DbHandle};
-use crate::embedding::{bytes_to_vec, cosine, vec_to_bytes, Embedder};
-use crate::vault::layout::{wiki_dir, WIKI_SUBDIRS};
+use crate::db::{DbHandle, migrations};
+use crate::embedding::{Embedder, bytes_to_vec, cosine, vec_to_bytes};
+use crate::vault::layout::{WIKI_SUBDIRS, wiki_dir};
 use crate::wiki::page::{extract_wiki_links, parse};
 
 use super::ViewerResult;
@@ -229,11 +229,12 @@ pub fn search_hybrid_on_conn(
         for id in vec_rank.keys() {
             if !meta.contains_key(id) {
                 let row = conn
-                    .query_row(
-                        "SELECT title, path FROM pages WHERE id = ?1",
-                        [id],
-                        |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)),
-                    )
+                    .query_row("SELECT title, path FROM pages WHERE id = ?1", [id], |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                        ))
+                    })
                     .ok();
                 if let Some((title, path)) = row {
                     meta.insert(id.clone(), (title, path, String::new()));
@@ -243,8 +244,7 @@ pub fn search_hybrid_on_conn(
 
         // RRF score fusion.
         const K: f32 = 60.0;
-        let mut score: std::collections::HashMap<String, f32> =
-            std::collections::HashMap::new();
+        let mut score: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
         for (rank, (id, _, _, _)) in fts_rows.iter().enumerate() {
             *score.entry(id.clone()).or_default() += 1.0 / (K + rank as f32);
         }
@@ -255,10 +255,10 @@ pub fn search_hybrid_on_conn(
         let mut hits: Vec<SearchHit> = score
             .into_iter()
             .map(|(id, s)| {
-                let (title, path, snippet) = meta
-                    .get(&id)
-                    .cloned()
-                    .unwrap_or((None, None, String::new()));
+                let (title, path, snippet) =
+                    meta.get(&id)
+                        .cloned()
+                        .unwrap_or((None, None, String::new()));
                 // Post-process FTS5's snippet markers so a query token
                 // that recurs many times in a single page (e.g. the
                 // user's own name on their entity page) gets
@@ -419,15 +419,18 @@ pub fn search_brute_force(vault: &Path, query: &str) -> ViewerResult<Vec<SearchH
 
     walk_pages(vault, |id, path, raw, parsed| {
         let body = parsed.body.to_lowercase();
-        let title = parsed.frontmatter.title.clone().unwrap_or_else(|| id.to_string());
+        let title = parsed
+            .frontmatter
+            .title
+            .clone()
+            .unwrap_or_else(|| id.to_string());
         let title_lower = title.to_lowercase();
         let title_hits = title_lower.matches(&needle).count() as f32;
         let body_hits = body.matches(&needle).count() as f32;
         let total = title_hits * 2.0 + body_hits;
         if total > 0.0 {
-            let snippet = build_snippet(&parsed.body, &needle).unwrap_or_else(|| {
-                raw.lines().take(1).collect::<Vec<_>>().join(" ")
-            });
+            let snippet = build_snippet(&parsed.body, &needle)
+                .unwrap_or_else(|| raw.lines().take(1).collect::<Vec<_>>().join(" "));
             hits.push(SearchHit {
                 id: id.to_string(),
                 title,
@@ -437,7 +440,11 @@ pub fn search_brute_force(vault: &Path, query: &str) -> ViewerResult<Vec<SearchH
             });
         }
     })?;
-    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     Ok(hits)
 }
 
@@ -635,8 +642,20 @@ mod tests {
     fn search_returns_hits_sorted_by_score_desc() {
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
-        write_page(tmp.path(), "entities", "alice", "Alice", "Alice loves NLSpec methodology.");
-        write_page(tmp.path(), "concepts", "nlspec", "NLSpec", "NLSpec is the methodology for specs.");
+        write_page(
+            tmp.path(),
+            "entities",
+            "alice",
+            "Alice",
+            "Alice loves NLSpec methodology.",
+        );
+        write_page(
+            tmp.path(),
+            "concepts",
+            "nlspec",
+            "NLSpec",
+            "NLSpec is the methodology for specs.",
+        );
         let hits = search(tmp.path(), "nlspec").unwrap();
         assert!(!hits.is_empty());
         assert!(hits[0].score >= hits.last().unwrap().score);
@@ -678,7 +697,10 @@ mod tests {
 
     #[test]
     fn sanitize_fts_query_strips_punctuation_and_or_joins_terms() {
-        assert_eq!(sanitize_fts_query("nis2 directive!"), "\"nis2\" OR \"directive\"");
+        assert_eq!(
+            sanitize_fts_query("nis2 directive!"),
+            "\"nis2\" OR \"directive\""
+        );
     }
 
     #[test]
@@ -702,7 +724,13 @@ mod tests {
     fn backlinks_returns_empty_when_no_page_references_target() {
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
-        write_page(tmp.path(), "concepts", "lonely", "Lonely", "no inbound links");
+        write_page(
+            tmp.path(),
+            "concepts",
+            "lonely",
+            "Lonely",
+            "no inbound links",
+        );
         let bl = backlinks(tmp.path(), "concepts/lonely").unwrap();
         assert!(bl.is_empty());
     }
@@ -752,7 +780,10 @@ mod tests {
         .unwrap();
         let db = crate::db::DbHandle::open(tmp.path()).unwrap();
         crate::db::pages_index::rebuild_with(&db, tmp.path(), &AxisEmbedder).unwrap();
-        assert_eq!(ranked(&db, "renewal", RetrievalMode::FtsOnly), vec!["entities/b", "entities/c"]);
+        assert_eq!(
+            ranked(&db, "renewal", RetrievalMode::FtsOnly),
+            vec!["entities/b", "entities/c"]
+        );
     }
 
     #[test]
@@ -764,7 +795,10 @@ mod tests {
         write_page(tmp.path(), "entities", "b", "B", "near words");
         let db = crate::db::DbHandle::open(tmp.path()).unwrap();
         crate::db::pages_index::rebuild_with(&db, tmp.path(), &AxisEmbedder).unwrap();
-        assert_eq!(ranked(&db, "near", RetrievalMode::DenseOnly), vec!["entities/b", "entities/a"]);
+        assert_eq!(
+            ranked(&db, "near", RetrievalMode::DenseOnly),
+            vec!["entities/b", "entities/a"]
+        );
     }
 
     #[test]
@@ -772,7 +806,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         ensure_skeleton(tmp.path()).unwrap();
         // Three "near" chunks on page a, one "far" chunk on page b.
-        write_page(tmp.path(), "entities", "a", "A", "# X\nnear one\n# Y\nnear two\n# Z\nnear three");
+        write_page(
+            tmp.path(),
+            "entities",
+            "a",
+            "A",
+            "# X\nnear one\n# Y\nnear two\n# Z\nnear three",
+        );
         write_page(tmp.path(), "entities", "b", "B", "far words");
         let db = crate::db::DbHandle::open(tmp.path()).unwrap();
         crate::db::pages_index::rebuild_with(&db, tmp.path(), &AxisEmbedder).unwrap();

@@ -8,7 +8,7 @@
 //!   sequences don't end up in Claude Desktop's log file (where they'd
 //!   render as `\u{1b}[2m…` clutter).
 
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 fn default_filter() -> EnvFilter {
     // Default filter: noisy plugins are silenced unless RUST_LOG overrides.

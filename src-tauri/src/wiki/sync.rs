@@ -21,14 +21,14 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use git2::{build::CheckoutBuilder, Oid, Repository, Signature};
+use git2::{Oid, Repository, Signature, build::CheckoutBuilder};
 
 use crate::crypto::keychain::{self, KeyringStore, MasterKeyStore};
-use crate::crypto::{gitfilter, MasterKey};
+use crate::crypto::{MasterKey, gitfilter};
 use crate::vault::layout::wiki_dir;
 
 use super::encryption;
-use super::git::{init_repo, COMMITTER_EMAIL, COMMITTER_NAME};
+use super::git::{COMMITTER_EMAIL, COMMITTER_NAME, init_repo};
 use super::{WikiError, WikiResult};
 
 /// The single sync remote BRAIN manages.
@@ -164,12 +164,17 @@ fn credentials_callbacks<'a>(pat: Option<String>) -> git2::RemoteCallbacks<'a> {
             sent = true;
             // GitHub authenticates on the PAT (the password); the username
             // is a conventional placeholder when the URL carries none.
-            return git2::Cred::userpass_plaintext(username_from_url.unwrap_or("x-access-token"), pat);
+            return git2::Cred::userpass_plaintext(
+                username_from_url.unwrap_or("x-access-token"),
+                pat,
+            );
         }
         if allowed.contains(git2::CredentialType::DEFAULT) {
             return git2::Cred::default();
         }
-        Err(git2::Error::from_str("no supported authentication method for this remote"))
+        Err(git2::Error::from_str(
+            "no supported authentication method for this remote",
+        ))
     });
     cb
 }
@@ -224,7 +229,8 @@ pub fn clone_and_prepare(
 
     // Persist the key (and PAT, so later syncs work) under this machine's
     // fresh vault_id account.
-    let account = keychain::vault_account(vault).map_err(|e| WikiError::Encryption(e.to_string()))?;
+    let account =
+        keychain::vault_account(vault).map_err(|e| WikiError::Encryption(e.to_string()))?;
     keychain::store_master_key(&KeyringStore, &account, &key)
         .map_err(|e| WikiError::Encryption(e.to_string()))?;
     if let Some(pat) = pat {
@@ -606,7 +612,7 @@ fn three_way_merge(ours: &[u8], base: &[u8], theirs: &[u8]) -> WikiResult<(Vec<u
 mod tests {
     use super::*;
     use crate::vault::layout::{ensure_skeleton, wiki_dir};
-    use crate::vault::marker::{write_marker, VaultMarker};
+    use crate::vault::marker::{VaultMarker, write_marker};
     use tempfile::TempDir;
 
     #[test]
@@ -617,7 +623,10 @@ mod tests {
         let wiki = wiki_dir(tmp.path());
         init_repo(&wiki).unwrap();
         let err = set_remote(&wiki, "https://github.com/example/brain.git").unwrap_err();
-        assert!(matches!(err, WikiError::Encryption(_)), "network remote must require encryption");
+        assert!(
+            matches!(err, WikiError::Encryption(_)),
+            "network remote must require encryption"
+        );
     }
 
     #[test]
@@ -659,9 +668,18 @@ mod tests {
 
         crate::wiki::encryption::disable_encryption_with_store(v.path(), &store).unwrap();
 
-        assert!(remote_url(&wiki).is_none(), "remote must be gone after disabling encryption");
-        assert!(!encryption::is_encrypted(v.path()), "vault must be plaintext again");
-        assert!(wiki.join("entities/note.md").exists(), "plaintext filename restored");
+        assert!(
+            remote_url(&wiki).is_none(),
+            "remote must be gone after disabling encryption"
+        );
+        assert!(
+            !encryption::is_encrypted(v.path()),
+            "vault must be plaintext again"
+        );
+        assert!(
+            wiki.join("entities/note.md").exists(),
+            "plaintext filename restored"
+        );
     }
 
     #[test]
@@ -690,9 +708,15 @@ mod tests {
         let restored =
             std::fs::read(crate::vault::layout::raw_dir(b.path()).join("docs/angebot.pdf"))
                 .unwrap();
-        assert_eq!(restored, payload, "attachment bytes must survive the round trip");
+        assert_eq!(
+            restored, payload,
+            "attachment bytes must survive the round trip"
+        );
         // The mirror must never linger in the wiki working tree.
-        assert!(!b_wiki.join("raw").exists(), "no raw mirror copies in the worktree");
+        assert!(
+            !b_wiki.join("raw").exists(),
+            "no raw mirror copies in the worktree"
+        );
     }
 
     #[test]
@@ -703,8 +727,11 @@ mod tests {
         let key = crate::crypto::MasterKey::from_bytes([13u8; 32]);
         let a = make_encrypted_vault(&key, &[("entities/x", "x")], &store);
         let custom = b"# my customised wiki-agent rules";
-        std::fs::write(crate::vault::layout::meta_dir(a.path()).join("AGENTS.md"), custom)
-            .unwrap();
+        std::fs::write(
+            crate::vault::layout::meta_dir(a.path()).join("AGENTS.md"),
+            custom,
+        )
+        .unwrap();
         crate::wiki::encryption::commit_wiki_with_store(&wiki_dir(a.path()), "meta", &store)
             .unwrap()
             .unwrap();
@@ -718,7 +745,10 @@ mod tests {
 
         let restored =
             std::fs::read(crate::vault::layout::meta_dir(b.path()).join("AGENTS.md")).unwrap();
-        assert_eq!(restored, custom, "the customised AGENTS.md must arrive on B");
+        assert_eq!(
+            restored, custom,
+            "the customised AGENTS.md must arrive on B"
+        );
     }
 
     #[test]
@@ -743,7 +773,10 @@ mod tests {
         let b_wiki = wiki_dir(b.path());
         set_remote(&b_wiki, &wiki_dir(a.path()).to_string_lossy()).unwrap();
         let err = verify_remote_key_with_store(&b_wiki, &store).unwrap_err();
-        assert!(err.to_string().contains("different key"), "clear message: {err}");
+        assert!(
+            err.to_string().contains("different key"),
+            "clear message: {err}"
+        );
     }
 
     #[test]
@@ -778,14 +811,22 @@ mod tests {
         let branch = current_branch(&init_repo(&b_wiki).unwrap()).unwrap();
         let err = merge_from_remote_with_store(&b_wiki, &branch, &store).unwrap_err();
 
-        assert!(matches!(err, WikiError::Encryption(_)), "must be a key error: {err}");
-        assert!(err.to_string().contains("different key"), "clear message: {err}");
+        assert!(
+            matches!(err, WikiError::Encryption(_)),
+            "must be a key error: {err}"
+        );
+        assert!(
+            err.to_string().contains("different key"),
+            "clear message: {err}"
+        );
         // Nothing merged: local HEAD still knows nothing of the remote page.
         let repo = init_repo(&b_wiki).unwrap();
         let head_tree = repo.head().unwrap().peel_to_tree().unwrap();
         let token_a = key_a.derive().filename_token("entities/only-a");
         assert!(
-            head_tree.get_path(Path::new(&format!("entities/{token_a}.md"))).is_err(),
+            head_tree
+                .get_path(Path::new(&format!("entities/{token_a}.md")))
+                .is_err(),
             "the foreign-keyed page must not enter the local history"
         );
     }
@@ -798,7 +839,10 @@ mod tests {
         let (merged, markers) = three_way_merge(ours, base, theirs).unwrap();
         assert!(!markers, "non-overlapping edits merge cleanly");
         let s = String::from_utf8(merged).unwrap();
-        assert!(s.contains("line1 CHANGED") && s.contains("line3 CHANGED"), "both edits survive: {s}");
+        assert!(
+            s.contains("line1 CHANGED") && s.contains("line3 CHANGED"),
+            "both edits survive: {s}"
+        );
     }
 
     #[test]
@@ -809,7 +853,10 @@ mod tests {
         let (merged, markers) = three_way_merge(ours, base, theirs).unwrap();
         assert!(markers, "overlapping edits must be flagged as a conflict");
         let s = String::from_utf8(merged).unwrap();
-        assert!(s.contains("<<<<<<<") && s.contains(">>>>>>>"), "conflict markers present: {s}");
+        assert!(
+            s.contains("<<<<<<<") && s.contains(">>>>>>>"),
+            "conflict markers present: {s}"
+        );
     }
 
     // In-memory key store so the merge's decrypt/encrypt runs against a
@@ -821,7 +868,10 @@ mod tests {
             self.0.lock().unwrap().insert(a.into(), h.into());
             Ok(())
         }
-        fn get_hex(&self, a: &str) -> Result<Option<String>, crate::crypto::keychain::KeychainError> {
+        fn get_hex(
+            &self,
+            a: &str,
+        ) -> Result<Option<String>, crate::crypto::keychain::KeychainError> {
             Ok(self.0.lock().unwrap().get(a).cloned())
         }
         fn delete(&self, a: &str) -> Result<(), crate::crypto::keychain::KeychainError> {
@@ -849,8 +899,11 @@ mod tests {
         for (id, body) in pages {
             let abs = wiki.join(format!("{id}.md"));
             std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
-            std::fs::write(&abs, format!("---\nid: {id}\ntype: entity\ntitle: t\n---\n\n{body}\n"))
-                .unwrap();
+            std::fs::write(
+                &abs,
+                format!("---\nid: {id}\ntype: entity\ntitle: t\n---\n\n{body}\n"),
+            )
+            .unwrap();
         }
         crate::wiki::encryption::commit_wiki_with_store(&wiki, "init", store).unwrap();
         tmp
@@ -865,12 +918,18 @@ mod tests {
         let key = crate::crypto::MasterKey::from_bytes([9u8; 32]);
         let a = make_encrypted_vault(
             &key,
-            &[("entities/only-a", "aaa"), ("entities/shared", "shared from A")],
+            &[
+                ("entities/only-a", "aaa"),
+                ("entities/shared", "shared from A"),
+            ],
             &store,
         );
         let b = make_encrypted_vault(
             &key,
-            &[("entities/only-b", "bbb"), ("entities/shared", "shared from B")],
+            &[
+                ("entities/only-b", "bbb"),
+                ("entities/shared", "shared from B"),
+            ],
             &store,
         );
         let a_wiki = wiki_dir(a.path());
@@ -882,21 +941,30 @@ mod tests {
         let outcome = merge_from_remote_with_store(&b_wiki, &branch, &store).unwrap();
 
         let (sha, conflicts) = match outcome {
-            MergeOutcome::Merged { sha, conflicted_pages } => (sha, conflicted_pages),
+            MergeOutcome::Merged {
+                sha,
+                conflicted_pages,
+            } => (sha, conflicted_pages),
             other => panic!("expected a merge of unrelated histories, got {other:?}"),
         };
         assert!(!sha.is_empty());
 
         let keys = key.derive();
         let shared = format!("entities/{}.md", keys.filename_token("entities/shared"));
-        assert!(conflicts.contains(&shared), "the shared id must conflict: {conflicts:?}");
+        assert!(
+            conflicts.contains(&shared),
+            "the shared id must conflict: {conflicts:?}"
+        );
 
         // Union: every side's pages are in the merged tree.
         let repo = git2::Repository::open(&b_wiki).unwrap();
         let tree = repo.head().unwrap().peel_to_tree().unwrap();
         for id in ["entities/only-a", "entities/only-b", "entities/shared"] {
             let p = format!("entities/{}.md", keys.filename_token(id));
-            assert!(tree.get_path(Path::new(&p)).is_ok(), "merged tree missing {id}");
+            assert!(
+                tree.get_path(Path::new(&p)).is_ok(),
+                "merged tree missing {id}"
+            );
         }
         // The conflicted page's working tree carries BOTH versions (markers).
         let merged_shared = std::fs::read_to_string(b_wiki.join(&shared)).unwrap();

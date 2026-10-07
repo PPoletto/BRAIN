@@ -34,7 +34,7 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::xlm_roberta::{Config, XLMRobertaModel};
 use tokenizers::Tokenizer;
 
-use super::{Embedder, EMBED_DIM};
+use super::{EMBED_DIM, Embedder};
 
 /// Hard cap on tokens fed to the model. bge-m3 supports up to 8192, but
 /// inference cost is quadratic in sequence length on CPU. 512 is the
@@ -100,7 +100,9 @@ impl BgeM3Embedder {
             return Err(BgeM3Error::MissingFile(config_path.display().to_string()));
         }
         if !tokenizer_path.exists() {
-            return Err(BgeM3Error::MissingFile(tokenizer_path.display().to_string()));
+            return Err(BgeM3Error::MissingFile(
+                tokenizer_path.display().to_string(),
+            ));
         }
         if !pth_path.exists() && !safetensors_path.exists() {
             return Err(BgeM3Error::MissingFile(format!(
@@ -112,8 +114,8 @@ impl BgeM3Embedder {
 
         let config_raw = std::fs::read_to_string(&config_path)
             .map_err(|e| BgeM3Error::BadConfig(e.to_string()))?;
-        let config: Config = serde_json::from_str(&config_raw)
-            .map_err(|e| BgeM3Error::BadConfig(e.to_string()))?;
+        let config: Config =
+            serde_json::from_str(&config_raw).map_err(|e| BgeM3Error::BadConfig(e.to_string()))?;
         if config.hidden_size != EMBED_DIM {
             return Err(BgeM3Error::HiddenSizeMismatch {
                 actual: config.hidden_size,
@@ -136,12 +138,8 @@ impl BgeM3Embedder {
             // SAFETY: `from_mmaped_safetensors` mmap's the file read-only;
             // the storage is reference-counted, so the file outlives `vb`.
             unsafe {
-                VarBuilder::from_mmaped_safetensors(
-                    &[&safetensors_path],
-                    DType::F32,
-                    &device,
-                )
-                .map_err(|e| BgeM3Error::BadWeights(e.to_string()))?
+                VarBuilder::from_mmaped_safetensors(&[&safetensors_path], DType::F32, &device)
+                    .map_err(|e| BgeM3Error::BadWeights(e.to_string()))?
             }
         } else {
             VarBuilder::from_pth(&pth_path, DType::F32, &device)

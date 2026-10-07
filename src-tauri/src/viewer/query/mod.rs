@@ -99,7 +99,9 @@ pub enum QueryError {
     #[error("invalid value: {0}")]
     InvalidValue(String),
 
-    #[error("sort: may only be combined with AND at the top level of the query (not inside OR, NOT or parentheses with OR)")]
+    #[error(
+        "sort: may only be combined with AND at the top level of the query (not inside OR, NOT or parentheses with OR)"
+    )]
     MisplacedSort,
 
     #[error("expected value after operator")]

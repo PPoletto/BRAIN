@@ -34,8 +34,8 @@ use crate::db::DbHandle;
 use crate::state::AppState;
 use crate::vault::layout::meta_dir;
 
-use super::lint::{lint_with_index, LintReport};
 use super::WikiResult;
+use super::lint::{LintReport, lint_with_index};
 
 /// Name of the report directory inside `00_meta/`.
 pub const AUDIT_DIR_NAME: &str = "audit";
@@ -341,7 +341,10 @@ fn audit_once(state: &AppState, vault: &Path) -> WikiResult<Option<PathBuf>> {
 fn deep_sleep_housekeeping(db: &DbHandle) {
     match db.with(super::dream::deep_sleep_housekeeping) {
         Ok(vacuumed) => tracing::info!(vacuumed, "index housekeeping done"),
-        Err(err) => tracing::warn!(?err, "index housekeeping failed — retried with the next audit"),
+        Err(err) => tracing::warn!(
+            ?err,
+            "index housekeeping failed — retried with the next audit"
+        ),
     }
 }
 
@@ -358,7 +361,11 @@ mod tests {
 
     fn warning(vault: &Path, kind: &str, page: &str, message: &str) -> LintWarning {
         LintWarning {
-            path: vault.join("02_wiki").join(page).to_string_lossy().to_string(),
+            path: vault
+                .join("02_wiki")
+                .join(page)
+                .to_string_lossy()
+                .to_string(),
             kind: kind.into(),
             message: message.into(),
         }
@@ -367,12 +374,20 @@ mod tests {
     fn sample_report(vault: &Path) -> LintReport {
         LintReport {
             errors: vec![LintError {
-                path: vault.join("02_wiki/entities/a.md").to_string_lossy().to_string(),
+                path: vault
+                    .join("02_wiki/entities/a.md")
+                    .to_string_lossy()
+                    .to_string(),
                 kind: "broken-link".into(),
                 message: "wiki link '[[entities/gone]]' has no target page".into(),
             }],
             warnings: vec![
-                warning(vault, "orphan", "entities/old.md", "no other page links to 'entities/old'"),
+                warning(
+                    vault,
+                    "orphan",
+                    "entities/old.md",
+                    "no other page links to 'entities/old'",
+                ),
                 warning(
                     vault,
                     "duplicate-candidate",
@@ -401,14 +416,20 @@ mod tests {
         let tmp = vault();
         let path =
             write_audit_report_for_date(tmp.path(), &sample_report(tmp.path()), date()).unwrap();
-        assert_eq!(path, meta_dir(tmp.path()).join("audit").join("2026-10-06.md"));
+        assert_eq!(
+            path,
+            meta_dir(tmp.path()).join("audit").join("2026-10-06.md")
+        );
     }
 
     #[test]
     fn the_report_summary_counts_the_findings_per_kind() {
         let tmp = vault();
         let text = render_audit_report(tmp.path(), &sample_report(tmp.path()), date());
-        assert!(text.contains("| duplicate-candidate | warning | 2 |"), "{text}");
+        assert!(
+            text.contains("| duplicate-candidate | warning | 2 |"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -457,7 +478,10 @@ mod tests {
             }],
         };
         let text = render_audit_report(tmp.path(), &report, date());
-        assert!(text.contains("\n- duplicate detection needs the embedding model\n"), "{text}");
+        assert!(
+            text.contains("\n- duplicate detection needs the embedding model\n"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -537,5 +561,4 @@ mod tests {
         let written = audit_once(&state, tmp.path()).unwrap();
         assert!(written.is_none() && !audit_dir(tmp.path()).exists());
     }
-
 }

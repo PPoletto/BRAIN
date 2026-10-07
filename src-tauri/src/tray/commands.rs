@@ -7,9 +7,9 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::error::BrainResult;
-use crate::mount::{lifecycle, MountError};
+use crate::mount::{MountError, lifecycle};
 
-use super::state_machine::{derive, TrayState};
+use super::state_machine::{TrayState, derive};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TrayStatus {
@@ -33,11 +33,7 @@ pub fn tray_status(state: State<Arc<crate::state::AppState>>) -> BrainResult<Tra
             format!("BRAIN error – {msg}"),
             Some(msg),
         ),
-        other => (
-            other.tag().to_string(),
-            other.tooltip(),
-            None,
-        ),
+        other => (other.tag().to_string(), other.tooltip(), None),
     };
     Ok(TrayStatus {
         state: tag,
@@ -50,10 +46,7 @@ pub fn tray_status(state: State<Arc<crate::state::AppState>>) -> BrainResult<Tra
 }
 
 #[tauri::command]
-pub fn eject_brain(
-    state: State<Arc<crate::state::AppState>>,
-    force: bool,
-) -> BrainResult<()> {
+pub fn eject_brain(state: State<Arc<crate::state::AppState>>, force: bool) -> BrainResult<()> {
     match lifecycle::unmount(&state, force) {
         Ok(()) => {
             let _ = crate::mcp::registration::unregister_brain_from_supported_clients();

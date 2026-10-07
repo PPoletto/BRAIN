@@ -156,10 +156,7 @@ pub fn load_master_key(
 }
 
 /// Remove the stored master key for `account` (e.g. on vault reset).
-pub fn delete_master_key(
-    store: &impl MasterKeyStore,
-    account: &str,
-) -> Result<(), KeychainError> {
+pub fn delete_master_key(store: &impl MasterKeyStore, account: &str) -> Result<(), KeychainError> {
     store.delete(account)
 }
 
@@ -167,7 +164,7 @@ pub fn delete_master_key(
 mod tests {
     use super::*;
     use crate::vault::layout::ensure_skeleton;
-    use crate::vault::marker::{write_marker, VaultMarker};
+    use crate::vault::marker::{VaultMarker, write_marker};
     use std::collections::HashMap;
     use std::sync::Mutex;
     use tempfile::TempDir;
@@ -180,7 +177,10 @@ mod tests {
 
     impl MasterKeyStore for MemStore {
         fn set_hex(&self, account: &str, hex: &str) -> Result<(), KeychainError> {
-            self.0.lock().unwrap().insert(account.to_string(), hex.to_string());
+            self.0
+                .lock()
+                .unwrap()
+                .insert(account.to_string(), hex.to_string());
             Ok(())
         }
         fn get_hex(&self, account: &str) -> Result<Option<String>, KeychainError> {
@@ -197,7 +197,9 @@ mod tests {
         let store = MemStore::default();
         let key = MasterKey::from_bytes([42u8; 32]);
         store_master_key(&store, "01VAULT", &key).unwrap();
-        let loaded = load_master_key(&store, "01VAULT").unwrap().expect("key present");
+        let loaded = load_master_key(&store, "01VAULT")
+            .unwrap()
+            .expect("key present");
         assert_eq!(loaded.derive().content, key.derive().content);
     }
 
@@ -233,8 +235,16 @@ mod tests {
         store_master_key(&store, "a", &MasterKey::from_bytes([1u8; 32])).unwrap();
         store_master_key(&store, "b", &MasterKey::from_bytes([2u8; 32])).unwrap();
         assert_ne!(
-            load_master_key(&store, "a").unwrap().unwrap().derive().content,
-            load_master_key(&store, "b").unwrap().unwrap().derive().content,
+            load_master_key(&store, "a")
+                .unwrap()
+                .unwrap()
+                .derive()
+                .content,
+            load_master_key(&store, "b")
+                .unwrap()
+                .unwrap()
+                .derive()
+                .content,
         );
     }
 
@@ -257,13 +267,19 @@ mod tests {
         write_marker(tmp.path(), &VaultMarker::new("0.0.0-test")).unwrap();
         let via_plain = vault_account(tmp.path()).unwrap();
         let via_dot = vault_account(&tmp.path().join(".")).unwrap();
-        assert_eq!(via_plain, via_dot, "account must not depend on path spelling");
+        assert_eq!(
+            via_plain, via_dot,
+            "account must not depend on path spelling"
+        );
     }
 
     #[test]
     fn vault_account_errors_when_marker_absent() {
         let tmp = TempDir::new().unwrap();
-        assert!(matches!(vault_account(tmp.path()), Err(KeychainError::NoMarker)));
+        assert!(matches!(
+            vault_account(tmp.path()),
+            Err(KeychainError::NoMarker)
+        ));
     }
 
     /// A KeyringStore can be constructed (real backend). We don't

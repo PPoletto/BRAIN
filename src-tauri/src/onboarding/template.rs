@@ -9,10 +9,10 @@ use std::path::Path;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
-use crate::vault::layout::{
-    meta_dir, AGENTS_FILENAME, CLAUDE_FILENAME, MCP_CONFIG_FILENAME, SKILL_FILENAME,
-};
 use crate::vault::VaultResult;
+use crate::vault::layout::{
+    AGENTS_FILENAME, CLAUDE_FILENAME, MCP_CONFIG_FILENAME, SKILL_FILENAME, meta_dir,
+};
 
 /// The bundled AGENTS.md — also served by the MCP resource
 /// `brain://agents-md` when a vault has none.
@@ -369,7 +369,10 @@ mod tests {
         );
         // After: file contents match the bundled template.
         let after = std::fs::read_to_string(&agents).unwrap();
-        assert_eq!(after, AGENTS_MD, "bundled template content must be on disk verbatim");
+        assert_eq!(
+            after, AGENTS_MD,
+            "bundled template content must be on disk verbatim"
+        );
         // size_before tracked the stale length, size_after the new.
         let agents_entry = report
             .iter()

@@ -188,9 +188,8 @@ pub fn commit_detail(wiki_path: &Path, sha: &str) -> WikiResult<CommitDetail> {
     // interior mutability without going `unsafe`. Both closures finish
     // before we read it back, so there's no aliased borrow at the
     // .borrow_mut() call sites.
-    let per_file: std::cell::RefCell<
-        std::collections::HashMap<String, (String, u32, u32)>,
-    > = std::cell::RefCell::new(std::collections::HashMap::new());
+    let per_file: std::cell::RefCell<std::collections::HashMap<String, (String, u32, u32)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
     diff.foreach(
         &mut |delta, _| {
             let path = delta
@@ -288,9 +287,9 @@ pub fn restore_page(wiki_path: &Path, sha: &str, page: &str) -> WikiResult<()> {
     let commit = commit_by_sha(&repo, sha)?;
     let tree = commit.tree()?;
 
-    let entry = tree.get_path(Path::new(page)).map_err(|_| {
-        WikiError::PageNotFound(format!("{page} not present in commit {sha}"))
-    })?;
+    let entry = tree
+        .get_path(Path::new(page))
+        .map_err(|_| WikiError::PageNotFound(format!("{page} not present in commit {sha}")))?;
     let blob = repo.find_blob(entry.id())?;
 
     let target_path = wiki_path.join(page);
@@ -350,11 +349,7 @@ pub fn hard_reset(wiki_path: &Path, sha: &str) -> WikiResult<()> {
 }
 
 fn short_sha(sha: &str) -> &str {
-    if sha.len() <= 7 {
-        sha
-    } else {
-        &sha[..7]
-    }
+    if sha.len() <= 7 { sha } else { &sha[..7] }
 }
 
 #[cfg(test)]
@@ -423,7 +418,11 @@ mod tests {
         // Two alice edits, both must surface; the two bob commits
         // must NOT — they share the same window but didn't touch
         // alice.md.
-        assert_eq!(history.len(), 2, "expected 2 alice-only commits, got {history:#?}");
+        assert_eq!(
+            history.len(),
+            2,
+            "expected 2 alice-only commits, got {history:#?}"
+        );
         for c in &history {
             assert!(
                 c.message.contains("alice"),

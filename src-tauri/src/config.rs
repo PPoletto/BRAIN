@@ -162,7 +162,10 @@ mod tests {
         assert_eq!(parsed.update_channel, "beta");
         assert_eq!(parsed.skipped_versions, vec!["1.2.3"]);
         assert_eq!(parsed.default_provider, "anthropic");
-        assert_eq!(parsed.last_active_vault_path.as_deref(), Some(std::path::Path::new("D:/")));
+        assert_eq!(
+            parsed.last_active_vault_path.as_deref(),
+            Some(std::path::Path::new("D:/"))
+        );
     }
 
     #[test]
@@ -182,7 +185,10 @@ mod tests {
         // invariant that the two names differ.
         let name = config_app_name();
         if cfg!(debug_assertions) {
-            assert_eq!(name, "brain-dev", "debug/dev builds must use the isolated dir");
+            assert_eq!(
+                name, "brain-dev",
+                "debug/dev builds must use the isolated dir"
+            );
         } else {
             assert_eq!(name, "brain", "release builds use the canonical dir");
         }
@@ -195,7 +201,10 @@ mod tests {
     #[test]
     fn config_path_ends_with_the_settings_filename() {
         let p = config_path();
-        assert_eq!(p.file_name().and_then(|n| n.to_str()), Some(CONFIG_FILENAME));
+        assert_eq!(
+            p.file_name().and_then(|n| n.to_str()),
+            Some(CONFIG_FILENAME)
+        );
     }
 
     #[test]

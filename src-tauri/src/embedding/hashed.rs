@@ -15,7 +15,7 @@ use std::hash::{Hash, Hasher};
 
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::{Embedder, EMBED_DIM};
+use super::{EMBED_DIM, Embedder};
 
 #[derive(Debug, Clone, Default)]
 pub struct HashedEmbedder;

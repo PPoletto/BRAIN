@@ -13,10 +13,7 @@ use tauri::{AppHandle, Emitter, Manager, Runtime, WindowEvent};
 
 use crate::state::AppState;
 
-pub fn setup<R: Runtime>(
-    app: AppHandle<R>,
-    state: Arc<AppState>,
-) -> tauri::Result<()> {
+pub fn setup<R: Runtime>(app: AppHandle<R>, state: Arc<AppState>) -> tauri::Result<()> {
     let menu = build_menu(&app)?;
 
     let mut builder = TrayIconBuilder::with_id("brain-tray")
@@ -149,7 +146,15 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     Menu::with_items(
         app,
         &[
-            &show, &viewer, &history, &settings, &sep_mcp, &reregister, &sep1, &eject, &sep2,
+            &show,
+            &viewer,
+            &history,
+            &settings,
+            &sep_mcp,
+            &reregister,
+            &sep1,
+            &eject,
+            &sep2,
             &quit,
         ],
     )

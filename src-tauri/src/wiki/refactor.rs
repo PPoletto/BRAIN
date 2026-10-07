@@ -334,7 +334,9 @@ pub(crate) fn delete_page_with_store(
     let pages = collect_pages(vault)?;
     let referrers: Vec<&PageFile> = pages
         .iter()
-        .filter(|p| !same_file(&p.path, &path) && (links_to(&p.raw, id) || names_in_frontmatter(&p.raw, id)))
+        .filter(|p| {
+            !same_file(&p.path, &path) && (links_to(&p.raw, id) || names_in_frontmatter(&p.raw, id))
+        })
         .collect();
     if !referrers.is_empty() && !force {
         let mut ids: Vec<String> = referrers.iter().map(|p| p.id.clone()).collect();
@@ -442,7 +444,12 @@ pub(crate) fn merge_pages_with_store(
     // its old id (so a later create under that name is caught as a
     // duplicate), and the union of both pages' sources.
     let mut aliases = into.frontmatter.aliases.clone();
-    for a in from.frontmatter.aliases.iter().chain(std::iter::once(&from.frontmatter.id)) {
+    for a in from
+        .frontmatter
+        .aliases
+        .iter()
+        .chain(std::iter::once(&from.frontmatter.id))
+    {
         if a != into_id && !aliases.contains(a) {
             aliases.push(a.clone());
         }
@@ -2199,7 +2206,10 @@ mod tests {
 
     #[test]
     fn rename_carries_the_keep_mark() {
-        let v = vault_with(&[("entities/old", page_fm("entities/old", "keep: true\n", "Body."))]);
+        let v = vault_with(&[(
+            "entities/old",
+            page_fm("entities/old", "keep: true\n", "Body."),
+        )]);
         rename_page_with_store(v.path(), "entities/old", "entities/new", &store()).unwrap();
         assert_eq!(keep_of(v.path(), "entities/new"), Some(true));
     }
@@ -2207,7 +2217,10 @@ mod tests {
     #[test]
     fn merge_keeps_the_keep_mark_of_the_folded_in_page() {
         let v = vault_with(&[
-            ("entities/dup", page_fm("entities/dup", "keep: true\n", "Dup.")),
+            (
+                "entities/dup",
+                page_fm("entities/dup", "keep: true\n", "Dup."),
+            ),
             ("entities/main", page_fm("entities/main", "", "Main.")),
         ]);
         merge_pages_with_store(v.path(), "entities/dup", "entities/main", &store()).unwrap();
@@ -2217,21 +2230,33 @@ mod tests {
     #[test]
     fn merge_writes_keep_as_a_bare_yaml_boolean() {
         let v = vault_with(&[
-            ("entities/dup", page_fm("entities/dup", "keep: true
-", "Dup.")),
+            (
+                "entities/dup",
+                page_fm(
+                    "entities/dup",
+                    "keep: true
+",
+                    "Dup.",
+                ),
+            ),
             ("entities/main", page_fm("entities/main", "", "Main.")),
         ]);
         merge_pages_with_store(v.path(), "entities/dup", "entities/main", &store()).unwrap();
-        assert!(read(v.path(), "entities/main").contains("
+        assert!(read(v.path(), "entities/main").contains(
+            "
 keep: true
-"));
+"
+        ));
     }
 
     #[test]
     fn merge_keeps_the_keep_mark_of_the_surviving_page() {
         let v = vault_with(&[
             ("entities/dup", page_fm("entities/dup", "", "Dup.")),
-            ("entities/main", page_fm("entities/main", "keep: true\n", "Main.")),
+            (
+                "entities/main",
+                page_fm("entities/main", "keep: true\n", "Main."),
+            ),
         ]);
         merge_pages_with_store(v.path(), "entities/dup", "entities/main", &store()).unwrap();
         assert_eq!(keep_of(v.path(), "entities/main"), Some(true));
@@ -2252,15 +2277,27 @@ keep: true
             ("entities/old", page_fm("entities/old", "", "Old body.")),
             (
                 "entities/replaced",
-                page_fm("entities/replaced", "superseded_by: entities/old\n", "Earlier."),
+                page_fm(
+                    "entities/replaced",
+                    "superseded_by: entities/old\n",
+                    "Earlier.",
+                ),
             ),
             (
                 "entities/cited",
-                page_fm("entities/cited", "sources: [entities/old, sources/keep]\n", "Facts."),
+                page_fm(
+                    "entities/cited",
+                    "sources: [entities/old, sources/keep]\n",
+                    "Facts.",
+                ),
             ),
             (
                 "entities/block",
-                page_fm("entities/block", "sources:\n  - entities/old\n  - sources/keep\n", "Facts."),
+                page_fm(
+                    "entities/block",
+                    "sources:\n  - entities/old\n  - sources/keep\n",
+                    "Facts.",
+                ),
             ),
             ("sources/keep", page_fm("sources/keep", "", "Source.")),
         ])
@@ -2272,7 +2309,11 @@ keep: true
         rename_page_with_store(v.path(), "entities/old", "entities/new", &store()).unwrap();
         assert_eq!(
             read(v.path(), "entities/replaced"),
-            page_fm("entities/replaced", "superseded_by: entities/new\n", "Earlier.")
+            page_fm(
+                "entities/replaced",
+                "superseded_by: entities/new\n",
+                "Earlier."
+            )
         );
     }
 
@@ -2282,7 +2323,11 @@ keep: true
         rename_page_with_store(v.path(), "entities/old", "entities/new", &store()).unwrap();
         assert_eq!(
             read(v.path(), "entities/cited"),
-            page_fm("entities/cited", "sources: [\"entities/new\",\"sources/keep\"]\n", "Facts.")
+            page_fm(
+                "entities/cited",
+                "sources: [\"entities/new\",\"sources/keep\"]\n",
+                "Facts."
+            )
         );
     }
 
@@ -2291,13 +2336,17 @@ keep: true
         let v = reference_vault();
         rename_page_with_store(v.path(), "entities/old", "entities/new", &store()).unwrap();
         let parsed = parse(&read(v.path(), "entities/block")).unwrap();
-        assert_eq!(parsed.frontmatter.sources, vec!["entities/new", "sources/keep"]);
+        assert_eq!(
+            parsed.frontmatter.sources,
+            vec!["entities/new", "sources/keep"]
+        );
     }
 
     #[test]
     fn rename_reports_the_rewritten_references() {
         let v = reference_vault();
-        let out = rename_page_with_store(v.path(), "entities/old", "entities/new", &store()).unwrap();
+        let out =
+            rename_page_with_store(v.path(), "entities/old", "entities/new", &store()).unwrap();
         assert_eq!(out.rewritten_references, 3);
     }
 
@@ -2312,7 +2361,10 @@ keep: true
         ]);
         rename_page_with_store(v.path(), "entities/old", "entities/new", &store()).unwrap();
         let parsed = parse(&read(v.path(), "entities/a")).unwrap();
-        assert_eq!(parsed.frontmatter.superseded_by.as_deref(), Some("entities/new"));
+        assert_eq!(
+            parsed.frontmatter.superseded_by.as_deref(),
+            Some("entities/new")
+        );
     }
 
     #[test]
@@ -2320,7 +2372,10 @@ keep: true
         let v = reference_vault();
         merge_pages_with_store(v.path(), "entities/old", "entities/cited", &store()).unwrap();
         let parsed = parse(&read(v.path(), "entities/replaced")).unwrap();
-        assert_eq!(parsed.frontmatter.superseded_by.as_deref(), Some("entities/cited"));
+        assert_eq!(
+            parsed.frontmatter.superseded_by.as_deref(),
+            Some("entities/cited")
+        );
     }
 
     #[test]
@@ -2334,19 +2389,31 @@ keep: true
     #[test]
     fn merge_keeps_the_merged_page_id_and_aliases_as_aliases_of_the_survivor() {
         let v = vault_with(&[
-            ("entities/old", page_fm("entities/old", "aliases: [Old Corp]\n", "Old.")),
-            ("entities/new", page_fm("entities/new", "aliases: [New Corp]\n", "New.")),
+            (
+                "entities/old",
+                page_fm("entities/old", "aliases: [Old Corp]\n", "Old."),
+            ),
+            (
+                "entities/new",
+                page_fm("entities/new", "aliases: [New Corp]\n", "New."),
+            ),
         ]);
         merge_pages_with_store(v.path(), "entities/old", "entities/new", &store()).unwrap();
         let parsed = parse(&read(v.path(), "entities/new")).unwrap();
-        assert_eq!(parsed.frontmatter.aliases, vec!["New Corp", "Old Corp", "entities/old"]);
+        assert_eq!(
+            parsed.frontmatter.aliases,
+            vec!["New Corp", "Old Corp", "entities/old"]
+        );
     }
 
     #[test]
     fn delete_refuses_while_a_page_is_superseded_by_it() {
         let v = vault_with(&[
             ("entities/old", page_fm("entities/old", "", "Old.")),
-            ("entities/a", page_fm("entities/a", "superseded_by: entities/old\n", "A.")),
+            (
+                "entities/a",
+                page_fm("entities/a", "superseded_by: entities/old\n", "A."),
+            ),
         ]);
         let err = delete_page_with_store(v.path(), "entities/old", false, &store()).unwrap_err();
         assert!(matches!(
@@ -2359,7 +2426,10 @@ keep: true
     fn delete_refuses_while_a_page_names_it_in_sources() {
         let v = vault_with(&[
             ("sources/s", page_fm("sources/s", "", "S.")),
-            ("entities/a", page_fm("entities/a", "sources: [sources/s]\n", "A.")),
+            (
+                "entities/a",
+                page_fm("entities/a", "sources: [sources/s]\n", "A."),
+            ),
         ]);
         let err = delete_page_with_store(v.path(), "sources/s", false, &store()).unwrap_err();
         assert!(matches!(err, RefactorError::StillLinked { .. }));
@@ -2369,20 +2439,36 @@ keep: true
     fn forced_delete_removes_the_superseded_by_line_and_nothing_else() {
         let v = vault_with(&[
             ("entities/old", page_fm("entities/old", "", "Old.")),
-            ("entities/a", page_fm("entities/a", "superseded_by: entities/old\nvalid_to: 2025-01-01\n", "A.")),
+            (
+                "entities/a",
+                page_fm(
+                    "entities/a",
+                    "superseded_by: entities/old\nvalid_to: 2025-01-01\n",
+                    "A.",
+                ),
+            ),
         ]);
         delete_page_with_store(v.path(), "entities/old", true, &store()).unwrap();
-        assert_eq!(read(v.path(), "entities/a"), page_fm("entities/a", "valid_to: 2025-01-01\n", "A."));
+        assert_eq!(
+            read(v.path(), "entities/a"),
+            page_fm("entities/a", "valid_to: 2025-01-01\n", "A.")
+        );
     }
 
     #[test]
     fn forced_delete_of_the_last_entry_leaves_no_blank_line_before_the_fence() {
         let v = vault_with(&[
             ("entities/old", page_fm("entities/old", "", "Old.")),
-            ("entities/a", page_fm("entities/a", "superseded_by: entities/old\n", "A.")),
+            (
+                "entities/a",
+                page_fm("entities/a", "superseded_by: entities/old\n", "A."),
+            ),
         ]);
         delete_page_with_store(v.path(), "entities/old", true, &store()).unwrap();
-        assert_eq!(read(v.path(), "entities/a"), page_fm("entities/a", "", "A."));
+        assert_eq!(
+            read(v.path(), "entities/a"),
+            page_fm("entities/a", "", "A.")
+        );
     }
 
     #[test]
@@ -2390,7 +2476,10 @@ keep: true
         let v = vault_with(&[
             ("sources/s", page_fm("sources/s", "", "S.")),
             ("sources/t", page_fm("sources/t", "", "T.")),
-            ("entities/a", page_fm("entities/a", "sources: [sources/s, sources/t]\n", "A.")),
+            (
+                "entities/a",
+                page_fm("entities/a", "sources: [sources/s, sources/t]\n", "A."),
+            ),
         ]);
         delete_page_with_store(v.path(), "sources/s", true, &store()).unwrap();
         let parsed = parse(&read(v.path(), "entities/a")).unwrap();

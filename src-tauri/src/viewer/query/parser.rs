@@ -192,7 +192,11 @@ impl Parser {
         };
         if !allowed.is_empty() {
             let value = value.to_ascii_lowercase();
-            let name = if field == Field::Valid { "valid" } else { "sort" };
+            let name = if field == Field::Valid {
+                "valid"
+            } else {
+                "sort"
+            };
             if op != Op::Eq || !allowed.contains(&value.as_str()) {
                 return Err(QueryError::InvalidValue(format!(
                     "{name}: takes `:` and one of {}",
@@ -299,8 +303,16 @@ mod tests {
         assert_eq!(
             expr,
             Expr::And(
-                Box::new(Expr::Clause(Clause { field: Field::Valid, op: Op::Eq, value: "all".into() })),
-                Box::new(Expr::Clause(Clause { field: Field::Sort, op: Op::Eq, value: "salience".into() })),
+                Box::new(Expr::Clause(Clause {
+                    field: Field::Valid,
+                    op: Op::Eq,
+                    value: "all".into()
+                })),
+                Box::new(Expr::Clause(Clause {
+                    field: Field::Sort,
+                    op: Op::Eq,
+                    value: "salience".into()
+                })),
             )
         );
     }

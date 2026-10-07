@@ -88,7 +88,8 @@ struct PageRow {
 /// `distinct_from` ids and the `keep` flag of a `pages.frontmatter` JSON
 /// text (empty / false on a missing or unreadable value).
 fn frontmatter_marks(frontmatter: Option<&str>) -> (Vec<String>, bool) {
-    let Some(fm) = frontmatter.and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+    let Some(fm) =
+        frontmatter.and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
     else {
         return (Vec::new(), false);
     };
@@ -191,7 +192,10 @@ pub fn load_page_vectors(conn: &rusqlite::Connection) -> DbResult<HashMap<String
 /// empty, not a whole number of f32s, or of another dimension than the
 /// page's first chunk are skipped; pages whose sum is the zero vector are
 /// left out.
-fn stream_page_vectors(conn: &rusqlite::Connection, sql: &str) -> DbResult<HashMap<String, Vec<f32>>> {
+fn stream_page_vectors(
+    conn: &rusqlite::Connection,
+    sql: &str,
+) -> DbResult<HashMap<String, Vec<f32>>> {
     let mut sums: HashMap<String, crate::embedding::MeanVector> = HashMap::new();
     let mut stmt = conn.prepare(sql)?;
     let mut rows = stmt.query([])?;
@@ -284,7 +288,11 @@ fn inbound_sources(links: &[(String, String)]) -> HashMap<&str, HashSet<&str>> {
 /// The pages the `orphan` rule reports (see [`orphans`]). A page marked
 /// `keep: true` is never one: the mark is the user's answer to "nobody
 /// links here".
-fn orphan_rows<'a>(pages: &'a [PageRow], links: &[(String, String)], now_unix: i64) -> Vec<&'a PageRow> {
+fn orphan_rows<'a>(
+    pages: &'a [PageRow],
+    links: &[(String, String)],
+    now_unix: i64,
+) -> Vec<&'a PageRow> {
     let inbound = inbound_sources(links);
     let cutoff = now_unix - ORPHAN_MIN_AGE_DAYS * 24 * 60 * 60;
     pages
@@ -349,7 +357,11 @@ impl HygieneRows {
 
 fn format_local_date(unix: i64) -> String {
     chrono::DateTime::from_timestamp(unix, 0)
-        .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d")
+                .to_string()
+        })
         .unwrap_or_else(|| "an unknown date".into())
 }
 
@@ -386,7 +398,10 @@ fn duplicate_pair_rows<'a>(
     let mut by_type: HashMap<&str, Vec<(&PageRow, &Vec<f32>)>> = HashMap::new();
     for page in &rows.pages {
         if let Some(v) = rows.page_vectors.get(&page.id) {
-            by_type.entry(page.page_type.as_str()).or_default().push((page, v));
+            by_type
+                .entry(page.page_type.as_str())
+                .or_default()
+                .push((page, v));
         }
     }
     let mut types: Vec<&str> = by_type.keys().copied().collect();
@@ -629,7 +644,10 @@ mod tests {
             .collect();
         assert_eq!(
             paths,
-            vec!["02_wiki/entities/mueller-gmbh.md", "02_wiki/entities/muller-gmbh.md"]
+            vec![
+                "02_wiki/entities/mueller-gmbh.md",
+                "02_wiki/entities/muller-gmbh.md"
+            ]
         );
     }
 
@@ -748,7 +766,9 @@ mod tests {
         let notes: Vec<&str> = findings.notes.iter().map(|n| n.message.as_str()).collect();
         assert_eq!(
             notes,
-            vec!["duplicate detection skipped for type 'entity': 2001 pages exceed the limit of 2000 per type"]
+            vec![
+                "duplicate detection skipped for type 'entity': 2001 pages exceed the limit of 2000 per type"
+            ]
         );
     }
 
@@ -782,7 +802,8 @@ mod tests {
         let findings = check(&db, false, NOW).unwrap();
         let notes: Vec<&str> = findings.notes.iter().map(|n| n.message.as_str()).collect();
         assert!(
-            notes.len() == 1 && notes[0].starts_with("duplicate detection needs the embedding model"),
+            notes.len() == 1
+                && notes[0].starts_with("duplicate detection needs the embedding model"),
             "{notes:?}"
         );
     }

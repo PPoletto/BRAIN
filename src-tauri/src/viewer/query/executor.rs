@@ -5,9 +5,9 @@ use serde::Serialize;
 
 use crate::db::DbHandle;
 
+use super::QueryError;
 use super::parser::parse;
 use super::sql::compile_query;
-use super::QueryError;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryHit {
@@ -220,7 +220,12 @@ mod tests {
     /// The roadmap's Slice C example: A expired and superseded by B.
     fn validity_vault() -> (TempDir, DbHandle) {
         fresh_db_with_pages(|root| {
-            write_page_with(root, "entities", "a", "valid_to: 2025-12-31\nsuperseded_by: entities/b\n");
+            write_page_with(
+                root,
+                "entities",
+                "a",
+                "valid_to: 2025-12-31\nsuperseded_by: entities/b\n",
+            );
             write_page_with(root, "entities", "b", "");
             write_page_with(root, "entities", "c", "valid_to: 2025-01-31\n");
         })
@@ -258,7 +263,10 @@ mod tests {
     #[test]
     fn valid_expired_returns_only_expired_and_superseded_pages() {
         let (_tmp, db) = validity_vault();
-        assert_eq!(ids_as_of(&db, "valid:expired"), vec!["entities/a", "entities/c"]);
+        assert_eq!(
+            ids_as_of(&db, "valid:expired"),
+            vec!["entities/a", "entities/c"]
+        );
     }
 
     #[test]
@@ -285,8 +293,10 @@ mod tests {
         .unwrap();
         let first = db
             .with(|conn| {
-                Ok(run_on_conn_as_of(conn, "type:entity AND sort:salience", "2026-10-06")
-                    .map_err(|e| std::io::Error::other(e.to_string()))?)
+                Ok(
+                    run_on_conn_as_of(conn, "type:entity AND sort:salience", "2026-10-06")
+                        .map_err(|e| std::io::Error::other(e.to_string()))?,
+                )
             })
             .unwrap()
             .remove(0);

@@ -173,12 +173,7 @@ fn register_codex(vault_path: &Path) -> ClientStatus {
     let Some(path) = codex_config_path() else {
         return ClientStatus::NotInstalled;
     };
-    if !path.exists()
-        && path
-            .parent()
-            .map(|p| !p.exists())
-            .unwrap_or(false)
-    {
+    if !path.exists() && path.parent().map(|p| !p.exists()).unwrap_or(false) {
         return ClientStatus::NotInstalled;
     }
     match register_codex_toml(&path, &brain_server_entry(vault_path)) {
@@ -224,8 +219,7 @@ fn register_claude_desktop_anywhere(vault_path: &Path) -> ClientStatus {
     let mut targets: Vec<PathBuf> = Vec::new();
     for path in &candidates {
         let path_str = path.to_string_lossy();
-        let is_sandbox =
-            path_str.contains("\\Packages\\") || path_str.contains("/Packages/");
+        let is_sandbox = path_str.contains("\\Packages\\") || path_str.contains("/Packages/");
         let parent_exists = path.parent().map(|p| p.exists()).unwrap_or(false);
         if is_sandbox || parent_exists {
             targets.push(path.clone());
@@ -269,7 +263,10 @@ fn register_claude_code(vault_path: &Path) -> ClientStatus {
         match invoke_claude_mcp_add(&claude, vault_path) {
             Ok(()) => return ClientStatus::Registered("via claude mcp add (user scope)".into()),
             Err(err) => {
-                tracing::warn!(?err, "claude mcp add failed, falling back to direct file write");
+                tracing::warn!(
+                    ?err,
+                    "claude mcp add failed, falling back to direct file write"
+                );
             }
         }
     }
@@ -291,12 +288,7 @@ fn register_simple_client(
     let Some(path) = config_path else {
         return ClientStatus::NotInstalled;
     };
-    if !path.exists()
-        && path
-            .parent()
-            .map(|p| !p.exists())
-            .unwrap_or(false)
-    {
+    if !path.exists() && path.parent().map(|p| !p.exists()).unwrap_or(false) {
         // Parent dir doesn't exist either — assume the client isn't installed.
         let _ = label;
         return ClientStatus::NotInstalled;
@@ -313,7 +305,8 @@ pub fn unregister_brain_from_supported_clients() -> McpResult<()> {
         // Remove the canonical key plus any legacy aliases, so users who
         // upgrade from < 0.2.0 (key was lowercase `brain`) don't keep an
         // orphan entry pointing at a stale binary path.
-        for key in std::iter::once(BRAIN_SERVER_KEY).chain(LEGACY_BRAIN_SERVER_KEYS.iter().copied()) {
+        for key in std::iter::once(BRAIN_SERVER_KEY).chain(LEGACY_BRAIN_SERVER_KEYS.iter().copied())
+        {
             let _ = crate::proc::no_window(&claude)
                 .args(["mcp", "remove", key, "--scope", "user"])
                 .output();
@@ -432,11 +425,7 @@ pub fn claude_desktop_config_path() -> Option<PathBuf> {
     let candidates = claude_desktop_candidates(&home);
     candidates
         .iter()
-        .find(|c| {
-            c.parent()
-                .map(|p| p.exists())
-                .unwrap_or(false)
-        })
+        .find(|c| c.parent().map(|p| p.exists()).unwrap_or(false))
         .cloned()
         .or_else(|| candidates.into_iter().next())
 }
@@ -642,14 +631,12 @@ pub fn register_codex_toml(config_path: &Path, entry: &McpServerEntry) -> McpRes
         t.set_implicit(true);
         doc.insert("mcp_servers", Item::Table(t));
     }
-    let servers = doc["mcp_servers"]
-        .as_table_mut()
-        .ok_or_else(|| {
-            super::McpError::Json(serde_json::Error::io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "mcp_servers is not a TOML table",
-            )))
-        })?;
+    let servers = doc["mcp_servers"].as_table_mut().ok_or_else(|| {
+        super::McpError::Json(serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "mcp_servers is not a TOML table",
+        )))
+    })?;
 
     // Strip legacy lowercase aliases so post-upgrade users don't see two
     // duplicate Codex entries pointing at the same binary.
@@ -675,7 +662,10 @@ pub fn register_codex_toml(config_path: &Path, entry: &McpServerEntry) -> McpRes
             // Codex env values are TOML strings. JSON envs in our entry
             // are always strings (we control the producer), but we
             // defensively coerce non-string values to their string form.
-            let s = v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string());
+            let s = v
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| v.to_string());
             env_table.insert(k, toml_edit::value(s));
         }
         brain.insert("env", Item::Table(env_table));
@@ -808,7 +798,8 @@ pub fn unregister_from_client(config_path: &Path) -> McpResult<()> {
         return Ok(());
     }
     let raw = std::fs::read_to_string(config_path)?;
-    let mut root: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}));
+    let mut root: serde_json::Value =
+        serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(servers) = root
         .as_object_mut()
         .and_then(|o| o.get_mut("mcpServers"))
@@ -868,7 +859,10 @@ mod tests {
             raw.contains("[mcp_servers.BRAIN]"),
             "expected [mcp_servers.BRAIN] section, got:\n{raw}"
         );
-        assert!(raw.contains("command ="), "expected command key, got:\n{raw}");
+        assert!(
+            raw.contains("command ="),
+            "expected command key, got:\n{raw}"
+        );
         assert!(raw.contains("args ="), "expected args key, got:\n{raw}");
         // The env block lives in a sub-table per Codex's TOML schema.
         assert!(
@@ -938,7 +932,10 @@ mod tests {
         )
         .unwrap();
         cleanup_orphan_json_if_brain_only(&orphan).unwrap();
-        assert!(!orphan.exists(), "BRAIN-only orphan should have been deleted");
+        assert!(
+            !orphan.exists(),
+            "BRAIN-only orphan should have been deleted"
+        );
     }
 
     #[test]
@@ -965,7 +962,10 @@ mod tests {
         let raw = r#"{"mcpServers":{"BRAIN":{"command":"x","args":[],"env":{}},"github":{"command":"gh-mcp","args":[],"env":{}}}}"#;
         std::fs::write(&mixed, raw).unwrap();
         cleanup_orphan_json_if_brain_only(&mixed).unwrap();
-        assert!(mixed.exists(), "file with non-BRAIN entries must be preserved");
+        assert!(
+            mixed.exists(),
+            "file with non-BRAIN entries must be preserved"
+        );
         let after = std::fs::read_to_string(&mixed).unwrap();
         assert_eq!(
             after, raw,
@@ -1009,7 +1009,10 @@ mod tests {
             !raw.contains("[mcp_servers.BRAIN]"),
             "BRAIN entry must be removed, got:\n{raw}"
         );
-        assert!(raw.contains("[mcp_servers.github]"), "github entry must remain");
+        assert!(
+            raw.contains("[mcp_servers.github]"),
+            "github entry must remain"
+        );
     }
 
     #[test]
@@ -1024,7 +1027,10 @@ mod tests {
 
     #[test]
     fn normalise_path_replaces_backslashes_with_forward_slashes() {
-        assert_eq!(normalise_path("C:\\Users\\p\\brain.exe"), "C:/Users/p/brain.exe");
+        assert_eq!(
+            normalise_path("C:\\Users\\p\\brain.exe"),
+            "C:/Users/p/brain.exe"
+        );
     }
 
     #[test]
@@ -1078,7 +1084,10 @@ mod tests {
         register_in_client(&config, &brain_entry()).unwrap();
         let parsed: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
-        assert!(parsed["mcpServers"]["brain"].is_null(), "legacy lowercase key must be removed");
+        assert!(
+            parsed["mcpServers"]["brain"].is_null(),
+            "legacy lowercase key must be removed"
+        );
         assert!(parsed["mcpServers"]["BRAIN"]["command"].as_str() == Some("brain"));
     }
 
@@ -1128,7 +1137,10 @@ mod tests {
         let err = register_in_client(&config, &brain_entry()).unwrap_err();
         assert!(matches!(err, super::super::McpError::Json(_)));
         // Original contents must be preserved.
-        assert_eq!(std::fs::read_to_string(&config).unwrap(), "this is not json");
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "this is not json"
+        );
     }
 
     #[test]
@@ -1203,8 +1215,7 @@ mod tests {
         let first = candidates.first().expect("at least one candidate");
         let s = first.to_string_lossy();
         assert!(
-            s.contains("\\Packages\\Claude_abcdef123\\")
-                && s.contains("\\LocalCache\\"),
+            s.contains("\\Packages\\Claude_abcdef123\\") && s.contains("\\LocalCache\\"),
             "sandbox path must come first, got {first:?}"
         );
     }

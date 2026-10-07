@@ -79,9 +79,12 @@ pub async fn enable_vault_encryption(
         // past can never be pushed; decide BEFORE flipping the canary.
         let was_encrypted = crate::wiki::encryption::is_encrypted(&convert_vault);
         let key = match &provided_key {
-            Some(hex) => {
-                crate::wiki::encryption::enable_encryption_with_key(&convert_vault, &store, &exe, hex)
-            }
+            Some(hex) => crate::wiki::encryption::enable_encryption_with_key(
+                &convert_vault,
+                &store,
+                &exe,
+                hex,
+            ),
             None => crate::wiki::encryption::enable_encryption(&convert_vault, &store, &exe),
         }
         .map_err(|e| format!("{e:#}"))?;
@@ -108,9 +111,10 @@ pub async fn enable_vault_encryption(
     // watcher regardless of the convert outcome so auto-commit resumes.
     if let Some(db) = state.db() {
         let reindex_vault = vault.clone();
-        let _ =
-            tokio::task::spawn_blocking(move || crate::db::pages_index::rebuild(&db, &reindex_vault))
-                .await;
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::db::pages_index::rebuild(&db, &reindex_vault)
+        })
+        .await;
     }
     state.set_watcher(Some(crate::wiki::watcher::spawn(
         app,
@@ -190,9 +194,10 @@ pub async fn disable_vault_encryption(
 
     if let Some(db) = state.db() {
         let reindex_vault = vault.clone();
-        let _ =
-            tokio::task::spawn_blocking(move || crate::db::pages_index::rebuild(&db, &reindex_vault))
-                .await;
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::db::pages_index::rebuild(&db, &reindex_vault)
+        })
+        .await;
     }
     state.set_watcher(Some(crate::wiki::watcher::spawn(
         app,
@@ -272,10 +277,7 @@ pub fn disconnect_git_remote(state: State<Arc<crate::state::AppState>>) -> Brain
 /// Attach (or update) the sync remote. Enforces the encryption coupling
 /// (a network URL requires an encrypted vault).
 #[tauri::command]
-pub fn set_git_remote(
-    state: State<Arc<crate::state::AppState>>,
-    url: String,
-) -> BrainResult<()> {
+pub fn set_git_remote(state: State<Arc<crate::state::AppState>>, url: String) -> BrainResult<()> {
     let wiki = current_wiki_dir(&state)?;
     sync::set_remote(&wiki, &url).map_err(BrainError::from)
 }
@@ -325,9 +327,7 @@ pub async fn verify_git_remote(
 /// changed (the merge/FF re-materialises pages). Returns a report for the
 /// UI.
 #[tauri::command]
-pub async fn sync_now(
-    state: State<'_, Arc<crate::state::AppState>>,
-) -> BrainResult<SyncReport> {
+pub async fn sync_now(state: State<'_, Arc<crate::state::AppState>>) -> BrainResult<SyncReport> {
     let vault = state
         .vault_path()
         .ok_or_else(|| BrainError::Internal("no vault is currently mounted".into()))?;
@@ -344,9 +344,9 @@ pub async fn sync_now(
     let (tag, conflicted, changed) = match &outcome {
         MergeOutcome::UpToDate => ("up-to-date", Vec::new(), false),
         MergeOutcome::FastForward(_) => ("fast-forward", Vec::new(), true),
-        MergeOutcome::Merged { conflicted_pages, .. } => {
-            ("merged", conflicted_pages.clone(), true)
-        }
+        MergeOutcome::Merged {
+            conflicted_pages, ..
+        } => ("merged", conflicted_pages.clone(), true),
     };
 
     // The merge/FF re-materialised the working tree; refresh the index so
@@ -402,10 +402,7 @@ pub fn wiki_commit_detail(
 }
 
 #[tauri::command]
-pub fn wiki_hard_reset(
-    state: State<Arc<crate::state::AppState>>,
-    sha: String,
-) -> BrainResult<()> {
+pub fn wiki_hard_reset(state: State<Arc<crate::state::AppState>>, sha: String) -> BrainResult<()> {
     let dir = current_wiki_dir(&state)?;
     history::hard_reset(&dir, &sha).map_err(BrainError::from)
 }
