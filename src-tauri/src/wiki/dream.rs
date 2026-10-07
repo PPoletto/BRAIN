@@ -12,7 +12,7 @@
 //!
 //! | priority | kind | suggested action |
 //! |---|---|---|
-//! | 1 | `duplicate-candidate` (hygiene pair: same title, or content alike in a model index) | `merge` |
+//! | 1 | `duplicate-candidate` (hygiene pair: same title, or content alike in a model index) | `merge` (`check-or-distinct` for a same title with similarity < 0.7) |
 //! | 1 | `broken-link` (links to missing pages, per source page) | `fix-link` |
 //! | 1 | `broken-source` (a `sources` entry without a page) | `fix-link` |
 //! | 2 | `summary-stale` (body changed since the summary was written) | `update-summary` |
@@ -237,6 +237,12 @@ pub fn load_dream_rows(conn: &rusqlite::Connection) -> DbResult<DreamRows> {
 /// Why a duplicate pair is in the queue: "same title" and/or "pages read
 /// almost the same", with the similarity when there is one.
 fn duplicate_reason(pair: &super::hygiene::DuplicatePair) -> String {
+    if pair.same_title_low_similarity() {
+        return format!(
+            "same title, low similarity ({:.2})",
+            pair.similarity.unwrap_or_default()
+        );
+    }
     match (pair.same_title, pair.reads_alike(), pair.similarity) {
         (true, true, Some(s)) => {
             format!("same title, pages read almost the same (similarity {s:.2})")
@@ -270,12 +276,19 @@ pub fn build_queue_with_history(
     // broken links (one item per source page) and broken sources.
     for pair in rows.hygiene.duplicate_pairs() {
         let reason = duplicate_reason(&pair);
+        // Same name, different content: probably two things — check and
+        // mark them distinct rather than merging.
+        let action = if pair.same_title_low_similarity() {
+            "check-or-distinct"
+        } else {
+            "merge"
+        };
         candidates.push(item(
             1,
             "duplicate-candidate",
             vec![pair.a, pair.b],
             reason,
-            "merge",
+            action,
         ));
     }
     let mut by_src: Vec<(String, Vec<String>)> = Vec::new();
@@ -441,7 +454,8 @@ pub fn build_queue_with_history(
 /// Whether an item with action `a` may share a page with one of action
 /// `b` (only merge ↔ fix-link).
 fn exempt_from_dedupe(a: &str, b: &str) -> bool {
-    matches!((a, b), ("merge", "fix-link") | ("fix-link", "merge"))
+    let pair_action = |s: &str| s == "merge" || s == "check-or-distinct";
+    (pair_action(a) && b == "fix-link") || (a == "fix-link" && pair_action(b))
 }
 
 fn item(priority: u8, kind: &str, pages: Vec<String>, reason: String, action: &str) -> DreamItem {
@@ -1133,6 +1147,57 @@ One block per dream session (brain_dream action log): the session line, then one
             .map(|i| i.reason.clone())
             .collect();
         assert_eq!(reasons, vec!["same title".to_string()]);
+    }
+
+    /// Two pages titled "Michael Meier" whose vectors have cosine 0.6.
+    fn same_title_low_similarity_pair(db: &DbHandle) {
+        exec(
+            db,
+            "INSERT INTO schema_meta(key, value) VALUES ('index_embedder', 'bge-m3')",
+            &[],
+        );
+        for (id, v) in [("entities/a", [1.0f32, 0.0]), ("entities/b", [0.6, 0.8])] {
+            page(db, id, NOW);
+            exec(
+                db,
+                "UPDATE pages SET title = 'Michael Meier' WHERE id = ?1",
+                &[&id],
+            );
+            exec(
+                db,
+                "INSERT INTO page_vectors(page_id, embedding) VALUES (?1, ?2)",
+                &[&id, &vec_to_bytes(&v)],
+            );
+        }
+    }
+
+    #[test]
+    fn a_same_title_pair_with_low_similarity_asks_to_check_or_mark_distinct() {
+        let (_tmp, db) = open_db();
+        same_title_low_similarity_pair(&db);
+        let actions: Vec<String> = queue(&db)
+            .items
+            .iter()
+            .filter(|i| i.kind == "duplicate-candidate")
+            .map(|i| i.suggested_action.clone())
+            .collect();
+        assert_eq!(actions, vec!["check-or-distinct".to_string()]);
+    }
+
+    #[test]
+    fn a_same_title_pair_with_low_similarity_names_the_similarity_in_its_reason() {
+        let (_tmp, db) = open_db();
+        same_title_low_similarity_pair(&db);
+        let reasons: Vec<String> = queue(&db)
+            .items
+            .iter()
+            .filter(|i| i.kind == "duplicate-candidate")
+            .map(|i| i.reason.clone())
+            .collect();
+        assert_eq!(
+            reasons,
+            vec!["same title, low similarity (0.60)".to_string()]
+        );
     }
 
     #[test]

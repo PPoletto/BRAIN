@@ -345,8 +345,10 @@ same findings live (concise: counts per kind; then `response_format:
 
 - `duplicate-candidate` — two pages of the same type that read almost
   the same (similarity score in the message) or carry the same title
-  ("same title": equal after ignoring case, extra spaces and a trailing
-  parenthetical such as "(Mutter)"). Open both; if they describe the
+  ("same title": equal after ignoring case and extra spaces, or one is
+  the other plus a trailing parenthetical such as "(Mutter)"; source
+  pages and generic titles like "Notes" or "Meeting" do not count).
+  Open both; if they describe the
   same thing, merge the weaker into the stronger (`brain_refactor`,
   `action: "merge"`). If they are genuinely different, add the other id
   to `distinct_from` on one of them (detailed read first) — that ends
@@ -405,6 +407,11 @@ A dream session (the `dream` prompt contains the same protocol):
      `action: "merge"`) and tidy
      the appended section with `brain_patch_page`. If not, leave them (and
      add `distinct_from` if they share a name — detailed read first).
+   - `check-or-distinct` — same title, but the pages share little
+     content (similarity below 0.7): most likely two different things
+     with one name. Read both; usually add `distinct_from` (detailed
+     read first) and, if it helps, a distinguishing title; merge only if
+     they really are the same thing.
    - `update-summary` / `write-summary` — read the page with
      `brain_get_pages` and `response_format: "detailed"`, then write a
      fitting one-to-two-sentence `summary` (`brain_patch_page` cannot edit

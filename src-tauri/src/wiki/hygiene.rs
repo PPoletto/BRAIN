@@ -56,6 +56,29 @@ const SKIPPED_KIND: &str = "duplicate-detection-skipped";
 /// the same subject); the group is reported once as a note instead.
 pub const TITLE_GROUP_MAX_PAGES: usize = 10;
 
+/// A same-title pair whose page vectors are less similar than this is
+/// probably two different things that share a name: the dream queue asks
+/// to check it (or mark it distinct) instead of suggesting a merge.
+pub const LOW_TITLE_SIMILARITY: f32 = 0.7;
+
+/// Titles too generic to signal a duplicate (compared after
+/// normalisation, see [`title_keys`]).
+const GENERIC_TITLES: &[&str] = &[
+    "notizen",
+    "notes",
+    "kickoff",
+    "meeting",
+    "todo",
+    "readme",
+    "index",
+    "übersicht",
+    "overview",
+];
+
+/// Page type left out of the same-title rule: source pages of mail and
+/// calendar ingestion repeat subjects without being duplicates.
+const TITLE_RULE_SKIPS_TYPE: &str = "source";
+
 /// What [`evaluate`] found: page findings (warnings) and info notes.
 #[derive(Debug, Default)]
 pub struct HygieneFindings {
@@ -390,6 +413,12 @@ impl DuplicatePair {
         self.similarity
             .is_some_and(|s| s >= DUPLICATE_SIMILARITY_THRESHOLD)
     }
+
+    /// Same title, but the page vectors are less similar than
+    /// [`LOW_TITLE_SIMILARITY`] — likely two things sharing a name.
+    pub fn same_title_low_similarity(&self) -> bool {
+        self.same_title && self.similarity.is_some_and(|s| s < LOW_TITLE_SIMILARITY)
+    }
 }
 
 /// The comparison keys of a title for the same-title rule: the title
@@ -578,23 +607,48 @@ fn content_pairs(rows: &HygieneRows, notes: &mut Vec<LintWarning>) -> Vec<(usize
     out
 }
 
-/// Index pairs `(i, j)` (`i < j`) of same-type pages sharing a title key
-/// (see [`title_keys`]), without pairs declared distinct. A group of more
-/// than [`TITLE_GROUP_MAX_PAGES`] pages is reported as one note instead.
+/// Index pairs `(i, j)` (`i < j`) of same-type pages with the same title
+/// (see [`title_keys`]): equal normalised titles, or a title that equals
+/// another one once its trailing parenthetical is removed ("X (Mutter)"
+/// and "X" — but not "X (Mutter)" and "X (Tochter)", whose
+/// parentheticals tell them apart). Source pages and generic titles
+/// ([`GENERIC_TITLES`]) take no part; pairs declared distinct are left
+/// out. A group of more than [`TITLE_GROUP_MAX_PAGES`] pages with one
+/// title is reported as one note instead.
 fn title_pairs(pages: &[PageRow], notes: &mut Vec<LintWarning>) -> Vec<(usize, usize)> {
     let mut groups: BTreeMap<(&str, String), Vec<usize>> = BTreeMap::new();
+    let mut shortened: Vec<(usize, String)> = Vec::new();
     for (idx, page) in pages.iter().enumerate() {
+        if page.page_type == TITLE_RULE_SKIPS_TYPE {
+            continue;
+        }
         let Some(title) = page.title.as_deref() else {
             continue;
         };
-        for key in title_keys(title) {
-            let members = groups.entry((page.page_type.as_str(), key)).or_default();
-            if members.last() != Some(&idx) {
-                members.push(idx);
-            }
+        let mut keys = title_keys(title).into_iter();
+        let Some(full) = keys.next() else {
+            continue;
+        };
+        if GENERIC_TITLES.contains(&full.as_str()) {
+            continue;
         }
+        if let Some(short) = keys
+            .next()
+            .filter(|s| !GENERIC_TITLES.contains(&s.as_str()))
+        {
+            shortened.push((idx, short));
+        }
+        groups
+            .entry((page.page_type.as_str(), full))
+            .or_default()
+            .push(idx);
     }
     let mut out: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut add = |i: usize, j: usize| {
+        if i != j && !declared_distinct(&pages[i], &pages[j]) {
+            out.insert((i.min(j), i.max(j)));
+        }
+    };
     for ((page_type, key), members) in &groups {
         if members.len() < 2 {
             continue;
@@ -613,9 +667,19 @@ fn title_pairs(pages: &[PageRow], notes: &mut Vec<LintWarning>) -> Vec<(usize, u
         }
         for (n, &i) in members.iter().enumerate() {
             for &j in &members[n + 1..] {
-                if !declared_distinct(&pages[i], &pages[j]) {
-                    out.insert((i, j));
-                }
+                add(i, j);
+            }
+        }
+    }
+    // "X (Mutter)" pairs with a page titled plainly "X".
+    for (idx, short) in shortened {
+        let key = (pages[idx].page_type.as_str(), short);
+        if let Some(members) = groups
+            .get(&key)
+            .filter(|m| m.len() <= TITLE_GROUP_MAX_PAGES)
+        {
+            for &j in members {
+                add(idx, j);
             }
         }
     }
@@ -1069,6 +1133,79 @@ mod tests {
     }
 
     #[test]
+    fn titles_with_different_trailing_parentheticals_are_not_a_duplicate_candidate() {
+        let (_tmp, db) = open_db();
+        insert_titled_page(
+            &db,
+            "entities/maria-mutter",
+            "entity",
+            "Maria Muster (Mutter)",
+        );
+        insert_titled_page(
+            &db,
+            "entities/maria-tochter",
+            "entity",
+            "Maria Muster (Tochter)",
+        );
+        assert!(duplicate_pairs_of(&db).is_empty());
+    }
+
+    #[test]
+    fn a_plain_title_pairs_with_each_parenthetical_variant_but_those_not_with_each_other() {
+        let (_tmp, db) = open_db();
+        insert_titled_page(&db, "entities/maria", "entity", "Maria Muster");
+        insert_titled_page(
+            &db,
+            "entities/maria-mutter",
+            "entity",
+            "Maria Muster (Mutter)",
+        );
+        insert_titled_page(
+            &db,
+            "entities/maria-tochter",
+            "entity",
+            "Maria Muster (Tochter)",
+        );
+        assert_eq!(
+            duplicate_pairs_of(&db),
+            vec![
+                (
+                    "entities/maria".to_string(),
+                    "entities/maria-mutter".to_string()
+                ),
+                (
+                    "entities/maria".to_string(),
+                    "entities/maria-tochter".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn source_pages_with_the_same_title_are_not_a_duplicate_candidate() {
+        let (_tmp, db) = open_db();
+        insert_titled_page(&db, "sources/mail-1", "source", "Re: Angebot");
+        insert_titled_page(&db, "sources/mail-2", "source", "Re: Angebot");
+        assert!(duplicate_pairs_of(&db).is_empty());
+    }
+
+    #[test]
+    fn generic_titles_are_not_a_duplicate_signal() {
+        let (_tmp, db) = open_db();
+        insert_titled_page(&db, "topics/notes-a", "topic", "Notizen");
+        insert_titled_page(&db, "topics/notes-b", "topic", "notizen");
+        assert!(duplicate_pairs_of(&db).is_empty());
+    }
+
+    #[test]
+    fn a_generic_title_with_a_parenthetical_does_not_pair_with_the_bare_generic_title() {
+        let (_tmp, db) = open_db();
+        insert_titled_page(&db, "topics/kickoff", "topic", "Kickoff");
+        insert_titled_page(&db, "topics/kickoff-a", "topic", "Kickoff (Projekt A)");
+        assert!(duplicate_pairs_of(&db).is_empty());
+    }
+
+    #[test]
     fn pages_of_different_types_with_the_same_title_are_not_a_duplicate_candidate() {
         let (_tmp, db) = open_db();
         insert_titled_page(&db, "entities/nis2", "entity", "NIS2");
@@ -1145,19 +1282,14 @@ mod tests {
     fn more_same_title_pages_than_the_group_cap_become_one_note() {
         let (_tmp, db) = open_db();
         for i in 0..=TITLE_GROUP_MAX_PAGES {
-            insert_titled_page(
-                &db,
-                &format!("sources/mail-{i:02}"),
-                "source",
-                "Re: Angebot",
-            );
+            insert_titled_page(&db, &format!("topics/t-{i:02}"), "topic", "Projekt Alpha");
         }
         let findings = check(&db, false, NOW).unwrap();
         assert!(
             kinds(&findings, "duplicate-candidate").is_empty()
                 && findings.notes.iter().any(|n| n
                     .message
-                    .starts_with("11 pages of type 'source' share the title")),
+                    .starts_with("11 pages of type 'topic' share the title")),
             "{:?}",
             findings.notes
         );

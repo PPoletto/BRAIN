@@ -10,14 +10,20 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Same title = possible duplicate.** The lint report, the daily audit
   and the dream queue now also flag two pages of the same type whose
-  titles are equal (ignoring upper/lower case, extra spaces and a
-  trailing parenthetical such as "Maria Muster (Mutter)") as
-  `duplicate-candidate` with the reason "same title" — no embedding
-  model needed. The similarity is shown too when both pages have
-  vectors; a pair found both by title and by content is listed once.
-  `distinct_from` on either page silences the pair as before. More than
-  ten pages of one type sharing one title (mail sources with the same
-  subject) are summarised in one note instead of being listed pairwise.
+  titles are equal (ignoring upper/lower case and extra spaces), or where
+  one title is the other plus a trailing parenthetical ("Maria Muster
+  (Mutter)" and "Maria Muster" — but not "… (Mutter)" and
+  "… (Tochter)"), as `duplicate-candidate` with the reason "same title"
+  — no embedding model needed. Source pages (mail subjects repeat) and
+  generic titles (Notizen, Notes, Kickoff, Meeting, Todo, Readme, Index,
+  Übersicht, Overview) are left out. The similarity is shown too when
+  both pages have vectors; a pair found both by title and by content is
+  listed once. When the same-title pages share little content
+  (similarity below 0.7), the dream queue suggests `check-or-distinct`
+  ("same title, low similarity") instead of a merge. `distinct_from` on
+  either page silences the pair as before. More than ten pages of one
+  type sharing one title are summarised in one note instead of being
+  listed pairwise.
   Both real duplicates of the first dream session had the same title but
   stayed below the 0.92 similarity threshold.
 
