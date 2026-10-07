@@ -88,6 +88,9 @@ pub fn get_graph(
     graph::build_graph(&vault, &filters).map_err(BrainError::from)
 }
 
+/// Most rows the viewer's query list / table shows.
+const VIEWER_QUERY_CAP: usize = 200;
+
 /// Runs a Dataview-style query (e.g. `type:source AND tag:customer AND updated:>2026-04-01`)
 /// against the SQLite index. Returns matching pages sorted by updated_at DESC.
 #[tauri::command]
@@ -105,7 +108,12 @@ pub fn query_pages(
     } else {
         trimmed
     };
-    super::query::executor::run(&db, query).map_err(|err| BrainError::Internal(err.to_string()))
+    let mut hits = super::query::executor::run(&db, query)
+        .map_err(|err| BrainError::Internal(err.to_string()))?;
+    // The viewer's list and table show at most this many rows (the query
+    // itself is uncapped since 0.3.6 — brain_query pages through it).
+    hits.truncate(VIEWER_QUERY_CAP);
+    Ok(hits)
 }
 
 /// B1: run the retrieval eval of the mounted vault (Settings → "Search

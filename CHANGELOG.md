@@ -90,6 +90,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`brain_query` reaches every page.** A structured query stopped at
+  200 pages: `total` said 200, there was no `next_offset`, and a
+  `prefix` was applied to those 200 only — pages beyond them could not
+  be listed or found by prefix. The query is no longer cut: `total` is
+  the true number of matches, `limit` / `offset` page through all of
+  them with `next_offset` while more remain, and the prefix filter sees
+  every match. The app's Query view and table still show the first 200.
 - **Hybrid search no longer buries the best semantic hit.** On a real
   vault (50 curated eval questions, bge-m3) hybrid search scored far
   below semantic search alone — Recall@10 0.800 / MRR 0.720 / nDCG@10

@@ -18,18 +18,18 @@ pub struct CompiledQuery {
 
 /// Selected columns, in the order `executor` reads them. `page_access`
 /// (H3 salience) is LEFT JOINed: pages never read have no row there.
-const BASE_SQL: &str = "SELECT pages.id, pages.type, pages.path, pages.title, pages.frontmatter, \
-                        pages.body, pages.updated_at, COALESCE(pa.reads, 0), \
+const BASE_SQL: &str = "SELECT pages.id, pages.type, pages.path, pages.title, NULL, \
+                        NULL, pages.updated_at, COALESCE(pa.reads, 0), \
                         COALESCE(pa.search_hits, 0), pa.last_read_at, pages.valid_from, \
                         pages.valid_to, pages.superseded_by, \
                         (SELECT group_concat(pt.tag, char(31)) FROM page_tags pt \
                          WHERE pt.page_id = pages.id), pages.summary \
                        FROM pages LEFT JOIN page_access pa ON pa.page_id = pages.id WHERE ";
 
-const ORDER_BY_UPDATED: &str = " ORDER BY COALESCE(updated_at, '') DESC, pages.id ASC LIMIT 200";
+const ORDER_BY_UPDATED: &str = " ORDER BY COALESCE(updated_at, '') DESC, pages.id ASC";
 
 const ORDER_BY_SALIENCE: &str = " ORDER BY (COALESCE(pa.reads, 0) * 2 + COALESCE(pa.search_hits, 0)) DESC, \
-                                 COALESCE(updated_at, '') DESC, pages.id ASC LIMIT 200";
+                                 COALESCE(updated_at, '') DESC, pages.id ASC";
 
 /// Result order of a query (`sort:` clause).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

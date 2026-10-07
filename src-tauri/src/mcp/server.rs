@@ -4344,6 +4344,71 @@ mod tests {
         );
     }
 
+    /// 250 entity pages `entities/p000` … `entities/p249`, indexed.
+    fn large_indexed_vault() -> (tempfile::TempDir, crate::db::DbHandle) {
+        use crate::vault::layout::{ensure_skeleton, wiki_dir};
+        let tmp = tempfile::TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        seed_marker(tmp.path());
+        let dir = wiki_dir(tmp.path()).join("entities");
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..250 {
+            std::fs::write(
+                dir.join(format!("p{i:03}.md")),
+                format!(
+                    "---\nid: entities/p{i:03}\ntype: entity\ntitle: P{i:03}\nupdated: 2026-04-30\n---\n\nbody\n"
+                ),
+            )
+            .unwrap();
+        }
+        let db = crate::db::DbHandle::open(tmp.path()).unwrap();
+        crate::db::pages_index::rebuild(&db, tmp.path()).unwrap();
+        (tmp, db)
+    }
+
+    #[test]
+    fn query_star_reports_the_true_total_beyond_two_hundred_pages() {
+        let (tmp, db) = large_indexed_vault();
+        let result = query_call(tmp.path(), json!({ "query": "*" }), Some(db));
+        assert_eq!(result["total"], json!(250));
+    }
+
+    #[test]
+    fn query_star_pages_through_every_page_with_next_offset() {
+        let (tmp, db) = large_indexed_vault();
+        let mut seen: Vec<String> = Vec::new();
+        let mut offset = 0;
+        loop {
+            let result = query_call(
+                tmp.path(),
+                json!({ "query": "*", "limit": 100, "offset": offset }),
+                Some(db.clone()),
+            );
+            seen.extend(hit_ids(&result));
+            match result["next_offset"].as_u64() {
+                Some(next) => offset = next as usize,
+                None => break,
+            }
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 250);
+    }
+
+    #[test]
+    fn query_with_a_prefix_finds_a_page_beyond_position_two_hundred() {
+        let (tmp, db) = large_indexed_vault();
+        let result = query_call(
+            tmp.path(),
+            json!({ "query": "type:entity", "prefix": "entities/p24" }),
+            Some(db),
+        );
+        assert!(
+            hit_ids(&result).contains(&"entities/p245".to_string()),
+            "{result}"
+        );
+    }
+
     #[test]
     fn query_with_an_offset_skips_leading_hits() {
         let (tmp, db) = indexed_sample_vault();
