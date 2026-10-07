@@ -329,8 +329,8 @@ vor (Tiefschlaf); ein geplanter Agenten-Lauf über MCP erledigt das inhaltliche 
   Hooks in `brain_get_pages` (reads, auch mit `include_context`) und `brain_search` (Treffer in
   Top-10). `brain_query` erhält `sort:salience`; Audit/Traumqueue nutzen sie. Keine
   Zeitstempel ins Frontmatter (würde Commits erzeugen) — nur DB, lokal, nicht gesynct.
-- H4 (später, optional) lokaler LLM-Provider (Ollama) ausschließlich für
-  `summary`-Erzeugung innerhalb von BRAIN, Flag-gesteuert; erst wenn H2 im Alltag läuft.
+- ~~H4 lokaler LLM-Provider~~ — verworfen (07.10.2026): BRAIN bleibt ohne eigenes LLM,
+  siehe ADR-001 (`docs/adr/ADR-001-no-embedded-llm.md`, lokal, nicht versioniert) und „Nicht in diesem Plan".
 
 **Akzeptanzkriterien**
 - Nach einem Mount + 24 h existieren `00_meta/audit/<datum>.md` und `dream-queue.md`; die
@@ -341,7 +341,7 @@ vor (Tiefschlaf); ein geplanter Agenten-Lauf über MCP erledigt das inhaltliche 
   reduziert die Queue beim nächsten Tiefschlaf um genau diesen Eintrag.
 
 **Aufwand:** H1 S–M, H2 S, H3 S. **Risiko:** gering (alles additiv, nichts löscht).
-**Release:** 0.3.5 (H1–H3), H4 offen.
+**Release:** 0.3.5 (H1–H3); H4 verworfen (ADR-001).
 
 ---
 
@@ -367,7 +367,7 @@ vor (Tiefschlaf); ein geplanter Agenten-Lauf über MCP erledigt das inhaltliche 
 | Release | Inhalt | Begründung |
 |---|---|---|
 | **0.3.5** | Contextual Chunking + Rename/Delete/Merge (committed) · **Slice 0** (Spec-Abgleich, Versions-Logging, Dual-Version-Server) · **Slice A** (Aliases/Dublettenprüfung, Hygiene-Lint, Audit-Report, Index-Konsistenz) · **Slice B** (Eval + `summary`) · **Slice C** (Gültigkeit/Provenienz) · **Slice D** (MCP straffen, ohne Übergangsfrist) · **Slice H1–H3** (Traumqueue, Traum-Protokoll, Salienz) · **G4** Batch-Rebuild | Alles, was ohne Messdaten gebaut werden kann; Agenten lesen `tools/list` pro Sitzung, daher kein Alias-Zwischenschritt |
-| **0.3.6** | Slice E (Reranker, gated durch Eval-Zahlen aus B1) + Slice F (Viewer: ähnliche Seiten, Tabellen) + H4 (lokaler LLM-Provider, optional) | Erst nach Messung bzw. Alltagserfahrung mit dem Traum-Protokoll |
+| **0.3.6** | Slice E (Reranker, gated durch Eval-Zahlen aus B1) + Slice F (Viewer: ähnliche Seiten ✅, Tabellen ✅) — H4 verworfen (ADR-001) | Erst nach Messung bzw. Alltagserfahrung mit dem Traum-Protokoll |
 | offen | Slice G (Graph-Nachbarn, geteilter Daemon, Quantisierung) | nur bei konkretem Bedarf |
 
 **Umsetzungswellen für 0.3.5** (sequenziell, weil `mcp/server.rs` von fast allem berührt wird):
@@ -384,14 +384,16 @@ Review-Runden vor dem Release.
 
 | # | Item | Warum | Größe |
 |---|---|---|---|
-| 1 | **Titel-Gleichheit als Dubletten-Signal.** Hygiene und Traumqueue melden zwei Seiten gleichen Typs mit identischem (normalisiertem) Titel als `duplicate-candidate`, unabhängig von der Embedding-Ähnlichkeit; `distinct_from` unterdrückt wie bisher. | Beide echten Dubletten des ersten Traumlaufs (Firmenseite, COCKPIT) hatten denselben Titel, lagen aber unter der 0,92-Schwelle; `brain_lookup` greift nur über Slugs. Billig, treffsicher. | S |
-| 2 | **YAML-Hinweis für Summaries.** Tool-Beschreibung von `brain_write_page`/`brain_write_batch`: Summary quoten, wenn sie `: ` enthält; optional serverseitig den Parse-Fehler mit genau diesem Hinweis anreichern. | Erster Schreibversuch im Traumlauf scheiterte an „mapping values are not allowed"; der Fehler war sauber, aber ohne Hinweis auf die Ursache. | XS |
+| 1 | ✅ **erledigt (0.3.6)** — **Titel-Gleichheit als Dubletten-Signal.** Hygiene und Traumqueue melden zwei Seiten gleichen Typs mit identischem (normalisiertem) Titel als `duplicate-candidate`, unabhängig von der Embedding-Ähnlichkeit; `distinct_from` unterdrückt wie bisher. | Beide echten Dubletten des ersten Traumlaufs (Firmenseite, COCKPIT) hatten denselben Titel, lagen aber unter der 0,92-Schwelle; `brain_lookup` greift nur über Slugs. Billig, treffsicher. | S |
+| 2 | ✅ **erledigt (0.3.6)** — **YAML-Hinweis für Summaries.** Tool-Beschreibung von `brain_write_page`/`brain_write_batch`: Summary quoten, wenn sie `: ` enthält; optional serverseitig den Parse-Fehler mit genau diesem Hinweis anreichern. | Erster Schreibversuch im Traumlauf scheiterte an „mapping values are not allowed"; der Fehler war sauber, aber ohne Hinweis auf die Ursache. | XS |
 | 3 | ✅ **erledigt (0.3.6)** — **Memory-Prompt und SKILL.md per Schalter installieren.** Settings → MCP: markierter Block in `~/.claude/CLAUDE.md` und `~/.codex/AGENTS.md`, SKILL.md nach `~/.claude/skills/brain-wiki/`; Versionsmarke, Block-Ersatz bei Update, Entfernen bei Abwahl. Claude Desktop bleibt Copy-Paste. | „Update vault templates" ändert am Client nichts; der kopierte Prompt veraltet still. **Entscheidung Pascal offen** (Prompt gilt dann in allen Claude-Code-Projekten). | M |
 | 4 | ✅ **erledigt (0.3.6)** — **Traum-Log auswerten.** Kleine Auswertung je Item-Art: wie oft done/skipped/deferred; Anzeige in Integrity oder als Resource. | Das strukturierte Log aus 0.3.5 liefert die Daten, genutzt werden sie noch nicht. | S |
 | 5 | ✅ **erledigt (0.3.6, nur Prompt/AGENTS.md)** — **`missing-sources` für Ingestion-Seiten** halbautomatisch: Lint-Session-Prompt schlägt den Master-Index der jeweiligen Mail-Ingestion als `sources`-Eintrag vor. | Fast jede aus Mails erzeugte Seite trägt die Warnung; von Hand ist das Fleißarbeit. | S |
-| 6 | **Repo-Hygiene:** repo-weites `cargo fmt` als eigener Commit, ungenutztes `axum`-Crate entfernen, flaky Windows-Test `viewer::eval::tests::concurrent_adds_keep_every_entry` (Datei-Lock-Rennen) stabilisieren. | Technische Schulden aus dem 0.3.5-Zyklus. | S |
+| 6 | ✅ **erledigt (0.3.6)** — **Repo-Hygiene:** repo-weites `cargo fmt` als eigener Commit, ungenutztes `axum`-Crate entfernen, flaky Windows-Test `viewer::eval::tests::concurrent_adds_keep_every_entry` (Datei-Lock-Rennen) stabilisieren. | Technische Schulden aus dem 0.3.5-Zyklus. | S |
 | 7 | ✅ **Entwürfe liegen (0.3.6)** unter `docs/spec-addenda/` — **Spec-Addenda** S03 (Lint/Hygiene), S06 (MCP-Oberfläche/Protokoll), S09 (Index/Suche) als Entwürfe unter `docs/`, Übernahme nach `requirements/` durch Pascal. | CLAUDE.md verlangt Spec-Deckung für Verhaltensänderungen; `requirements/` ist für den Build-Agenten read-only. | M |
-| — | Slice E Reranker, Slice F Viewer, H4 lokaler LLM-Provider | wie in der Release-Tabelle: gated durch `brain eval`-Zahlen bzw. Alltagserfahrung | L |
+| — | ✅ Slice F Viewer (ähnliche Seiten, Tabellenansicht) erledigt (0.3.6); offen: Slice E Reranker. H4 lokaler LLM-Provider verworfen (ADR-001) | Slice E gated durch `brain eval`-Zahlen | L |
+| 8 | ✅ **erledigt (0.3.6)** — **Fusion der Hybrid-Suche** dense-first statt RRF (RRF drückte im echten Vault den besten semantischen Treffer aus den Top 10: hybrid R@10 0,80 vs. dense 0,96); `brain eval` zeigt alle fünf Varianten. Nachmessung im echten Vault steht aus. | Eval-Lauf des Nutzers, 50 Fragen | S |
+| 9 | ✅ **erledigt (0.3.6)** — **`brain_query` ohne 200er-Kappung**: wahres `total`, `next_offset`, Präfix vor dem Paging. | Seiten jenseits von 200 waren unerreichbar | XS |
 
 ## Nicht in diesem Plan (bewusst)
 
@@ -399,6 +401,12 @@ GraphRAG/LightRAG mit LLM-Extraktion, Memory-Frameworks als Abhängigkeit, Wechs
 Vektor-DB, Embedding-Modellwechsel (C-11), F16/INT8 für bge-m3, ColBERT, HyDE/Query-
 Rewriting in BRAIN, Remote-HTTP-MCP, eingebaute Chat-UI (C-08). Begründungen im
 Recherche-Bericht, Abschnitt C.
+
+**Eigenes LLM in BRAIN (ehemals H4, lokaler LLM-Provider):** verworfen am 07.10.2026.
+BRAIN bleibt ohne eigenes Sprachmodell und wird nur über externe LLM-Clients per MCP
+bedient; das Traum-Protokoll teilt die Arbeit (BRAIN die mechanische Hälfte, der Agent
+die denkende). bge-m3-Embeddings sind davon nicht betroffen. Siehe
+ADR-001 (`docs/adr/ADR-001-no-embedded-llm.md`, lokal, nicht versioniert).
 
 ## Ergebnis der Zusammenführung mit `/deep-research`
 

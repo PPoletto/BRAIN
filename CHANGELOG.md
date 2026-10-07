@@ -76,12 +76,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   calendar ingestion, the master-index topic page of that ingestion wave
   counts as a source, and how to find it (the "Verwandt im Brain" link
   or `brain_query`). Use "Update vault templates" to pass it on.
-- **Clearer error for a summary with a colon.** A `summary` or `title`
-  whose unquoted value contains `: ` (e.g. "… (auch CIO COCKPIT):
-  SaaS-Cockpit …") is invalid YAML. `brain_write_page` and
-  `brain_write_batch` now say so in their description, and the parse
-  error ("mapping values are not allowed in this context") gets the
-  hint that YAML needs the value quoted, e.g. `summary: "…"`.
+- **Leaner build.** Seven Rust dependencies that nothing used any more
+  (an HTTP server stack from an MCP transport BRAIN never shipped, and
+  others) are no longer compiled in.
+- **No LLM inside BRAIN — recorded.** BRAIN stays without a language
+  model of its own and is driven only by your LLM client over MCP
+  (ADR-001); the planned optional local LLM provider is dropped.
 - **Release pipeline hardening.** One release build runs per tag at a
   time (a newer tag push cancels the older run instead of both writing
   into the same draft), every GitHub Action is pinned to a commit SHA,
@@ -90,6 +90,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Clearer error for a summary with a colon.** A `summary` or `title`
+  whose unquoted value contains `: ` (e.g. "… (auch CIO COCKPIT):
+  SaaS-Cockpit …") is invalid YAML. `brain_write_page` and
+  `brain_write_batch` now say so in their description, and the parse
+  error ("mapping values are not allowed in this context") gets the
+  hint that YAML needs the value quoted, e.g. `summary: "…"`.
 - **`brain_query` reaches every page.** A structured query stopped at
   200 pages: `total` said 200, there was no `next_offset`, and a
   `prefix` was applied to those 200 only — pages beyond them could not
@@ -97,6 +103,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the true number of matches, `limit` / `offset` page through all of
   them with `next_offset` while more remain, and the prefix filter sees
   every match. The app's Query view and table still show the first 200.
+- **Adding eval questions from two sessions at once works on Windows.**
+  Two concurrent `brain_eval` `add` calls could fail with "access
+  denied" while the other one released its lock; the second one now
+  waits its turn, and the eval set is written under a unique temporary
+  name.
 - **Hybrid search no longer buries the best semantic hit.** On a real
   vault (50 curated eval questions, bge-m3) hybrid search scored far
   below semantic search alone — Recall@10 0.800 / MRR 0.720 / nDCG@10

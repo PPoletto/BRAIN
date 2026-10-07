@@ -22,6 +22,7 @@ S09 beschreibt den suchgestützten Einstieg in den Viewer. Dieses Addendum besch
 
 - Die Volltextsuche gewichtet einen Treffer im Titel dreifach und in der Kurzbeschreibung fünffach gegenüber dem Text. Der Snippet stammt aus dem Teil, der am besten trifft.
 - Die semantische Suche betrachtet die 200 nächsten Abschnitte, rankt nach Ähnlichkeit und fasst sie zu Pages zusammen, bevor sie mit der Volltextsuche kombiniert wird.
+- Die kombinierte Suche ist **semantisch geführt**: die semantische Rangfolge ist die Basis; die Volltextsuche hebt nur Pages an, die beide Suchen gefunden haben, und das nur um wenige Plätze. Pages, die nur die Volltextsuche findet, folgen nach den semantischen Treffern und füllen nur eine kurze semantische Liste auf. Damit liefert die kombinierte Suche unter ihren ersten zehn Treffern mindestens die Pages, die die semantische Suche allein dort liefert. Die Messung der Suchqualität zeigt die Kennzahlen aller erwogenen Kombinationsverfahren nebeneinander.
 - Strukturierte Abfragen blenden ersetzte und abgelaufene Pages aus, sofern die Abfrage nicht ausdrücklich alle oder nur abgelaufene verlangt. Eine Sortierung nach Nutzung (meistgelesene zuerst) ist möglich.
 
 ### Messung der Suchqualität

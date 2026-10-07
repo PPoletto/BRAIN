@@ -176,8 +176,8 @@ Wiki-style `[[id]]` links resolve at index time and feed the graph view.
                       │                 │
               ┌───────▼──────┐   ┌──────▼──────┐
               │  Tray + UI   │   │ MCP server  │
-              │ (React/TS)   │   │ (stdio +    │
-              └───────┬──────┘   │  HTTP)      │
+              │ (React/TS)   │   │ (stdio)     │
+              └───────┬──────┘   │             │
                       │          └──────┬──────┘
                       ▼                 ▼
        ┌──────────────────────┐  ┌─────────────┐
@@ -204,6 +204,12 @@ Wiki-style `[[id]]` links resolve at index time and feed the graph view.
 | MCP           | [Model Context Protocol](https://modelcontextprotocol.io) JSON-RPC over stdio |
 | Update        | Tauri Updater + minisign signature verification |
 | Graph         | [Cytoscape.js](https://js.cytoscape.org/) + [fcose](https://github.com/iVis-at-Bilkent/cytoscape.js-fcose) layout |
+
+**No LLM inside BRAIN.** BRAIN never runs a language model of its own; your
+LLM client (Claude Code, Claude Desktop, Codex, …) does the thinking over MCP,
+BRAIN does the mechanical part (index, lint, dream queue). The bge-m3 embedding
+model is for search only (decision record ADR-001, kept with the
+development documents).
 
 The architecture document lives at [`docs/architecture.md`](docs/architecture.md).
 Specs (NLSpec methodology) live at [`requirements/spec/`](requirements/spec).
