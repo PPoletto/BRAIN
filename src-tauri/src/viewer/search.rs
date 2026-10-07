@@ -258,7 +258,9 @@ impl Fusion {
 ///
 /// Dense-first keeps the dense top K as the top K for the requested K,
 /// so hybrid Recall@K equals dense-only Recall@K — the failure measured
-/// with RRF cannot happen. Measured on the user's vault (50 curated
+/// with RRF cannot happen. This holds when the vector index
+/// (`chunk_vectors`) is available; without it the dense list is computed
+/// over the FTS candidates only, so hybrid then ranks FTS candidates. Measured on the user's vault (50 curated
 /// queries, bge-m3): rrf 0.800 / 0.720 / 0.697 (R@10 / MRR / nDCG@10) →
 /// dense-first 0.960 / 0.878 / 0.874; convex scored 0.953 / 0.893 /
 /// 0.880 (more MRR, one page less recall) and was not chosen.

@@ -215,8 +215,15 @@ fn find_block(text: &str, block_id: &str) -> Result<Option<BlockSpan>, DamagedMa
     let mut offset = 0;
     for line in text.split_inclusive('\n') {
         let content = line.trim_end_matches(['\n', '\r']);
+        // A UTF-8 BOM (files saved by PowerShell / Notepad) is not
+        // whitespace for `trim`: skip it on the first line, keeping the
+        // byte offsets (the BOM itself stays in the file).
+        let (bom, content) = match content.strip_prefix('\u{feff}') {
+            Some(rest) if offset == 0 => ('\u{feff}'.len_utf8(), rest),
+            _ => (0, content),
+        };
         let trimmed = content.trim();
-        let start = offset + (content.len() - content.trim_start().len());
+        let start = offset + bom + (content.len() - content.trim_start().len());
         if let Some(rest) = trimmed.strip_prefix(&prefix) {
             let version = rest.strip_suffix(" -->").unwrap_or("");
             if version.is_empty() || version.contains(char::is_whitespace) {
@@ -246,7 +253,9 @@ fn damaged_error(file: &Path) -> io::Error {
         io::ErrorKind::InvalidData,
         format!(
             "BRAIN's markers in {} are damaged (a start or end marker without its partner, or \
-             more than one block) — fix them by hand; BRAIN writes nothing until then",
+             more than one block — a marker pair you quoted on lines of their own, e.g. in a \
+             fenced code block, counts too) — fix them by hand (remove the quoted markers or \
+             put other text on their lines); BRAIN writes nothing until then",
             file.display()
         ),
     )
@@ -496,15 +505,16 @@ pub fn is_older_version(installed: &str, current: &str) -> bool {
     }
 }
 
-/// Installed in the current version, or in a newer one (written by a
-/// newer BRAIN on the same machine — never downgraded); anything else is
+/// Installed in the current version (equal numeric parts, so
+/// `0.3.7-rc1` counts as `0.3.7`), or in a newer one (written by a newer
+/// BRAIN on the same machine — never downgraded); anything else is
 /// outdated.
 fn versioned(found: String, current: &str) -> InstallStatus {
-    let newer = matches!(
+    let same_or_newer = matches!(
         (version_parts(&found), version_parts(current)),
-        (Some(a), Some(b)) if a > b
+        (Some(a), Some(b)) if a >= b
     );
-    if found == current || newer {
+    if found == current || same_or_newer {
         InstallStatus::Installed { version: found }
     } else {
         InstallStatus::Outdated { version: found }
@@ -550,7 +560,9 @@ pub enum InstallError {
     Foreign(String),
     #[error(
         "BRAIN's markers in {0} are damaged (a start or end marker without its partner, or more \
-         than one block) — fix them by hand; BRAIN changes nothing in that file until then"
+         than one block — a marker pair you quoted on lines of their own, e.g. in a fenced code \
+         block, counts too) — fix them by hand (remove the quoted markers or put other text on \
+         their lines); BRAIN changes nothing in that file until then"
     )]
     Damaged(String),
     #[error("io: {0}")]
@@ -1213,6 +1225,40 @@ mod tests {
         assert_eq!(
             block_version(&read(&file), MEMORY_BLOCK_ID),
             Some("0.3.5".into())
+        );
+    }
+
+    #[test]
+    fn a_release_candidate_block_of_the_current_version_counts_as_installed() {
+        let (_tmp, paths) = home();
+        with_clients(&paths);
+        let file = paths.prompt_file(Target::ClaudeCodePrompt).unwrap();
+        upsert_marked_block(&file, MEMORY_BLOCK_ID, "0.3.7-rc1", "x").unwrap();
+        assert_eq!(
+            status(&paths, Target::ClaudeCodePrompt, "0.3.7"),
+            InstallStatus::Installed {
+                version: "0.3.7-rc1".into()
+            }
+        );
+    }
+
+    const BOM_FILE: &str =
+        "\u{feff}<!-- BRAIN:memory-prompt v1 -->\nold\n<!-- /BRAIN:memory-prompt -->\nmine\n";
+
+    #[test]
+    fn a_block_on_the_first_line_of_a_bom_file_is_found() {
+        assert_eq!(block_version(BOM_FILE, BLOCK), Some("1".to_string()));
+    }
+
+    #[test]
+    fn rewriting_a_bom_file_keeps_the_bom_and_the_text_after_the_block() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("AGENTS.md");
+        std::fs::write(&file, BOM_FILE).unwrap();
+        upsert_marked_block(&file, BLOCK, "2", "new").unwrap();
+        assert_eq!(
+            read(&file),
+            "\u{feff}<!-- BRAIN:memory-prompt v2 -->\nnew\n<!-- /BRAIN:memory-prompt -->\nmine\n"
         );
     }
 

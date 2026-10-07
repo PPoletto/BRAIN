@@ -12,7 +12,7 @@
 //!
 //! | priority | kind | suggested action |
 //! |---|---|---|
-//! | 1 | `duplicate-candidate` (hygiene pair: same title, or content alike in a model index) | `merge` (`check-or-distinct` for a same title with similarity < 0.7) |
+//! | 1 | `duplicate-candidate` (hygiene pair: same title, or content alike in a model index) | `merge`; `check-or-distinct` for a same title without similarity or below about 0.7 |
 //! | 1 | `broken-link` (links to missing pages, per source page) | `fix-link` |
 //! | 1 | `broken-source` (a `sources` entry without a page) | `fix-link` |
 //! | 2 | `summary-stale` (body changed since the summary was written) | `update-summary` |
@@ -276,12 +276,12 @@ pub fn build_queue_with_history(
     // broken links (one item per source page) and broken sources.
     for pair in rows.hygiene.duplicate_pairs() {
         let reason = duplicate_reason(&pair);
-        // Same name, different content: probably two things — check and
-        // mark them distinct rather than merging.
-        let action = if pair.same_title_low_similarity() {
-            "check-or-distinct"
-        } else {
+        // Only a shared name, and no (or little) shared content: check
+        // and mark them distinct rather than merging.
+        let action = if pair.suggests_merge() {
             "merge"
+        } else {
+            "check-or-distinct"
         };
         candidates.push(item(
             1,
@@ -458,7 +458,23 @@ fn exempt_from_dedupe(a: &str, b: &str) -> bool {
     (pair_action(a) && b == "fix-link") || (a == "fix-link" && pair_action(b))
 }
 
+/// Every `suggested_action` the queue can carry. The dream prompt and
+/// AGENTS.md must explain each one (tested in `mcp::server`).
+pub const SUGGESTED_ACTIONS: &[&str] = &[
+    "merge",
+    "check-or-distinct",
+    "fix-link",
+    "update-summary",
+    "write-summary",
+    "archive-or-supersede",
+    "review-or-archive",
+];
+
 fn item(priority: u8, kind: &str, pages: Vec<String>, reason: String, action: &str) -> DreamItem {
+    debug_assert!(
+        SUGGESTED_ACTIONS.contains(&action),
+        "unlisted dream action {action}"
+    );
     DreamItem {
         priority,
         kind: kind.into(),
@@ -1130,7 +1146,7 @@ One block per dream session (brain_dream action log): the session line, then one
     }
 
     #[test]
-    fn two_pages_with_the_same_title_give_a_merge_item_without_a_model_index() {
+    fn two_pages_with_the_same_title_and_no_vectors_ask_to_check_or_mark_distinct() {
         let (_tmp, db) = open_db();
         for id in ["entities/cockpit", "entities/cio-cockpit"] {
             page(&db, id, NOW);
@@ -1140,13 +1156,46 @@ One block per dream session (brain_dream action log): the session line, then one
                 &[&id],
             );
         }
-        let reasons: Vec<String> = queue(&db)
+        let items: Vec<(String, String)> = queue(&db)
             .items
             .iter()
-            .filter(|i| i.suggested_action == "merge")
-            .map(|i| i.reason.clone())
+            .filter(|i| i.kind == "duplicate-candidate")
+            .map(|i| (i.reason.clone(), i.suggested_action.clone()))
             .collect();
-        assert_eq!(reasons, vec!["same title".to_string()]);
+        assert_eq!(
+            items,
+            vec![("same title".to_string(), "check-or-distinct".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_same_title_pair_with_high_similarity_suggests_a_merge() {
+        let (_tmp, db) = open_db();
+        exec(
+            &db,
+            "INSERT INTO schema_meta(key, value) VALUES ('index_embedder', 'bge-m3')",
+            &[],
+        );
+        for (id, v) in [("entities/a", [1.0f32, 0.0]), ("entities/b", [0.8, 0.6])] {
+            page(&db, id, NOW);
+            exec(
+                &db,
+                "UPDATE pages SET title = 'COCKPIT' WHERE id = ?1",
+                &[&id],
+            );
+            exec(
+                &db,
+                "INSERT INTO page_vectors(page_id, embedding) VALUES (?1, ?2)",
+                &[&id, &vec_to_bytes(&v)],
+            );
+        }
+        let actions: Vec<String> = queue(&db)
+            .items
+            .iter()
+            .filter(|i| i.kind == "duplicate-candidate")
+            .map(|i| i.suggested_action.clone())
+            .collect();
+        assert_eq!(actions, vec!["merge".to_string()]);
     }
 
     /// Two pages titled "Michael Meier" whose vectors have cosine 0.6.

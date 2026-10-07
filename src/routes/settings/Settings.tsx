@@ -1215,7 +1215,8 @@ function installStatusText(status: ClientInstallStatus, enabled: boolean): {
       return { text: "Client not found on this computer", color: "text-neutral-500" };
     case "damaged":
       return {
-        text: "Damaged — fix the BRAIN markers in this file by hand; BRAIN changes nothing until then",
+        text:
+          "Damaged — the BRAIN markers in this file are unmatched or repeated (a marker pair you quoted on lines of their own, e.g. in a fenced code block, counts too). Fix them by hand — remove the quoted markers or put other text on their lines; BRAIN changes nothing until then",
         color: "text-red-400",
       };
   }

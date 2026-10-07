@@ -1796,7 +1796,7 @@ Steps:
 2. Work top-down (priority 1 first). By suggested_action:
 - fix-link: repair the broken link or sources entry (right id, create the missing page, or brain_refactor action \"rename\" on the page that was meant).
 - merge: read both pages (brain_get_pages); the same thing → brain_refactor action \"merge\" the weaker into the stronger, then tidy the appended section with brain_patch_page; different things → add distinct_from (rewrite rule above).
-- check-or-distinct: same title but little shared content — most likely two different things with one name. Read both; usually add distinct_from (rewrite rule above) and, if it helps, a distinguishing title; merge only if they really are the same thing.
+- check-or-distinct: same title, but nothing shows the content is alike (no similarity known, or below about 0.7) — most likely two different things with one name. Read both; usually add distinct_from (rewrite rule above) and, if it helps, a distinguishing title; merge only if they really are the same thing.
 - update-summary / write-summary: read the page with brain_get_pages (response_format \"detailed\") and write a fitting one-to-two-sentence summary with brain_write_page (body and every other frontmatter field unchanged). If the existing summary is still right, confirm it instead: brain_write_page with the page exactly as read (response_format \"detailed\") and confirm_summary: true.
 - archive-or-supersede / review-or-archive: link it from a related page if it is still useful; if its facts were replaced, set superseded_by and valid_to (rewrite rule above). Do not delete it.
 3. Stop after {max_changes} changes or when the queue is done; what is left shows up in the next queue.
@@ -7243,6 +7243,18 @@ mod protocol_tests {
     fn the_lint_session_prompt_starts_from_the_newest_audit() {
         let text = prompt_text("lint-session", json!({}));
         assert!(text.contains("brain://audit/latest"), "{text}");
+    }
+
+    #[test]
+    fn every_dream_action_is_explained_in_the_dream_prompt_and_in_agents_md() {
+        let prompt = prompt_text("dream", json!({}));
+        let agents = crate::onboarding::template::AGENTS_MD;
+        let unexplained: Vec<&str> = crate::wiki::dream::SUGGESTED_ACTIONS
+            .iter()
+            .copied()
+            .filter(|a| !prompt.contains(a) || !agents.contains(&format!("`{a}`")))
+            .collect();
+        assert!(unexplained.is_empty(), "{unexplained:?}");
     }
 
     #[test]

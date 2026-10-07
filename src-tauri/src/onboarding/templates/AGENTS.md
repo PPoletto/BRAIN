@@ -407,9 +407,9 @@ A dream session (the `dream` prompt contains the same protocol):
      `action: "merge"`) and tidy
      the appended section with `brain_patch_page`. If not, leave them (and
      add `distinct_from` if they share a name — detailed read first).
-   - `check-or-distinct` — same title, but the pages share little
-     content (similarity below 0.7): most likely two different things
-     with one name. Read both; usually add `distinct_from` (detailed
+   - `check-or-distinct` — same title, but nothing shows the content is
+     alike (no similarity known, or below about 0.7): most likely two
+     different things with one name. Read both; usually add `distinct_from` (detailed
      read first) and, if it helps, a distinguishing title; merge only if
      they really are the same thing.
    - `update-summary` / `write-summary` — read the page with

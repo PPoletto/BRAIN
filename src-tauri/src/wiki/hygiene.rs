@@ -59,6 +59,7 @@ pub const TITLE_GROUP_MAX_PAGES: usize = 10;
 /// A same-title pair whose page vectors are less similar than this is
 /// probably two different things that share a name: the dream queue asks
 /// to check it (or mark it distinct) instead of suggesting a merge.
+/// A chosen value, not measured yet.
 pub const LOW_TITLE_SIMILARITY: f32 = 0.7;
 
 /// Titles too generic to signal a duplicate (compared after
@@ -418,6 +419,14 @@ impl DuplicatePair {
     /// [`LOW_TITLE_SIMILARITY`] — likely two things sharing a name.
     pub fn same_title_low_similarity(&self) -> bool {
         self.same_title && self.similarity.is_some_and(|s| s < LOW_TITLE_SIMILARITY)
+    }
+
+    /// Something supports merging: the pages read alike by content, or
+    /// a same-title pair has a similarity of at least
+    /// [`LOW_TITLE_SIMILARITY`]. A same-title pair without vectors (no
+    /// model index) or with a low similarity does not.
+    pub fn suggests_merge(&self) -> bool {
+        !self.same_title || self.similarity.is_some_and(|s| s >= LOW_TITLE_SIMILARITY)
     }
 }
 

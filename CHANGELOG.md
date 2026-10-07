@@ -18,9 +18,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   generic titles (Notizen, Notes, Kickoff, Meeting, Todo, Readme, Index,
   Übersicht, Overview) are left out. The similarity is shown too when
   both pages have vectors; a pair found both by title and by content is
-  listed once. When the same-title pages share little content
-  (similarity below 0.7), the dream queue suggests `check-or-distinct`
-  ("same title, low similarity") instead of a merge. `distinct_from` on
+  listed once. When nothing shows that same-title pages share content —
+  no similarity known, or below about 0.7 (a chosen value, not measured
+  yet) — the dream queue suggests `check-or-distinct` instead of a
+  merge. `distinct_from` on
   either page silences the pair as before. More than ten pages of one
   type sharing one title are summarised in one note instead of being
   listed pairwise.
@@ -42,9 +43,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a line of their own; if they are broken (a start without an end, an
   end without a start, or two blocks — e.g. after editing the file by
   hand), the card shows "Damaged" and BRAIN changes nothing in that
-  file until the markers are fixed. An instruction file that is a
-  symbolic link (stow, yadm, home-manager) stays a link: BRAIN writes
-  into the file it points to. After an app update
+  file until the markers are fixed (a marker pair you quoted on lines of
+  their own, e.g. in a code block, counts too). A symlinked file (e.g.
+  stow/yadm) stays a link — BRAIN writes into the file it points to; a
+  read-only target is reported as an error. A file saved with a UTF-8
+  BOM keeps it. After an app update
   BRAIN refreshes every switched-on install that is older than the app
   at start (never downgrading one written by a newer BRAIN), so the
   prompt no longer goes stale silently. Claude Desktop keeps its instructions in
