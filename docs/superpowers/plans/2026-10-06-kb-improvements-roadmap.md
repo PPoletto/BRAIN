@@ -376,6 +376,23 @@ vor (Tiefschlaf); ein geplanter Agenten-Lauf über MCP erledigt das inhaltliche 
 3. Welle 3: Slice D (Tools straffen, Prompts inkl. `dream`, Resources, SKILL.md) · Slice 0.3 Dual-Version · H2 Traum-Protokoll in AGENTS.md
 4. Review je Welle, dann CHANGELOG konsolidieren, Version 0.3.5, Tag, Release.
 
+## 0.3.6 — Backlog aus dem Betrieb von 0.3.5 (Stand 07.10.2026)
+
+Ergänzt die Release-Tabelle oben. Quelle: erste Traumsitzungen im echten Vault am
+07.10.2026 (zwei echte Dubletten gefunden, die die Queue nicht hatte) und die
+Review-Runden vor dem Release.
+
+| # | Item | Warum | Größe |
+|---|---|---|---|
+| 1 | **Titel-Gleichheit als Dubletten-Signal.** Hygiene und Traumqueue melden zwei Seiten gleichen Typs mit identischem (normalisiertem) Titel als `duplicate-candidate`, unabhängig von der Embedding-Ähnlichkeit; `distinct_from` unterdrückt wie bisher. | Beide echten Dubletten des ersten Traumlaufs (Firmenseite, COCKPIT) hatten denselben Titel, lagen aber unter der 0,92-Schwelle; `brain_lookup` greift nur über Slugs. Billig, treffsicher. | S |
+| 2 | **YAML-Hinweis für Summaries.** Tool-Beschreibung von `brain_write_page`/`brain_write_batch`: Summary quoten, wenn sie `: ` enthält; optional serverseitig den Parse-Fehler mit genau diesem Hinweis anreichern. | Erster Schreibversuch im Traumlauf scheiterte an „mapping values are not allowed"; der Fehler war sauber, aber ohne Hinweis auf die Ursache. | XS |
+| 3 | **Memory-Prompt und SKILL.md per Schalter installieren.** Settings → MCP: markierter Block in `~/.claude/CLAUDE.md` und `~/.codex/AGENTS.md`, SKILL.md nach `~/.claude/skills/brain-wiki/`; Versionsmarke, Block-Ersatz bei Update, Entfernen bei Abwahl. Claude Desktop bleibt Copy-Paste. | „Update vault templates" ändert am Client nichts; der kopierte Prompt veraltet still. **Entscheidung Pascal offen** (Prompt gilt dann in allen Claude-Code-Projekten). | M |
+| 4 | **Traum-Log auswerten.** Kleine Auswertung je Item-Art: wie oft done/skipped/deferred; Anzeige in Integrity oder als Resource. | Das strukturierte Log aus 0.3.5 liefert die Daten, genutzt werden sie noch nicht. | S |
+| 5 | **`missing-sources` für Ingestion-Seiten** halbautomatisch: Lint-Session-Prompt schlägt den Master-Index der jeweiligen Mail-Ingestion als `sources`-Eintrag vor. | Fast jede aus Mails erzeugte Seite trägt die Warnung; von Hand ist das Fleißarbeit. | S |
+| 6 | **Repo-Hygiene:** repo-weites `cargo fmt` als eigener Commit, ungenutztes `axum`-Crate entfernen, flaky Windows-Test `viewer::eval::tests::concurrent_adds_keep_every_entry` (Datei-Lock-Rennen) stabilisieren. | Technische Schulden aus dem 0.3.5-Zyklus. | S |
+| 7 | **Spec-Addenda** S03 (Lint/Hygiene), S06 (MCP-Oberfläche/Protokoll), S09 (Index/Suche) als Entwürfe unter `docs/`, Übernahme nach `requirements/` durch Pascal. | CLAUDE.md verlangt Spec-Deckung für Verhaltensänderungen; `requirements/` ist für den Build-Agenten read-only. | M |
+| — | Slice E Reranker, Slice F Viewer, H4 lokaler LLM-Provider | wie in der Release-Tabelle: gated durch `brain eval`-Zahlen bzw. Alltagserfahrung | L |
+
 ## Nicht in diesem Plan (bewusst)
 
 GraphRAG/LightRAG mit LLM-Extraktion, Memory-Frameworks als Abhängigkeit, Wechsel der
