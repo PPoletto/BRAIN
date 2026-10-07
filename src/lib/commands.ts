@@ -96,6 +96,13 @@ export type DreamStats = {
   most_skipped: Array<{ kind: string; pages: string[]; count: number }>;
 };
 
+/** Rust `viewer::similar::SimilarPages`. */
+export type SimilarPages = {
+  index_available: boolean;
+  semantic: boolean;
+  pages: Array<{ id: string; title: string | null; type: string; score: number }>;
+};
+
 export type RemoteStatus = {
   encrypted: boolean;
   remote_url: string | null;
@@ -204,6 +211,8 @@ export const commands = {
     >("search_pages", { query }),
   getBacklinks: (id: string) =>
     invoke<Array<{ id: string; title: string; path: string }>>("get_backlinks", { id }),
+  similarPages: (id: string, limit?: number) =>
+    invoke<SimilarPages>("similar_pages", { id, limit: limit ?? null }),
   getGraph: (filters: {
     types?: string[];
     tags?: string[];

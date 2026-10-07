@@ -302,8 +302,12 @@ Two modes in the **Search** tab:
 | **Query DSL** | Structured filter over frontmatter: `type:source AND tag:customer AND updated:>2026-04-01`. Fields: `id`, `type`, `title`, `tag`, `created`, `updated`. Operators: `:` (eq), `:>` (after), `:<` (before). Combine with `AND`, `OR`, `NOT`, parens. |
 
 Click any result to read the page, follow `[[wiki-links]]`, and see
-backlinks — all without leaving the Search tab. **Open in Browse** jumps
-to the same page with the full sidebar tree.
+backlinks — all without leaving the Search tab. Below the backlinks,
+**Ähnliche Seiten** (collapsed) lists the eight pages whose content is
+closest to the open page, across all types, with the similarity in
+percent (from the index's page vectors; pages named in the page's
+`distinct_from` are left out). **Open in Browse** jumps to the same page
+with the full sidebar tree.
 
 ### Graph
 

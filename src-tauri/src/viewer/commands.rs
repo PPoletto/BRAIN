@@ -57,6 +57,28 @@ pub fn get_backlinks(
     search::backlinks(&vault, &id).map_err(BrainError::from)
 }
 
+/// S08 "Ähnliche Seiten": the pages closest to `id` by page vector
+/// (default 8, across types; the page and its `distinct_from` left out).
+/// Without an open or built index: an empty list with
+/// `index_available: false` — never builds the index.
+#[tauri::command]
+pub async fn similar_pages(
+    state: State<'_, Arc<crate::state::AppState>>,
+    id: String,
+    limit: Option<usize>,
+) -> BrainResult<super::similar::SimilarPages> {
+    let Some(db) = state.db() else {
+        return Ok(super::similar::SimilarPages::no_index());
+    };
+    let limit = limit.unwrap_or(super::similar::DEFAULT_LIMIT);
+    tokio::task::spawn_blocking(move || {
+        db.with(|conn| super::similar::similar_pages(conn, &id, limit))
+    })
+    .await
+    .map_err(|e| BrainError::Internal(format!("similar-pages task panicked: {e}")))?
+    .map_err(|e| BrainError::Internal(e.to_string()))
+}
+
 #[tauri::command]
 pub fn get_graph(
     state: State<Arc<crate::state::AppState>>,

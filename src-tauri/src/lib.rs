@@ -477,6 +477,7 @@ pub fn run() {
             viewer::commands::read_page,
             viewer::commands::search_pages,
             viewer::commands::get_backlinks,
+            viewer::commands::similar_pages,
             viewer::commands::get_graph,
             viewer::commands::query_pages,
             viewer::commands::rebuild_index,

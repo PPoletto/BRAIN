@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { commands } from "../../lib/commands";
+import { commands, type SimilarPages } from "../../lib/commands";
 import { useDataRefresh } from "../../lib/events";
 import { Button } from "../../components/ui/Button";
 import { EmptyState } from "../../components/ui/EmptyState";
@@ -341,11 +341,98 @@ export function Tier2() {
                     </ul>
                   )}
                 </section>
+                <SimilarPagesSection id={page.id} onOpen={(id) => void openHit(id)} />
               </div>
             </>
           )}
         </article>
       }
     />
+  );
+}
+
+/// "Ähnliche Seiten": the pages closest to `id` by content (page vectors),
+/// loaded when the section is opened (and again when `id` changes while
+/// it is open).
+function SimilarPagesSection({ id, onOpen }: { id: string; onOpen: (id: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const [result, setResult] = useState<SimilarPages | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    setResult(null);
+    setFailed(false);
+    if (!open) return;
+    let cancelled = false;
+    commands
+      .similarPages(id)
+      .then((r) => {
+        if (!cancelled) setResult(r);
+      })
+      .catch(() => {
+        if (!cancelled) setFailed(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [id, open]);
+
+  let content: ReactNode;
+  if (failed) {
+    content = <p className="text-sm text-neutral-500">Similar pages could not be loaded.</p>;
+  } else if (!result) {
+    content = <p className="text-sm text-neutral-500">Loading…</p>;
+  } else if (!result.index_available) {
+    content = (
+      <p className="text-sm text-neutral-500">
+        No search index yet — similar pages appear once the index is built.
+      </p>
+    );
+  } else if (result.pages.length === 0) {
+    content = <p className="text-sm text-neutral-500">No similar pages found.</p>;
+  } else {
+    content = (
+      <>
+        {!result.semantic && (
+          <p className="mb-2 text-xs text-neutral-500">
+            The index was built without the embedding model — similarity is
+            word overlap, not meaning.
+          </p>
+        )}
+        <ul className="space-y-2">
+          {result.pages.map((p) => (
+            <li key={p.id}>
+              <button
+                type="button"
+                onClick={() => onOpen(p.id)}
+                className="flex w-full items-center gap-3 rounded-md border border-neutral-800 p-2 text-left hover:bg-neutral-900"
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="truncate font-medium text-neutral-200">{p.title ?? p.id}</div>
+                  <div className="truncate font-mono text-xs text-neutral-500">{p.id}</div>
+                </div>
+                <span className="rounded border border-neutral-700 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-neutral-400">
+                  {p.type}
+                </span>
+                <span className="w-12 text-right font-mono text-xs text-neutral-400">
+                  {Math.round(p.score * 100)}%
+                </span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      </>
+    );
+  }
+
+  return (
+    <section className="border-t border-neutral-800 px-6 py-4">
+      <details onToggle={(e) => setOpen(e.currentTarget.open)}>
+        <summary className="cursor-pointer text-xs font-medium uppercase tracking-wider text-neutral-500">
+          Ähnliche Seiten
+        </summary>
+        <div className="mt-2">{content}</div>
+      </details>
+    </section>
   );
 }

@@ -47,6 +47,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a new "Dreaming" section. Use "Update vault templates" to tell your
   agent about it.
 
+- **Similar pages in the viewer.** Under the backlinks of an open page
+  (Search tab) a collapsible "Ähnliche Seiten" list shows the eight
+  pages whose content is closest — across all page types, with a type
+  badge and the similarity in percent; click one to open it. The page's
+  own `distinct_from` pages are left out. It uses the stored page
+  vectors (no extra work at indexing time); without an index the list
+  says so, and an index built without the embedding model is flagged
+  (word overlap instead of meaning).
+
 ### Changed
 
 - **`missing-sources` on ingested pages.** The `lint-session` prompt and

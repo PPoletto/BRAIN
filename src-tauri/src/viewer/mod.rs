@@ -6,6 +6,7 @@ pub mod eval;
 pub mod graph;
 pub mod query;
 pub mod search;
+pub mod similar;
 pub mod tree;
 
 use thiserror::Error;
