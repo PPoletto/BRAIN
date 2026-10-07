@@ -662,10 +662,10 @@ pub fn add_eval_query(vault: &Path, new: NewEvalQuery) -> EvalResult<EvalQuery> 
         _ => format!("{SET_HEADER}{}", serde_yaml::to_string(&expected_set)?),
     };
     // Write-then-rename: a reader (the watcher's commit, a sync) never
-    // sees a half-written set.
-    let tmp = path.with_extension("yaml.tmp");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, &path)?;
+    // sees a half-written set. The temp name is unique per call and the
+    // rename retries through a transient Windows lock (a reader that
+    // still has the set open).
+    crate::fsutil::atomic_write(&path, text.as_bytes())?;
     Ok(entry)
 }
 
@@ -686,6 +686,12 @@ impl Drop for EvalSetLock {
 }
 
 /// Take `<set>.lock` (created exclusively), waiting up to [`LOCK_WAIT`].
+///
+/// On Windows, creating the lock file while the previous holder is just
+/// deleting it fails with "access denied" (the old file is still "delete
+/// pending") instead of "already exists" — the cause of the old flaky
+/// `concurrent_adds_keep_every_entry`. That error is treated as "busy"
+/// too; only if it persists until the deadline is it returned as is.
 fn lock_eval_set(set_path: &Path) -> EvalResult<EvalSetLock> {
     let lock = set_path.with_extension("yaml.lock");
     let deadline = std::time::Instant::now() + LOCK_WAIT;
@@ -696,6 +702,12 @@ fn lock_eval_set(set_path: &Path) -> EvalResult<EvalSetLock> {
             .open(&lock)
         {
             Ok(_) => return Ok(EvalSetLock(lock)),
+            Err(err) if crate::fsutil::is_transient_lock_error(&err) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(err.into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                 let stale = std::fs::metadata(&lock)
                     .and_then(|m| m.modified())

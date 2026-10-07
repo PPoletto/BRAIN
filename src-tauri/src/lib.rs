@@ -5,6 +5,7 @@ pub mod crypto;
 pub mod db;
 pub mod embedding;
 pub mod error;
+pub mod fsutil;
 pub mod logging;
 pub mod mcp;
 pub mod mount;
