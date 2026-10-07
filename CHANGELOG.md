@@ -6,6 +6,21 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Same title = possible duplicate.** The lint report, the daily audit
+  and the dream queue now also flag two pages of the same type whose
+  titles are equal (ignoring upper/lower case, extra spaces and a
+  trailing parenthetical such as "Maria Muster (Mutter)") as
+  `duplicate-candidate` with the reason "same title" — no embedding
+  model needed. The similarity is shown too when both pages have
+  vectors; a pair found both by title and by content is listed once.
+  `distinct_from` on either page silences the pair as before. More than
+  ten pages of one type sharing one title (mail sources with the same
+  subject) are summarised in one note instead of being listed pairwise.
+  Both real duplicates of the first dream session had the same title but
+  stayed below the 0.92 similarity threshold.
+
 ### Changed
 
 - **Release pipeline hardening.** One release build runs per tag at a

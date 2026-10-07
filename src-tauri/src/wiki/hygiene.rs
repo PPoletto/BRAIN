@@ -1,6 +1,8 @@
 //! Index-backed hygiene rules (A3): pages nobody links to that have been
 //! left alone for a long time (`orphan`), and pairs of pages that look
-//! like the same thing written twice (`duplicate-candidate`).
+//! like the same thing written twice (`duplicate-candidate`) — either
+//! because their content reads almost the same (page vectors, model index
+//! only) or because they carry the same title (any index).
 //!
 //! Both read the SQLite index (`pages`, `wiki_links`, `chunks`) instead of
 //! the files: the link graph and the chunk vectors are already there. The
@@ -20,7 +22,7 @@
 //! Dead links (`[[id]]` without a target page) are NOT a hygiene rule:
 //! the filesystem lint already reports them as the `broken-link` error.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use rusqlite::types::ValueRef;
 
@@ -48,6 +50,11 @@ pub const ORPHAN_MIN_AGE_DAYS: i64 = 90;
 const SEMANTIC_EMBEDDER: &str = "bge-m3";
 
 const SKIPPED_KIND: &str = "duplicate-detection-skipped";
+
+/// More pages of one type than this sharing one title are not compared
+/// pairwise (that would list n·(n−1)/2 pairs, e.g. for mail sources with
+/// the same subject); the group is reported once as a note instead.
+pub const TITLE_GROUP_MAX_PAGES: usize = 10;
 
 /// What [`evaluate`] found: page findings (warnings) and info notes.
 #[derive(Debug, Default)]
@@ -77,6 +84,9 @@ struct PageRow {
     path: String,
     /// Unix seconds of the file's last modification; 0 = unknown.
     mtime: i64,
+    /// Frontmatter `title` (as indexed); pages without one take no part
+    /// in the same-title rule.
+    title: Option<String>,
     /// Frontmatter `distinct_from`: ids this page declares to be a
     /// different thing — never reported as its duplicate.
     distinct_from: Vec<String>,
@@ -123,7 +133,8 @@ pub fn load_rows(conn: &rusqlite::Connection) -> DbResult<HygieneRows> {
     let index_embedder = crate::db::pages_index::index_embedder(conn);
     let pages = {
         let mut stmt = conn.prepare(
-            "SELECT id, type, path, COALESCE(file_mtime, 0), frontmatter FROM pages ORDER BY id",
+            "SELECT id, type, path, COALESCE(file_mtime, 0), frontmatter, title \
+             FROM pages ORDER BY id",
         )?;
         stmt.query_map([], |row| {
             let (distinct_from, keep) =
@@ -133,6 +144,7 @@ pub fn load_rows(conn: &rusqlite::Connection) -> DbResult<HygieneRows> {
                 page_type: row.get(1)?,
                 path: row.get(2)?,
                 mtime: row.get(3)?,
+                title: row.get(5)?,
                 distinct_from,
                 keep,
             })
@@ -223,16 +235,18 @@ pub fn evaluate(rows: &HygieneRows, model_available: bool, now_unix: i64) -> Hyg
         warnings: orphans(&rows.pages, &rows.links, now_unix),
         notes: Vec::new(),
     };
-    if rows.index_embedder.as_deref() == Some(SEMANTIC_EMBEDDER) {
-        duplicate_candidates(rows, &mut findings);
-    } else {
+    // Same-title pairs need no vectors; the content comparison inside is
+    // gated on a model-embedded index.
+    duplicate_candidates(rows, &mut findings);
+    if rows.index_embedder.as_deref() != Some(SEMANTIC_EMBEDDER) {
         let message = if model_available {
             "duplicate detection needs the embedding model's vectors in the index — it still \
              holds vectors from the fallback embedder. Settings → \"Rebuild index\" re-embeds \
-             every page with the model"
+             every page with the model (pages with the same title are still reported)"
         } else {
             "duplicate detection needs the embedding model (bge-m3) — download it in Settings \
-             to get duplicate-candidate findings"
+             to get duplicate-candidate findings by content (pages with the same title are \
+             still reported)"
         };
         findings.notes.push(LintWarning {
             path: String::new(),
@@ -340,19 +354,69 @@ impl HygieneRows {
             .collect()
     }
 
-    /// The `duplicate-candidate` pairs `(a, b, score)`, highest score
-    /// first (`a < b`). Empty unless the index was embedded by the real
-    /// model — the same gate as the lint rule.
-    pub fn duplicate_pairs(&self) -> Vec<(String, String, f32)> {
-        if self.index_embedder.as_deref() != Some(SEMANTIC_EMBEDDER) {
-            return Vec::new();
-        }
+    /// The `duplicate-candidate` pairs (`a < b`), in the order of the
+    /// lint rule: highest similarity first, pairs without one (same
+    /// title, no vectors) last. Same-title pairs come from any index;
+    /// content pairs only from a model-embedded one.
+    pub fn duplicate_pairs(&self) -> Vec<DuplicatePair> {
         let mut ignored_notes = Vec::new();
         duplicate_pair_rows(self, &mut ignored_notes)
             .into_iter()
-            .map(|(score, a, b)| (a.id.clone(), b.id.clone(), score))
+            .map(|p| DuplicatePair {
+                a: p.a.id.clone(),
+                b: p.b.id.clone(),
+                similarity: p.similarity,
+                same_title: p.same_title,
+            })
             .collect()
     }
+}
+
+/// One `duplicate-candidate` pair (see [`HygieneRows::duplicate_pairs`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DuplicatePair {
+    pub a: String,
+    pub b: String,
+    /// Cosine similarity of the two page vectors, when both pages have
+    /// one in a model-embedded index.
+    pub similarity: Option<f32>,
+    /// Both pages carry the same title (see [`title_keys`]).
+    pub same_title: bool,
+}
+
+impl DuplicatePair {
+    /// The content similarity reached [`DUPLICATE_SIMILARITY_THRESHOLD`].
+    pub fn reads_alike(&self) -> bool {
+        self.similarity
+            .is_some_and(|s| s >= DUPLICATE_SIMILARITY_THRESHOLD)
+    }
+}
+
+/// The comparison keys of a title for the same-title rule: the title
+/// trimmed, lower-cased and with runs of whitespace collapsed to one
+/// space, plus — when it ends in a parenthetical and something precedes
+/// it — the same without that parenthetical ("Maria Muster (Mutter)" →
+/// "maria muster"). Two pages share a title when any key is equal. Empty
+/// for a blank title.
+pub fn title_keys(title: &str) -> Vec<String> {
+    let full = title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    if full.is_empty() {
+        return Vec::new();
+    }
+    let mut keys = vec![full.clone()];
+    if full.ends_with(')') {
+        if let Some(open) = full.rfind('(') {
+            let rest = full[..open].trim_end();
+            if !rest.is_empty() {
+                keys.push(rest.to_string());
+            }
+        }
+    }
+    keys
 }
 
 fn format_local_date(unix: i64) -> String {
@@ -365,20 +429,30 @@ fn format_local_date(unix: i64) -> String {
         .unwrap_or_else(|| "an unknown date".into())
 }
 
-/// Pairs of pages of the same `type` whose page vectors have a cosine
-/// similarity of at least [`DUPLICATE_SIMILARITY_THRESHOLD`], highest
-/// first. Each pair is reported under BOTH pages' paths (same message,
-/// naming both ids), so a page-scoped view of either page shows it. Types
-/// with more than [`DUPLICATE_MAX_PAGES_PER_TYPE`] pages are skipped with
-/// a note; pages without vectors are ignored.
+/// The `duplicate-candidate` findings: pairs of pages of the same `type`
+/// that read almost the same (page vectors with a cosine similarity of at
+/// least [`DUPLICATE_SIMILARITY_THRESHOLD`]; model index only) or carry
+/// the same title (see [`title_keys`]). Each pair is reported once, under
+/// BOTH pages' paths (same message, naming both ids), so a page-scoped
+/// view of either page shows it. `distinct_from` on either side
+/// suppresses a pair. Types with more than
+/// [`DUPLICATE_MAX_PAGES_PER_TYPE`] pages skip the content comparison
+/// with a note; pages without vectors take part only by title.
 fn duplicate_candidates(rows: &HygieneRows, findings: &mut HygieneFindings) {
-    for (score, a, b) in duplicate_pair_rows(rows, &mut findings.notes) {
+    for pair in duplicate_pair_rows(rows, &mut findings.notes) {
+        let detail = match (pair.same_title, pair.similarity) {
+            (true, Some(score)) => format!("same title, similarity {score:.2}"),
+            (true, None) => "same title".to_string(),
+            (false, Some(score)) => format!("similarity {score:.2}"),
+            (false, None) => continue,
+        };
         let message = format!(
-            "'{}' and '{}' may be duplicates (similarity {score:.2}) — if they describe the \
-             same thing, fold one into the other with brain_refactor (action merge)",
-            a.id, b.id
+            "'{}' and '{}' may be duplicates ({detail}) — if they describe the same thing, \
+             fold one into the other with brain_refactor (action merge); if they are \
+             different things, list the other id in distinct_from",
+            pair.a.id, pair.b.id
         );
-        for page in [a, b] {
+        for page in [pair.a, pair.b] {
             findings.warnings.push(LintWarning {
                 path: page.path.clone(),
                 kind: "duplicate-candidate".into(),
@@ -388,26 +462,93 @@ fn duplicate_candidates(rows: &HygieneRows, findings: &mut HygieneFindings) {
     }
 }
 
-/// The pairs behind [`duplicate_candidates`], highest score first; a
-/// skipped over-sized type adds a note to `notes`.
+/// One pair behind [`duplicate_candidates`] (`a.id < b.id`).
+struct PairRow<'a> {
+    a: &'a PageRow,
+    b: &'a PageRow,
+    similarity: Option<f32>,
+    same_title: bool,
+}
+
+/// Declared different things (A2 `distinct_from`, either side) are never
+/// duplicate candidates.
+fn declared_distinct(a: &PageRow, b: &PageRow) -> bool {
+    a.distinct_from.contains(&b.id) || b.distinct_from.contains(&a.id)
+}
+
+/// The pairs behind [`duplicate_candidates`]: content pairs and same-title
+/// pairs merged (a pair found both ways appears once, with both marks),
+/// highest similarity first, pairs without a similarity last, then by
+/// ids. A skipped over-sized type or title group adds a note to `notes`.
 fn duplicate_pair_rows<'a>(
     rows: &'a HygieneRows,
     notes: &mut Vec<LintWarning>,
-) -> Vec<(f32, &'a PageRow, &'a PageRow)> {
-    // Pages are loaded ORDER BY id, so within a group every pair is (a < b).
-    let mut by_type: HashMap<&str, Vec<(&PageRow, &Vec<f32>)>> = HashMap::new();
-    for page in &rows.pages {
+) -> Vec<PairRow<'a>> {
+    // Keyed by the two indexes into `rows.pages` (loaded ORDER BY id, so
+    // the smaller index is the smaller id).
+    let mut pairs: BTreeMap<(usize, usize), PairRow<'a>> = BTreeMap::new();
+    if rows.index_embedder.as_deref() == Some(SEMANTIC_EMBEDDER) {
+        for (i, j, score) in content_pairs(rows, notes) {
+            pairs.insert(
+                (i, j),
+                PairRow {
+                    a: &rows.pages[i],
+                    b: &rows.pages[j],
+                    similarity: Some(score),
+                    same_title: false,
+                },
+            );
+        }
+    }
+    for (i, j) in title_pairs(&rows.pages, notes) {
+        if let Some(pair) = pairs.get_mut(&(i, j)) {
+            pair.same_title = true;
+            continue;
+        }
+        let (a, b) = (&rows.pages[i], &rows.pages[j]);
+        let similarity = match (rows.page_vectors.get(&a.id), rows.page_vectors.get(&b.id)) {
+            (Some(va), Some(vb)) => Some(crate::embedding::cosine(va, vb)),
+            _ => None,
+        };
+        pairs.insert(
+            (i, j),
+            PairRow {
+                a,
+                b,
+                similarity,
+                same_title: true,
+            },
+        );
+    }
+    let mut out: Vec<PairRow<'a>> = pairs.into_values().collect();
+    let rank = |p: &PairRow| p.similarity.unwrap_or(f32::NEG_INFINITY);
+    out.sort_by(|x, y| {
+        rank(y)
+            .total_cmp(&rank(x))
+            .then_with(|| x.a.id.cmp(&y.a.id))
+            .then_with(|| x.b.id.cmp(&y.b.id))
+    });
+    out
+}
+
+/// Index pairs `(i, j)` (`i < j`) of same-type pages whose page vectors
+/// reach [`DUPLICATE_SIMILARITY_THRESHOLD`], with the score. A type with
+/// more than [`DUPLICATE_MAX_PAGES_PER_TYPE`] vectors is skipped with a
+/// note.
+fn content_pairs(rows: &HygieneRows, notes: &mut Vec<LintWarning>) -> Vec<(usize, usize, f32)> {
+    let mut by_type: HashMap<&str, Vec<(usize, &Vec<f32>)>> = HashMap::new();
+    for (idx, page) in rows.pages.iter().enumerate() {
         if let Some(v) = rows.page_vectors.get(&page.id) {
             by_type
                 .entry(page.page_type.as_str())
                 .or_default()
-                .push((page, v));
+                .push((idx, v));
         }
     }
     let mut types: Vec<&str> = by_type.keys().copied().collect();
     types.sort_unstable();
 
-    let mut pairs: Vec<(f32, &PageRow, &PageRow)> = Vec::new();
+    let mut out = Vec::new();
     for page_type in types {
         let group = &by_type[page_type];
         if group.len() > DUPLICATE_MAX_PAGES_PER_TYPE {
@@ -422,26 +563,63 @@ fn duplicate_pair_rows<'a>(
             });
             continue;
         }
-        for (i, (a, va)) in group.iter().enumerate() {
-            for (b, vb) in &group[i + 1..] {
-                // Declared different things (A2 `distinct_from`, either
-                // side) are never duplicate candidates.
-                if a.distinct_from.contains(&b.id) || b.distinct_from.contains(&a.id) {
+        for (n, (i, va)) in group.iter().enumerate() {
+            for (j, vb) in &group[n + 1..] {
+                if declared_distinct(&rows.pages[*i], &rows.pages[*j]) {
                     continue;
                 }
                 let score = crate::embedding::cosine(va, vb);
                 if score >= DUPLICATE_SIMILARITY_THRESHOLD {
-                    pairs.push((score, a, b));
+                    out.push((*i, *j, score));
                 }
             }
         }
     }
-    pairs.sort_by(|x, y| {
-        y.0.total_cmp(&x.0)
-            .then_with(|| x.1.id.cmp(&y.1.id))
-            .then_with(|| x.2.id.cmp(&y.2.id))
-    });
-    pairs
+    out
+}
+
+/// Index pairs `(i, j)` (`i < j`) of same-type pages sharing a title key
+/// (see [`title_keys`]), without pairs declared distinct. A group of more
+/// than [`TITLE_GROUP_MAX_PAGES`] pages is reported as one note instead.
+fn title_pairs(pages: &[PageRow], notes: &mut Vec<LintWarning>) -> Vec<(usize, usize)> {
+    let mut groups: BTreeMap<(&str, String), Vec<usize>> = BTreeMap::new();
+    for (idx, page) in pages.iter().enumerate() {
+        let Some(title) = page.title.as_deref() else {
+            continue;
+        };
+        for key in title_keys(title) {
+            let members = groups.entry((page.page_type.as_str(), key)).or_default();
+            if members.last() != Some(&idx) {
+                members.push(idx);
+            }
+        }
+    }
+    let mut out: BTreeSet<(usize, usize)> = BTreeSet::new();
+    for ((page_type, key), members) in &groups {
+        if members.len() < 2 {
+            continue;
+        }
+        if members.len() > TITLE_GROUP_MAX_PAGES {
+            notes.push(LintWarning {
+                path: String::new(),
+                kind: SKIPPED_KIND.into(),
+                message: format!(
+                    "{} pages of type '{page_type}' share the title '{key}' — too many to list \
+                     as duplicate pairs; give them distinguishing titles",
+                    members.len()
+                ),
+            });
+            continue;
+        }
+        for (n, &i) in members.iter().enumerate() {
+            for &j in &members[n + 1..] {
+                if !declared_distinct(&pages[i], &pages[j]) {
+                    out.insert((i, j));
+                }
+            }
+        }
+    }
+    out.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -758,6 +936,7 @@ mod tests {
                 page_type: "entity".into(),
                 path: String::new(),
                 mtime: NOW,
+                title: None,
                 distinct_from: Vec::new(),
                 keep: false,
             });
@@ -813,6 +992,175 @@ mod tests {
         let (_tmp, db) = open_semantic_db();
         let findings = check(&db, true, NOW).unwrap();
         assert!(findings.notes.is_empty());
+    }
+
+    // ---- duplicate-candidate by title --------------------------------------
+
+    fn insert_titled_page(db: &DbHandle, id: &str, page_type: &str, title: &str) {
+        insert_page(db, id, page_type, NOW);
+        db.with(|conn| {
+            conn.execute(
+                "UPDATE pages SET title = ?1 WHERE id = ?2",
+                rusqlite::params![title, id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    fn duplicate_pairs_of(db: &DbHandle) -> Vec<(String, String)> {
+        db.with(load_rows)
+            .unwrap()
+            .duplicate_pairs()
+            .into_iter()
+            .map(|p| (p.a, p.b))
+            .collect()
+    }
+
+    #[test]
+    fn two_pages_of_one_type_with_the_same_title_are_a_duplicate_candidate() {
+        let (_tmp, db) = open_db();
+        insert_titled_page(&db, "entities/dextradata", "entity", "DextraData GmbH");
+        insert_titled_page(
+            &db,
+            "entities/dextra-data-gmbh",
+            "entity",
+            "DextraData GmbH",
+        );
+        assert_eq!(
+            duplicate_pairs_of(&db),
+            vec![(
+                "entities/dextra-data-gmbh".to_string(),
+                "entities/dextradata".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn titles_are_compared_after_trimming_lower_casing_and_collapsing_whitespace() {
+        let (_tmp, db) = open_db();
+        insert_titled_page(&db, "entities/a", "entity", "  CIO   COCKPIT ");
+        insert_titled_page(&db, "entities/b", "entity", "cio cockpit");
+        assert_eq!(duplicate_pairs_of(&db).len(), 1);
+    }
+
+    #[test]
+    fn a_same_title_pair_declared_distinct_is_not_a_duplicate_candidate() {
+        let (_tmp, db) = open_db();
+        insert_titled_page(&db, "entities/a", "entity", "Michael Meier");
+        insert_titled_page(&db, "entities/b", "entity", "Michael Meier");
+        db.with(|conn| {
+            conn.execute(
+                "UPDATE pages SET frontmatter = ?1 WHERE id = 'entities/a'",
+                [r#"{"id":"entities/a","type":"entity","distinct_from":["entities/b"]}"#],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(duplicate_pairs_of(&db).is_empty());
+    }
+
+    #[test]
+    fn titles_differing_only_by_a_trailing_parenthetical_are_a_duplicate_candidate() {
+        let (_tmp, db) = open_db();
+        insert_titled_page(&db, "entities/maria", "entity", "Maria Muster (Mutter)");
+        insert_titled_page(&db, "entities/maria-muster", "entity", "Maria Muster");
+        assert_eq!(duplicate_pairs_of(&db).len(), 1);
+    }
+
+    #[test]
+    fn pages_of_different_types_with_the_same_title_are_not_a_duplicate_candidate() {
+        let (_tmp, db) = open_db();
+        insert_titled_page(&db, "entities/nis2", "entity", "NIS2");
+        insert_titled_page(&db, "concepts/nis2", "concept", "NIS2");
+        assert!(duplicate_pairs_of(&db).is_empty());
+    }
+
+    #[test]
+    fn a_title_that_is_only_a_parenthetical_has_no_shortened_key() {
+        assert_eq!(title_keys(" (Mutter) "), vec!["(mutter)".to_string()]);
+    }
+
+    #[test]
+    fn the_title_keys_are_the_normalised_title_and_the_title_without_its_parenthetical() {
+        assert_eq!(
+            title_keys("Maria  Muster (Mutter)"),
+            vec![
+                "maria muster (mutter)".to_string(),
+                "maria muster".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn the_same_title_finding_says_same_title_in_its_message() {
+        let (_tmp, db) = open_db();
+        insert_titled_page(&db, "entities/a", "entity", "COCKPIT");
+        insert_titled_page(&db, "entities/b", "entity", "Cockpit");
+        let findings = check(&db, false, NOW).unwrap();
+        let message = &kinds(&findings, "duplicate-candidate")[0];
+        assert!(message.contains("(same title)"), "{message}");
+    }
+
+    #[test]
+    fn a_pair_found_by_title_and_by_content_is_reported_once_with_both_reasons() {
+        let (_tmp, db) = open_semantic_db();
+        insert_titled_page(&db, "entities/a", "entity", "COCKPIT");
+        insert_titled_page(&db, "entities/b", "entity", "COCKPIT");
+        insert_chunk(&db, "entities/a", &unit(0, 0.0));
+        insert_chunk(&db, "entities/b", &unit(0, 0.0));
+        let findings = check(&db, true, NOW).unwrap();
+        assert_eq!(
+            kinds(&findings, "duplicate-candidate"),
+            vec![
+                "'entities/a' and 'entities/b' may be duplicates (same title, similarity 1.00) — \
+                 if they describe the same thing, fold one into the other with brain_refactor \
+                 (action merge); if they are different things, list the other id in \
+                 distinct_from"
+                    .to_string();
+                2
+            ]
+        );
+    }
+
+    #[test]
+    fn a_same_title_pair_below_the_similarity_threshold_carries_its_similarity() {
+        let (_tmp, db) = open_semantic_db();
+        insert_titled_page(&db, "entities/a", "entity", "COCKPIT");
+        insert_titled_page(&db, "entities/b", "entity", "COCKPIT");
+        insert_chunk(&db, "entities/a", &unit(0, 0.0));
+        // cos = 1 / sqrt(1 + 0.6²) = 0.857…
+        insert_chunk(&db, "entities/b", &unit(0, 0.6));
+        let pairs = db.with(load_rows).unwrap().duplicate_pairs();
+        assert_eq!(
+            pairs
+                .iter()
+                .map(|p| p.similarity.map(|s| (s * 100.0).round() as i32))
+                .collect::<Vec<_>>(),
+            vec![Some(86)]
+        );
+    }
+
+    #[test]
+    fn more_same_title_pages_than_the_group_cap_become_one_note() {
+        let (_tmp, db) = open_db();
+        for i in 0..=TITLE_GROUP_MAX_PAGES {
+            insert_titled_page(
+                &db,
+                &format!("sources/mail-{i:02}"),
+                "source",
+                "Re: Angebot",
+            );
+        }
+        let findings = check(&db, false, NOW).unwrap();
+        assert!(
+            kinds(&findings, "duplicate-candidate").is_empty()
+                && findings.notes.iter().any(|n| n
+                    .message
+                    .starts_with("11 pages of type 'source' share the title")),
+            "{:?}",
+            findings.notes
+        );
     }
 
     // ---- page_vectors (H1) -------------------------------------------------

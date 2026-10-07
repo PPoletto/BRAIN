@@ -344,9 +344,13 @@ same findings live (concise: counts per kind; then `response_format:
 (the `lint-session` prompt walks you through it):
 
 - `duplicate-candidate` — two pages of the same type that read almost
-  the same (similarity score in the message). Open both; if they
-  describe the same thing, merge the weaker into the stronger
-  (`brain_refactor`, `action: "merge"`). If they are genuinely different, leave them.
+  the same (similarity score in the message) or carry the same title
+  ("same title": equal after ignoring case, extra spaces and a trailing
+  parenthetical such as "(Mutter)"). Open both; if they describe the
+  same thing, merge the weaker into the stronger (`brain_refactor`,
+  `action: "merge"`). If they are genuinely different, add the other id
+  to `distinct_from` on one of them (detailed read first) — that ends
+  the finding.
 - `orphan` — no other page links here and it has not changed for 90+
   days. Link it from a related page, merge it into one, or — if it is
   junk — delete it (`brain_refactor`, `action: "delete"`).

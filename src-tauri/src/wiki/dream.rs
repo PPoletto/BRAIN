@@ -12,7 +12,7 @@
 //!
 //! | priority | kind | suggested action |
 //! |---|---|---|
-//! | 1 | `duplicate-candidate` (hygiene pair, model index only) | `merge` |
+//! | 1 | `duplicate-candidate` (hygiene pair: same title, or content alike in a model index) | `merge` |
 //! | 1 | `broken-link` (links to missing pages, per source page) | `fix-link` |
 //! | 1 | `broken-source` (a `sources` entry without a page) | `fix-link` |
 //! | 2 | `summary-stale` (body changed since the summary was written) | `update-summary` |
@@ -234,6 +234,20 @@ pub fn load_dream_rows(conn: &rusqlite::Connection) -> DbResult<DreamRows> {
     })
 }
 
+/// Why a duplicate pair is in the queue: "same title" and/or "pages read
+/// almost the same", with the similarity when there is one.
+fn duplicate_reason(pair: &super::hygiene::DuplicatePair) -> String {
+    match (pair.same_title, pair.reads_alike(), pair.similarity) {
+        (true, true, Some(s)) => {
+            format!("same title, pages read almost the same (similarity {s:.2})")
+        }
+        (true, _, Some(s)) => format!("same title (similarity {s:.2})"),
+        (true, _, None) => "same title".to_string(),
+        (false, _, Some(s)) => format!("pages read almost the same (similarity {s:.2})"),
+        (false, _, None) => "possible duplicates".to_string(),
+    }
+}
+
 /// Build the queue from `rows` as of `now`, without skip history. Pure.
 pub fn build_queue(rows: &DreamRows, now: chrono::DateTime<chrono::Utc>) -> DreamQueue {
     build_queue_with_history(rows, now, &HashMap::new())
@@ -254,12 +268,13 @@ pub fn build_queue_with_history(
 
     // Priority 1: duplicates first (the costliest kind of drift), then
     // broken links (one item per source page) and broken sources.
-    for (a, b, score) in rows.hygiene.duplicate_pairs() {
+    for pair in rows.hygiene.duplicate_pairs() {
+        let reason = duplicate_reason(&pair);
         candidates.push(item(
             1,
             "duplicate-candidate",
-            vec![a, b],
-            format!("pages read almost the same (similarity {score:.2})"),
+            vec![pair.a, pair.b],
+            reason,
             "merge",
         ));
     }
@@ -905,6 +920,26 @@ mod tests {
             .filter(|i| i.suggested_action == "merge")
             .count();
         assert_eq!(merges, 0);
+    }
+
+    #[test]
+    fn two_pages_with_the_same_title_give_a_merge_item_without_a_model_index() {
+        let (_tmp, db) = open_db();
+        for id in ["entities/cockpit", "entities/cio-cockpit"] {
+            page(&db, id, NOW);
+            exec(
+                &db,
+                "UPDATE pages SET title = 'CIO COCKPIT' WHERE id = ?1",
+                &[&id],
+            );
+        }
+        let reasons: Vec<String> = queue(&db)
+            .items
+            .iter()
+            .filter(|i| i.suggested_action == "merge")
+            .map(|i| i.reason.clone())
+            .collect();
+        assert_eq!(reasons, vec!["same title".to_string()]);
     }
 
     #[test]
