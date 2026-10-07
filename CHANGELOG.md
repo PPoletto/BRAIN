@@ -23,6 +23,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Clearer error for a summary with a colon.** A `summary` or `title`
+  whose unquoted value contains `: ` (e.g. "… (auch CIO COCKPIT):
+  SaaS-Cockpit …") is invalid YAML. `brain_write_page` and
+  `brain_write_batch` now say so in their description, and the parse
+  error ("mapping values are not allowed in this context") gets the
+  hint that YAML needs the value quoted, e.g. `summary: "…"`.
 - **Release pipeline hardening.** One release build runs per tag at a
   time (a newer tag push cancels the older run instead of both writing
   into the same draft), every GitHub Action is pinned to a commit SHA,

@@ -1311,7 +1311,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "brain_write_page",
             title: "Write a page",
-            description: "Create or fully overwrite ONE page. Use it for a new page or to rewrite a page including its frontmatter (summary, aliases, superseded_by). Not for several pages that link to each other — use brain_write_batch; not for changing one section — use brain_patch_page. `content` = YAML frontmatter (id, type: entity|concept|source|topic — singular, title, summary: one or two sentences; optional tags, aliases, sources: [sources/…], valid_from/valid_to YYYY-MM-DD, superseded_by, distinct_from, keep: true) followed by the markdown body; link pages as [[type-dir/slug]]. Creating a NEW id is refused when brain_lookup would report an alias or normalised match (the error names the page); overwriting an existing id never is. Facts are not overwritten: supersede the old page instead (superseded_by + valid_to). Rewriting an existing page: read it first with brain_get_pages (response_format \"detailed\") and carry over EVERY frontmatter field unchanged (aliases, sources, tags, superseded_by, valid_from/valid_to, distinct_from, keep) — a concise read has no frontmatter, and a dropped field is lost. Returns {wrote, previous_size_bytes, new_size_bytes, warnings}; lint errors on this page fail the call and list the findings. The watcher commits.",
+            description: "Create or fully overwrite ONE page. Use it for a new page or to rewrite a page including its frontmatter (summary, aliases, superseded_by). Not for several pages that link to each other — use brain_write_batch; not for changing one section — use brain_patch_page. `content` = YAML frontmatter (id, type: entity|concept|source|topic — singular, title, summary: one or two sentences; optional tags, aliases, sources: [sources/…], valid_from/valid_to YYYY-MM-DD, superseded_by, distinct_from, keep: true) followed by the markdown body; link pages as [[type-dir/slug]]. Quote a summary (or title) that contains ': ' or starts with a special character ([ { & * ! | > ' \" % @ `), e.g. summary: \"GRASP (auch CIO COCKPIT): SaaS-Cockpit …\". Creating a NEW id is refused when brain_lookup would report an alias or normalised match (the error names the page); overwriting an existing id never is. Facts are not overwritten: supersede the old page instead (superseded_by + valid_to). Rewriting an existing page: read it first with brain_get_pages (response_format \"detailed\") and carry over EVERY frontmatter field unchanged (aliases, sources, tags, superseded_by, valid_from/valid_to, distinct_from, keep) — a concise read has no frontmatter, and a dropped field is lost. Returns {wrote, previous_size_bytes, new_size_bytes, warnings}; lint errors on this page fail the call and list the findings. The watcher commits.",
             input: json!({
                 "type": "object",
                 "properties": {
@@ -1335,7 +1335,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "brain_write_batch",
             title: "Write several pages atomically",
-            description: "Atomic multi-page write: every entry is validated first (one bad entry → nothing is written), all are written, then lint runs once. Use it whenever new pages link to each other (ingest), so the links between them resolve. Not for a single page — use brain_write_page. Entries have the brain_write_page format (for existing pages: read them with response_format \"detailed\" and carry over every frontmatter field); the duplicate refusal applies too, also against earlier entries of the batch. Returns {wrote: [{id, previous_size_bytes, new_size_bytes, warnings}]}. The watcher commits.",
+            description: "Atomic multi-page write: every entry is validated first (one bad entry → nothing is written), all are written, then lint runs once. Use it whenever new pages link to each other (ingest), so the links between them resolve. Not for a single page — use brain_write_page. Entries have the brain_write_page format (for existing pages: read them with response_format \"detailed\" and carry over every frontmatter field; quote a summary or title that contains ': ' or starts with a special character); the duplicate refusal applies too, also against earlier entries of the batch. Returns {wrote: [{id, previous_size_bytes, new_size_bytes, warnings}]}. The watcher commits.",
             input: json!({
                 "type": "object",
                 "properties": {
@@ -2209,7 +2209,8 @@ fn call_tool(
                 .get("content")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "missing 'content'".to_string())?;
-            let parsed = page::parse(content).map_err(|e| format!("invalid page content: {e}"))?;
+            let parsed = page::parse(content)
+                .map_err(|e| format!("invalid page content: {}", parse_error_text(content, &e)))?;
             let allow_duplicate = allow_duplicate_arg(&args)?;
             let confirm_summary = confirm_summary_arg(&args)?;
             // A2: refuse to CREATE a page that probably exists already
@@ -3074,8 +3075,12 @@ fn write_batch(
             .get("content")
             .and_then(Value::as_str)
             .ok_or_else(|| format!("pages[{idx}]: missing 'content'"))?;
-        let parsed = page::parse(content)
-            .map_err(|e| format!("pages[{idx}] ({id}): invalid content: {e}"))?;
+        let parsed = page::parse(content).map_err(|e| {
+            format!(
+                "pages[{idx}] ({id}): invalid content: {}",
+                parse_error_text(content, &e)
+            )
+        })?;
         let allow_duplicate =
             allow_all || allow_duplicate_arg(entry).map_err(|e| format!("pages[{idx}]: {e}"))?;
         let target = crate::wiki::encryption::page_path(vault, id).map_err(|e| e.to_string())?;
@@ -3529,6 +3534,44 @@ fn strip_superseded_notice(body: &str) -> &str {
 /// write_batch (per page), patch_page, history (list and restore) and
 /// refactor (rename, merge, delete — inside `wiki::refactor`). Any new arm that resolves a page id must call
 /// this first. `brain_write_raw_file` uses [`check_relative_path`].
+/// The text of a page-parse error, plus a quoting hint when the YAML
+/// failed on a `summary:` / `title:` line whose unquoted value contains
+/// `: ` — YAML reads that as a second mapping ("mapping values are not
+/// allowed in this context"), which the bare message does not explain.
+fn parse_error_text(content: &str, err: &crate::wiki::WikiError) -> String {
+    let crate::wiki::WikiError::Yaml(yaml_err) = err else {
+        return err.to_string();
+    };
+    match yaml_err
+        .location()
+        .and_then(|loc| unquoted_colon_key(content, loc.line()))
+    {
+        Some(key) => format!(
+            "{err} — YAML needs the value quoted, e.g. {key}: \"…\" (a value that contains ': ' \
+             or starts with a special character must be in double quotes)"
+        ),
+        None => err.to_string(),
+    }
+}
+
+/// `summary` or `title` when line `line` (1-based, counted from the line
+/// after the opening `---`, as the YAML parser counts) of `content`'s
+/// frontmatter is that key with an unquoted value containing `: `.
+fn unquoted_colon_key(content: &str, line: usize) -> Option<&'static str> {
+    let text = content.trim_start_matches('\u{feff}');
+    let text = text.strip_prefix("---")?.trim_start_matches(['\r', '\n']);
+    let failing = text.lines().nth(line.checked_sub(1)?)?;
+    ["summary", "title"].into_iter().find(|key| {
+        failing
+            .strip_prefix(key)
+            .and_then(|rest| rest.strip_prefix(':'))
+            .map(str::trim)
+            .is_some_and(|value| {
+                !value.starts_with('"') && !value.starts_with('\'') && value.contains(": ")
+            })
+    })
+}
+
 fn check_page_id(id: &str) -> Result<(), String> {
     refactor::validate_page_id(id).map_err(|e| e.to_string())
 }
@@ -4637,6 +4680,70 @@ mod tests {
         let path = crate::wiki::encryption::page_path(tmp.path(), "entities/bob").unwrap();
         let text = std::fs::read_to_string(path).unwrap();
         assert!(text.contains("summary: Bob runs the ops team.\n"), "{text}");
+    }
+
+    /// The summary that failed in the first dream session on 07.10.2026
+    /// (`mapping values are not allowed in this context`).
+    const UNQUOTED_COLON_PAGE: &str = "---\nid: entities/grasp\ntype: entity\ntitle: GRASP\nsummary: GRC-Plattform der DextraData GRC Technologies GmbH (auch CIO COCKPIT): SaaS-Cockpit für Governance, Risk und Compliance.\n---\n\nBody.\n";
+
+    #[test]
+    fn a_summary_with_an_unquoted_colon_fails_with_a_quoting_hint() {
+        let tmp = refactor_vault();
+        let err = call(
+            &tmp,
+            "brain_write_page",
+            json!({ "id": "entities/grasp", "content": UNQUOTED_COLON_PAGE }),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("YAML needs the value quoted, e.g. summary: \"…\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_batch_entry_with_an_unquoted_colon_in_its_summary_fails_with_a_quoting_hint() {
+        let tmp = refactor_vault();
+        let err = call(
+            &tmp,
+            "brain_write_batch",
+            json!({ "pages": [{ "id": "entities/grasp", "content": UNQUOTED_COLON_PAGE }] }),
+        )
+        .unwrap_err();
+        assert!(err.contains("e.g. summary: \"…\""), "{err}");
+    }
+
+    #[test]
+    fn the_same_summary_in_double_quotes_is_written() {
+        let tmp = refactor_vault();
+        let quoted = UNQUOTED_COLON_PAGE.replace(
+            "summary: GRC-Plattform der DextraData GRC Technologies GmbH (auch CIO COCKPIT): SaaS-Cockpit für Governance, Risk und Compliance.",
+            "summary: \"GRC-Plattform der DextraData GRC Technologies GmbH (auch CIO COCKPIT): SaaS-Cockpit für Governance, Risk und Compliance.\"",
+        );
+        let result = call(
+            &tmp,
+            "brain_write_page",
+            json!({ "id": "entities/grasp", "content": quoted }),
+        );
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn a_title_with_an_unquoted_colon_gets_the_hint_for_title() {
+        let content = "---\nid: entities/x\ntype: entity\ntitle: Projekt: Phase 2\n---\n\nBody.\n";
+        let err = page::parse(content).unwrap_err();
+        assert!(
+            parse_error_text(content, &err).contains("e.g. title: \"…\""),
+            "{}",
+            parse_error_text(content, &err)
+        );
+    }
+
+    #[test]
+    fn a_yaml_error_elsewhere_gets_no_quoting_hint() {
+        let content = "---\nid: entities/x\ntype: entity\ntags: [a, b\n---\n\nBody.\n";
+        let err = page::parse(content).unwrap_err();
+        assert!(!parse_error_text(content, &err).contains("needs the value quoted"));
     }
 
     #[test]
