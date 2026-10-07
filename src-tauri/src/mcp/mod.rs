@@ -1,6 +1,7 @@
 //! S06 — MCP Integration and LLM-Client Registration (MVP scope, no Cron).
 
 pub mod commands;
+pub mod install;
 pub mod registration;
 pub mod routing;
 pub mod server;

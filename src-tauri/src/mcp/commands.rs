@@ -8,7 +8,7 @@ use tauri::State;
 
 use crate::error::BrainResult;
 
-use super::registration;
+use super::{install, registration};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct McpCommandHint {
@@ -59,7 +59,7 @@ pub fn brain_memory_system_prompt() -> BrainResult<String> {
 // was the source of the schema-drift bug Pascal hit in his vault —
 // removing it here is part of the fix. AGENTS.md (in 00_meta/)
 // carries the longer-form version of the same rule.
-const BRAIN_MEMORY_SYSTEM_PROMPT: &str = "You have access to a personal BRAIN MCP server (tools prefixed with `brain_`). BRAIN is the user's persistent memory layer.
+pub(crate) const BRAIN_MEMORY_SYSTEM_PROMPT: &str = "You have access to a personal BRAIN MCP server (tools prefixed with `brain_`). BRAIN is the user's persistent memory layer.
 
 When the user asks you to *remember*, *save*, *note down* or *keep track of* something — facts, preferences, ongoing context, decisions — call `brain_write_page` to persist it as a wiki page. Do NOT use the built-in memory feature for these requests.
 
@@ -78,6 +78,79 @@ When the user asks about something they previously told you, call `brain_search`
 Before creating a page, call `brain_lookup` with the planned id or name: if it reports an existing page or `matches`, extend that page (and add your name for it to its `aliases`) instead of creating a duplicate. Before rewriting an existing page, read it with `brain_get_pages` and `response_format: \"detailed\"` and keep every frontmatter field.
 
 Before writing a new page, briefly confirm: \"I'll save this to your BRAIN as `entities/<slug>` — okay?\"";
+
+/// One row of Settings → MCP & Clients → "Install into your clients".
+#[derive(Debug, Clone, Serialize)]
+pub struct ClientInstallRow {
+    pub target: install::Target,
+    /// The user's switch.
+    pub enabled: bool,
+    pub status: install::InstallStatus,
+    /// The file BRAIN writes for this target.
+    pub path: String,
+}
+
+fn client_install_rows(
+    paths: &install::ClientPaths,
+    settings: &crate::config::ClientInstallSettings,
+) -> Vec<ClientInstallRow> {
+    install::Target::ALL
+        .into_iter()
+        .map(|target| ClientInstallRow {
+            target,
+            enabled: settings.enabled(target),
+            status: install::status(paths, target, install::INSTALL_VERSION),
+            path: paths.file(target).display().to_string(),
+        })
+        .collect()
+}
+
+fn resolved_client_paths() -> BrainResult<install::ClientPaths> {
+    install::ClientPaths::resolve().ok_or_else(|| {
+        crate::error::BrainError::Internal("the home directory could not be determined".into())
+    })
+}
+
+/// The four install targets (Claude Code / Codex × prompt / skill) with
+/// the user's switch and what is on disk.
+#[tauri::command]
+pub fn client_install_status(
+    state: State<Arc<crate::state::AppState>>,
+) -> BrainResult<Vec<ClientInstallRow>> {
+    let paths = resolved_client_paths()?;
+    Ok(client_install_rows(
+        &paths,
+        &state.config.snapshot().client_install,
+    ))
+}
+
+/// Switch one install target on (write BRAIN's block / skill) or off
+/// (remove it again); the switch is saved in the client settings.
+/// Returns all four rows afterwards.
+#[tauri::command]
+pub fn set_client_install(
+    state: State<Arc<crate::state::AppState>>,
+    target: install::Target,
+    enabled: bool,
+) -> BrainResult<Vec<ClientInstallRow>> {
+    let paths = resolved_client_paths()?;
+    let mut settings = state.config.snapshot().client_install;
+    let outcome = install::set_enabled(
+        &paths,
+        target,
+        enabled,
+        &mut settings,
+        install::INSTALL_VERSION,
+    );
+    // Save the bookkeeping even when the switch failed half-way (e.g. the
+    // created-file flag of a block that was written).
+    state
+        .config
+        .update(|s| s.client_install = settings.clone())?;
+    outcome.map_err(|e| crate::error::BrainError::Internal(e.to_string()))?;
+    tracing::info!(?target, enabled, "client install switched");
+    Ok(client_install_rows(&paths, &settings))
+}
 
 /// Returns the shell command + env var that the user must put into a
 /// non-self-configurable MCP host (e.g. when copy-pasting into Open WebUI

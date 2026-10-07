@@ -4,6 +4,9 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open as openShell } from "@tauri-apps/plugin-shell";
 import {
   commands,
+  type ClientInstallRow,
+  type ClientInstallStatus,
+  type ClientInstallTarget,
   type ClientStatus,
   type EvalReport,
   type McpCommandHint,
@@ -1101,6 +1104,8 @@ function McpTab({
         )}
       </Card>
 
+      <ClientInstallCard />
+
       <Card>
         <CardHeader>
           <div>
@@ -1175,6 +1180,135 @@ function McpTab({
         )}
       </Card>
     </div>
+  );
+}
+
+const INSTALL_LABELS: Record<ClientInstallTarget, string> = {
+  claude_code_prompt: "Claude Code — memory prompt",
+  claude_code_skill: "Claude Code — brain-wiki skill",
+  codex_prompt: "Codex — memory prompt",
+  codex_skill: "Codex — brain-wiki skill",
+};
+
+/** Status text and colour of one install target. */
+function installStatusText(status: ClientInstallStatus, enabled: boolean): {
+  text: string;
+  color: string;
+} {
+  switch (status.state) {
+    case "installed":
+      return { text: `Installed v${status.version}`, color: "text-emerald-400" };
+    case "outdated":
+      return enabled
+        ? { text: `v${status.version} outdated → updating on next start`, color: "text-amber-400" }
+        : { text: `v${status.version} (outdated, switched off)`, color: "text-neutral-500" };
+    case "not-installed":
+      return enabled
+        ? { text: "Removed outside BRAIN — switch off and on to reinstall", color: "text-amber-400" }
+        : { text: "Not installed", color: "text-neutral-500" };
+    case "foreign":
+      return {
+        text: "A brain-wiki skill BRAIN did not write is there — BRAIN leaves it alone",
+        color: "text-amber-400",
+      };
+    case "target-missing":
+      return { text: "Client not found on this computer", color: "text-neutral-500" };
+  }
+}
+
+function ClientInstallCard() {
+  const [rows, setRows] = useState<ClientInstallRow[] | null>(null);
+  const [busy, setBusy] = useState<ClientInstallTarget | null>(null);
+  const { push } = useToast();
+
+  useEffect(() => {
+    let cancelled = false;
+    commands
+      .clientInstallStatus()
+      .then((r) => {
+        if (!cancelled) setRows(r);
+      })
+      .catch(() => {
+        if (!cancelled) setRows([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function toggle(target: ClientInstallTarget, enabled: boolean) {
+    setBusy(target);
+    try {
+      setRows(await commands.setClientInstall(target, enabled));
+      push({
+        kind: "success",
+        message: enabled
+          ? `${INSTALL_LABELS[target]} installed`
+          : `${INSTALL_LABELS[target]} removed`,
+      });
+    } catch (e: unknown) {
+      push({
+        kind: "error",
+        message: "Could not change the installation",
+        detail: e instanceof Error ? e.message : String(e),
+      });
+      setRows(await commands.clientInstallStatus().catch(() => rows));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <div>
+          <CardTitle>Install into your clients</CardTitle>
+          <CardDescription>
+            Puts BRAIN's memory prompt into the client's global instructions
+            and the <code className="font-mono">brain-wiki</code> skill into
+            its skills folder, and keeps both up to date when BRAIN updates.
+            The Claude Code prompt applies to every Claude Code project. BRAIN
+            only ever touches its own marked block (
+            <code className="font-mono">&lt;!-- BRAIN:memory-prompt … --&gt;</code>
+            ) and its own skill file; switching off removes exactly that.
+            Claude Desktop has no local instruction file — use "Copy system
+            prompt" on the Memory mode tab there.
+          </CardDescription>
+        </div>
+      </CardHeader>
+      {rows === null ? (
+        <p className="text-sm text-neutral-500">Loading…</p>
+      ) : (
+        <ul className="divide-y divide-neutral-800 rounded-md border border-neutral-800">
+          {rows.map((row) => {
+            const { text, color } = installStatusText(row.status, row.enabled);
+            const blocked =
+              !row.enabled &&
+              (row.status.state === "target-missing" || row.status.state === "foreign");
+            return (
+              <li key={row.target} className="flex flex-col gap-1 px-3 py-2.5">
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={row.enabled}
+                    disabled={busy !== null || blocked}
+                    onChange={(e) => void toggle(row.target, e.target.checked)}
+                    className="size-4 accent-emerald-500"
+                  />
+                  <span className="font-medium text-neutral-200">
+                    {INSTALL_LABELS[row.target]}
+                  </span>
+                  <span className={`text-xs ${color}`}>{text}</span>
+                </label>
+                <span className="truncate pl-6 font-mono text-xs text-neutral-500" title={row.path}>
+                  {row.path}
+                </span>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </Card>
   );
 }
 

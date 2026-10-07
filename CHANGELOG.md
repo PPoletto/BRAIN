@@ -21,6 +21,24 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Both real duplicates of the first dream session had the same title but
   stayed below the 0.92 similarity threshold.
 
+- **Install the memory prompt and the skill with a switch.** Settings →
+  MCP & Clients has a new card "Install into your clients" with four
+  switches: the memory prompt into Claude Code's user instructions
+  (`~/.claude/CLAUDE.md` — it then applies to every Claude Code project)
+  and into Codex's (`~/.codex/AGENTS.md`, or `$CODEX_HOME/AGENTS.md`),
+  and the `brain-wiki` skill into `~/.claude/skills/brain-wiki/` and
+  `~/.agents/skills/brain-wiki/` (Codex). BRAIN writes only a marked
+  block (`<!-- BRAIN:memory-prompt v… -->` … `<!-- /BRAIN:memory-prompt
+  -->`) and keeps your own text around it byte for byte, line endings
+  included; the skill file carries a marker too, and a `brain-wiki`
+  folder BRAIN did not write is reported as foreign and left alone.
+  Switching off removes exactly what BRAIN wrote. After an app update
+  BRAIN refreshes every switched-on install at start, so the prompt no
+  longer goes stale silently. Claude Desktop keeps its instructions in
+  the cloud and stays copy-paste ("Copy system prompt" on the Memory
+  mode tab). That Codex picks up skills from `~/.agents/skills/` is
+  taken from third-party documentation and not yet confirmed by OpenAI.
+
 ### Changed
 
 - **Clearer error for a summary with a colon.** A `summary` or `title`

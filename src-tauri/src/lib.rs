@@ -413,6 +413,12 @@ pub fn run() {
                 }
             });
 
+            // Installed memory prompt / skill (Settings → MCP & Clients):
+            // after an app update their version is behind — bring every
+            // switched-on target up to date, off the main thread.
+            let install_settings = app_state.config.snapshot().client_install;
+            std::thread::spawn(move || mcp::install::refresh_on_startup(&install_settings));
+
             // Idle eviction for the ~2.2 GB bge-m3 model: started once per
             // process (setup runs once), not per mount. Every 60 s, drop the
             // model if nothing used it for EMBEDDER_IDLE_TTL; the next
@@ -464,6 +470,8 @@ pub fn run() {
             mcp::commands::reregister_mcp,
             mcp::commands::last_mcp_registration_report,
             mcp::commands::brain_memory_system_prompt,
+            mcp::commands::client_install_status,
+            mcp::commands::set_client_install,
             // Wiki (S03) + Viewer (S08–S10)
             viewer::commands::list_wiki_tree,
             viewer::commands::read_page,

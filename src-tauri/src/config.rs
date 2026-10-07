@@ -30,6 +30,25 @@ pub struct ClientSettings {
     /// fetch→merge→pushes in the background (S11 phase 6). Off by default.
     #[serde(default)]
     pub auto_sync: bool,
+    /// Settings → MCP & Clients: which clients get BRAIN's memory prompt
+    /// and `brain-wiki` skill installed (see `mcp::install`). All off by
+    /// default.
+    #[serde(default)]
+    pub client_install: ClientInstallSettings,
+}
+
+/// The four install switches of `mcp::install` plus, per instruction
+/// file, whether BRAIN created that file (then it may delete it again
+/// when BRAIN's block was all it held).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClientInstallSettings {
+    pub claude_code_prompt: bool,
+    pub claude_code_skill: bool,
+    pub codex_prompt: bool,
+    pub codex_skill: bool,
+    pub claude_code_prompt_created_file: bool,
+    pub codex_prompt_created_file: bool,
 }
 
 impl Default for ClientSettings {
@@ -42,6 +61,7 @@ impl Default for ClientSettings {
             default_provider: "local".to_string(),
             last_active_vault_path: None,
             auto_sync: false,
+            client_install: ClientInstallSettings::default(),
         }
     }
 }
@@ -156,6 +176,7 @@ mod tests {
             default_provider: "anthropic".into(),
             last_active_vault_path: Some(PathBuf::from("D:/")),
             auto_sync: true,
+            client_install: ClientInstallSettings::default(),
         };
         let raw = serde_json::to_string(&s).unwrap();
         let parsed: ClientSettings = serde_json::from_str(&raw).unwrap();
@@ -166,6 +187,14 @@ mod tests {
             parsed.last_active_vault_path.as_deref(),
             Some(std::path::Path::new("D:/"))
         );
+    }
+
+    #[test]
+    fn a_settings_file_from_before_the_install_switches_loads_with_every_switch_off() {
+        let raw = r#"{"update_channel":"stable","skipped_versions":[],"folder_sources":[],
+            "mount_path_override":null,"default_provider":"local"}"#;
+        let parsed: ClientSettings = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.client_install, ClientInstallSettings::default());
     }
 
     #[test]

@@ -394,6 +394,30 @@ copy the snippet from **Settings → MCP & Clients → Manual setup snippet**.
 It's a one-line CLI command for Claude Code, or a JSON object you can
 paste into any `mcpServers` map.
 
+### Install the memory prompt and the skill into Claude Code / Codex
+
+**Settings → MCP & Clients → Install into your clients** has four
+switches (all off by default):
+
+| Switch | Writes |
+|--------|--------|
+| Claude Code — memory prompt | a marked block in `~/.claude/CLAUDE.md` (applies to **every** Claude Code project) |
+| Claude Code — brain-wiki skill | `~/.claude/skills/brain-wiki/SKILL.md` |
+| Codex — memory prompt | a marked block in `~/.codex/AGENTS.md` (`$CODEX_HOME/AGENTS.md` when set) |
+| Codex — brain-wiki skill | `~/.agents/skills/brain-wiki/SKILL.md` |
+
+BRAIN only ever touches its own block (between
+`<!-- BRAIN:memory-prompt v<version> -->` and
+`<!-- /BRAIN:memory-prompt -->`; your own text around it stays byte for
+byte, line endings included) and its own skill file (marked with
+`<!-- BRAIN:skill v<version> -->`). A `brain-wiki` skill folder BRAIN did
+not write is shown as "foreign" and never overwritten. Switching off
+removes exactly what BRAIN wrote (and the instruction file itself only if
+BRAIN created it and nothing else is left in it). After an app update,
+BRAIN refreshes every switched-on install to the new version at start.
+A client whose directory (`~/.claude`, `~/.codex`) does not exist shows
+as "client not found".
+
 ### Replace Claude Desktop's built-in memory
 
 Claude Desktop has its own internal memory by default. To make it write to
@@ -413,7 +437,9 @@ BRAIN's `brain_write_page` and `brain_search` tools.
 - **Connectors** — list of optional MCP connectors (Outlook, Atlassian,
   HubSpot…)
 - **MCP & Clients** — auto-registration status per client, re-register
-  button, Claude Desktop verification checklist, manual setup snippets
+  button, install switches for the memory prompt and the `brain-wiki`
+  skill (Claude Code, Codex), Claude Desktop verification checklist,
+  manual setup snippets
 - **Memory mode** — system-prompt snippet to redirect Claude Desktop's
   memory into BRAIN
 - **Danger zone** — Reset BRAIN (eject + forget vault path + relaunch

@@ -65,6 +65,29 @@ export type RegistrationReport = {
   // status meant we wrote a file ChatGPT never reads.
 };
 
+/** Rust `mcp::install::Target`. */
+export type ClientInstallTarget =
+  | "claude_code_prompt"
+  | "claude_code_skill"
+  | "codex_prompt"
+  | "codex_skill";
+
+/** Rust `mcp::install::InstallStatus`. */
+export type ClientInstallStatus =
+  | { state: "not-installed" }
+  | { state: "installed"; version: string }
+  | { state: "outdated"; version: string }
+  | { state: "foreign" }
+  | { state: "target-missing" };
+
+/** Rust `mcp::commands::ClientInstallRow`. */
+export type ClientInstallRow = {
+  target: ClientInstallTarget;
+  enabled: boolean;
+  status: ClientInstallStatus;
+  path: string;
+};
+
 export type RemoteStatus = {
   encrypted: boolean;
   remote_url: string | null;
@@ -131,6 +154,9 @@ export const commands = {
   lastMcpRegistrationReport: () =>
     invoke<RegistrationReport | null>("last_mcp_registration_report"),
   brainMemorySystemPrompt: () => invoke<string>("brain_memory_system_prompt"),
+  clientInstallStatus: () => invoke<ClientInstallRow[]>("client_install_status"),
+  setClientInstall: (target: ClientInstallTarget, enabled: boolean) =>
+    invoke<ClientInstallRow[]>("set_client_install", { target, enabled }),
   openPageInExternalEditor: (id: string) =>
     invoke<void>("open_page_in_external_editor", { id }),
   rebuildIndex: () => invoke<number>("rebuild_index"),
