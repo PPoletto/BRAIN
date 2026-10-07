@@ -29,6 +29,24 @@ pub struct QueryHit {
     pub valid_to: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<String>,
+    /// The page's tags (as indexed), sorted; omitted when it has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Frontmatter `summary` (as indexed), omitted when the page has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+/// The tags of a `group_concat(tag, char(31))` column, sorted.
+fn split_tags(joined: Option<String>) -> Vec<String> {
+    let mut tags: Vec<String> = joined
+        .unwrap_or_default()
+        .split('\u{1f}')
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect();
+    tags.sort();
+    tags
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -99,10 +117,47 @@ fn run_compiled_on_conn(
                 valid_from: row.get(10)?,
                 valid_to: row.get(11)?,
                 superseded_by: row.get(12)?,
+                tags: split_tags(row.get(13)?),
+                summary: row
+                    .get::<_, Option<String>>(14)?
+                    .filter(|s| !s.trim().is_empty()),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+#[cfg(test)]
+mod table_column_tests {
+    use super::*;
+    use crate::db::pages_index;
+    use crate::vault::layout::{ensure_skeleton, wiki_dir};
+    use tempfile::TempDir;
+
+    fn hit() -> QueryHit {
+        let tmp = TempDir::new().unwrap();
+        ensure_skeleton(tmp.path()).unwrap();
+        let dir = wiki_dir(tmp.path()).join("entities");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("acme.md"),
+            "---\nid: entities/acme\ntype: entity\ntitle: Acme\nsummary: Kunde A.\ntags: [kunde, b2b]\n---\n\nBody.\n",
+        )
+        .unwrap();
+        let db = DbHandle::open(tmp.path()).unwrap();
+        pages_index::rebuild(&db, tmp.path()).unwrap();
+        run(&db, "type:entity").unwrap().remove(0)
+    }
+
+    #[test]
+    fn a_query_hit_carries_the_pages_tags_sorted() {
+        assert_eq!(hit().tags, vec!["b2b".to_string(), "kunde".to_string()]);
+    }
+
+    #[test]
+    fn a_query_hit_carries_the_pages_summary() {
+        assert_eq!(hit().summary.as_deref(), Some("Kunde A."));
+    }
 }
 
 #[cfg(test)]

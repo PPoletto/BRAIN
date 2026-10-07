@@ -56,6 +56,19 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   says so, and an index built without the embedding model is flagged
   (word overlap instead of meaning).
 
+- **Pages as a table.** In the Search tab's Query DSL mode a "Liste |
+  Tabelle" switch shows the matching pages as a full-width table: title
+  (opens the page), type, updated, tags, summary (full text on hover),
+  validity (current / upcoming / expired / superseded → successor),
+  reads and search hits. Click a column header to sort (again to
+  reverse); hide columns with the checkboxes (remembered on this
+  computer). The filter box takes the same query syntax (`*`, `type:`,
+  `tag:`, `valid:all`, `sort:salience` …); "CSV kopieren" copies the
+  rows as shown to the clipboard. Structured queries (`query_pages`, and
+  `brain_query` with `response_format: "detailed"`) now also return each
+  page's tags and summary, and the Query view accepts `*` for "all
+  current pages".
+
 ### Changed
 
 - **`missing-sources` on ingested pages.** The `lint-session` prompt and

@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { commands, type SimilarPages } from "../../lib/commands";
 import { useDataRefresh } from "../../lib/events";
@@ -7,12 +7,14 @@ import { EmptyState } from "../../components/ui/EmptyState";
 import { ResizableSplit } from "../../components/ui/ResizableSplit";
 import { Tabs } from "../../components/ui/Tabs";
 import { MarkdownRenderer } from "../../components/MarkdownRenderer";
+import { PageTable } from "./PageTable";
 
 type Hit = Awaited<ReturnType<typeof commands.searchPages>>[number];
 type QueryHit = Awaited<ReturnType<typeof commands.queryPages>>[number];
 type Backlink = Awaited<ReturnType<typeof commands.getBacklinks>>[number];
 type PageView = Awaited<ReturnType<typeof commands.readPage>>;
 type Mode = "fts" | "query";
+type View = "list" | "table";
 
 const MODE_TABS = [
   { id: "fts", label: "Full-text" },
@@ -35,6 +37,10 @@ export function Tier2() {
   const [pageLoading, setPageLoading] = useState(false);
   const [backlinks, setBacklinks] = useState<Backlink[]>([]);
   const [error, setError] = useState<string | null>(null);
+  // Query DSL results as a list (with the reader) or as a full-width table.
+  const [view, setView] = useState<View>(() =>
+    params.get("view") === "table" && params.get("mode") === "query" ? "table" : "list",
+  );
 
   useEffect(() => {
     const initial = params.get("q");
@@ -76,6 +82,44 @@ export function Tier2() {
     const sp = new URLSearchParams(params);
     sp.set("mode", next);
     setParams(sp, { replace: true });
+  }
+
+  function setViewAndUrl(next: View) {
+    setView(next);
+    const sp = new URLSearchParams(params);
+    if (next === "table") {
+      sp.set("view", "table");
+    } else {
+      sp.delete("view");
+    }
+    setParams(sp, { replace: true });
+  }
+
+  // The table runs its own filter; keep the query box and URL in step.
+  const onTableQuery = useCallback(
+    (q: string) => {
+      setQuery(q);
+      setParams(
+        (prev) => {
+          const sp = new URLSearchParams(prev);
+          sp.set("q", q);
+          sp.set("mode", "query");
+          sp.set("view", "table");
+          return sp;
+        },
+        { replace: true },
+      );
+    },
+    [setParams],
+  );
+
+  function openFromTable(id: string) {
+    setView("list");
+    const sp = new URLSearchParams(params);
+    sp.delete("view");
+    setParams(sp, { replace: true });
+    void runSearch(query);
+    void openHit(id);
   }
 
   async function runSearch(q: string) {
@@ -126,6 +170,37 @@ export function Tier2() {
     }
   }
 
+  const viewToggle = (
+    <div className="flex items-center gap-1 text-xs" role="group" aria-label="Result view">
+      {(["list", "table"] as const).map((v) => (
+        <button
+          key={v}
+          type="button"
+          onClick={() => setViewAndUrl(v)}
+          className={`rounded px-2 py-1 ${
+            view === v
+              ? "bg-neutral-800 text-neutral-100"
+              : "text-neutral-500 hover:text-neutral-300"
+          }`}
+        >
+          {v === "list" ? "Liste" : "Tabelle"}
+        </button>
+      ))}
+    </div>
+  );
+
+  if (mode === "query" && view === "table") {
+    return (
+      <div className="flex h-full min-w-0 flex-col bg-neutral-950">
+        <div className="flex items-center justify-between gap-2 border-b border-neutral-800 pr-3">
+          <Tabs tabs={MODE_TABS} active={mode} onChange={setModeAndUrl} className="px-3" />
+          {viewToggle}
+        </div>
+        <PageTable query={query} onQueryChange={onTableQuery} onOpen={openFromTable} />
+      </div>
+    );
+  }
+
   return (
     <ResizableSplit
       storageKey="brain.tier2.sidebar"
@@ -162,6 +237,11 @@ export function Tier2() {
                   : "Run query"}
             </Button>
           </form>
+          {mode === "query" && (
+            <div className="flex justify-end border-b border-neutral-800 px-3 py-1">
+              {viewToggle}
+            </div>
+          )}
           {mode === "query" && (
             <div className="border-b border-neutral-800 px-3 py-2 text-xs text-neutral-500">
               <strong className="text-neutral-300">Fields:</strong> id · type · title · tag · created · updated.{" "}

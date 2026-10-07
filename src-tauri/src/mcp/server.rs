@@ -1274,7 +1274,7 @@ fn tool_specs() -> Vec<ToolSpec> {
                     "limit": { "type": "integer", "minimum": 1, "default": 100, "description": "maximum hits returned; `total` says how many matched" },
                     "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "skip this many hits (use `next_offset` of the previous call)" },
                     "facet": { "type": "string", "enum": ["tags"], "description": "'tags': return {tags: [{tag, count}]} over the matching pages instead of hits — use it to learn which tags exist before filtering with tag:" },
-                    "response_format": response_format_schema("id, type and title per hit", "also path, updated_at, read/search-hit counters and validity fields")
+                    "response_format": response_format_schema("id, type and title per hit", "also path, updated_at, read/search-hit counters, validity fields, tags and summary")
                 }
             }),
             output: object_schema(json!({
@@ -2958,6 +2958,8 @@ fn filesystem_hits(
             valid_from: None,
             valid_to: None,
             superseded_by: None,
+            tags: Vec::new(),
+            summary: None,
             id,
         })
         .collect())

@@ -98,7 +98,14 @@ pub fn query_pages(
     let db = state
         .db()
         .ok_or_else(|| BrainError::Internal("no SQLite index is open".into()))?;
-    super::query::executor::run(&db, &query).map_err(|err| BrainError::Internal(err.to_string()))
+    // As in brain_query: an empty query or `*` lists every current page.
+    let trimmed = query.trim();
+    let query = if trimmed.is_empty() || trimmed == "*" {
+        "valid:now"
+    } else {
+        trimmed
+    };
+    super::query::executor::run(&db, query).map_err(|err| BrainError::Internal(err.to_string()))
 }
 
 /// B1: run the retrieval eval of the mounted vault (Settings → "Search

@@ -32,6 +32,10 @@ Testfragen mit den Pages, die eine gute Suche liefern muss, liegen in einer Date
 
 Unter den Backlinks einer geöffneten Page zeigt der Viewer auf Wunsch (einklappbar) die **ähnlichsten Pages**: standardmäßig acht, über alle Typen hinweg, mit Typ und Ähnlichkeit in Prozent, nach Ähnlichkeit der Page-Vektoren geordnet. Die Page selbst und die Pages, die sie ausdrücklich für verschieden erklärt, erscheinen nicht. Ohne Index zeigt die Liste, dass es noch keinen Index gibt, und baut ihn nicht auf. Wurde der Index ohne das Embedding-Modell aufgebaut, weist die Liste darauf hin, dass die Ähnlichkeit dann nur Wortüberlappung misst.
 
+### Seitentabelle im Viewer
+
+Die Ergebnisse einer strukturierten Abfrage kann der Viewer statt als Liste als **Tabelle** zeigen: Titel (öffnet die Page), Typ, letzte Änderung, Tags, Kurzbeschreibung (vollständig beim Überfahren), Gültigkeit (aktuell, noch nicht gültig, abgelaufen, ersetzt mit Link auf den Nachfolger), Lese- und Suchzähler. Jede Spalte ist durch Klick auf ihren Kopf auf- und absteigend sortierbar; leere Werte stehen immer am Ende. Spalten lassen sich ausblenden; die Auswahl merkt sich der Viewer auf diesem Rechner. Das Filterfeld nimmt dieselbe Abfragesprache wie die Listenansicht; `*` oder ein leeres Feld zeigt alle aktuellen Pages. Die angezeigten Zeilen lassen sich als CSV (mit Kopfzeile, RFC-4180-Quoting) in die Zwischenablage kopieren. Die Tabelle ist rein lesend (C-07).
+
 ---
 
 ## Offene Punkte für die Übernahme

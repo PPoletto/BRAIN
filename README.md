@@ -299,7 +299,7 @@ Two modes in the **Search** tab:
 | Mode | What it does |
 |------|--------------|
 | **Full-text** | FTS5 BM25 + bge-m3 cosine, RRF-fused. Pass a free-form query like `nis2 audit obligations`. |
-| **Query DSL** | Structured filter over frontmatter: `type:source AND tag:customer AND updated:>2026-04-01`. Fields: `id`, `type`, `title`, `tag`, `created`, `updated`. Operators: `:` (eq), `:>` (after), `:<` (before). Combine with `AND`, `OR`, `NOT`, parens. |
+| **Query DSL** | Structured filter over frontmatter: `type:source AND tag:customer AND updated:>2026-04-01`. Fields: `id`, `type`, `title`, `tag`, `created`, `updated`. Operators: `:` (eq), `:>` (after), `:<` (before). Combine with `AND`, `OR`, `NOT`, parens. `*` lists every current page. Switch **Liste / Tabelle** for a sortable table (title, type, updated, tags, summary, validity, reads, search hits; columns can be hidden) with **CSV kopieren**. |
 
 Click any result to read the page, follow `[[wiki-links]]`, and see
 backlinks — all without leaving the Search tab. Below the backlinks,

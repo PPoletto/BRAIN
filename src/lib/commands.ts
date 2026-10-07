@@ -193,6 +193,9 @@ export const commands = {
         valid_from?: string;
         valid_to?: string;
         superseded_by?: string;
+        /** Indexed tags (sorted) and summary, present only when set. */
+        tags?: string[];
+        summary?: string;
       }>
     >("query_pages", { query }),
 
