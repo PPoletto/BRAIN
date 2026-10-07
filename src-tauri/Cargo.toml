@@ -53,12 +53,10 @@ anyhow = "1.0"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tracing-appender = "0.2"
 
 # Storage
 rusqlite = { version = "0.32", features = ["bundled", "trace", "load_extension"] }
 sqlite-vec = "0.1"
-zerocopy = "0.8"
 
 # ML (bge-m3 embeddings via candle, XLM-RoBERTa architecture).
 # CPU-only — no CUDA/MKL/Accelerate dependency to keep portable. Loading the
@@ -90,11 +88,7 @@ minisign-verify = "0.2"
 directories = "5.0"
 sysinfo = "0.32"
 
-# Markdown / parsing
-pulldown-cmark = { version = "0.12", default-features = false }
-
 # IDs
-uuid = { version = "1.10", features = ["v4", "serde"] }
 ulid = { version = "1.1", features = ["serde"] }
 
 # Misc
@@ -126,10 +120,6 @@ keyring = { version = "3", features = [
     "sync-secret-service",
 ] }
 
-# HTTP server for MCP
-axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }
-tower = "0.5"
-
 # Random (bearer token)
 rand = "0.8"
 
@@ -153,8 +143,6 @@ git2 = { version = "0.19", default-features = false, features = ["vendored-libgi
 
 [dev-dependencies]
 tempfile = "3.13"
-mockall = "0.13"
-serial_test = "3.1"
 
 [features]
 default = ["custom-protocol"]
