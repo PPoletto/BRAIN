@@ -294,7 +294,8 @@ pub fn run_eval(vault_arg: Option<&str>) -> i32 {
         eprintln!("eval: index rebuild failed: {e}");
         return 6;
     }
-    let report = match viewer::eval::run_eval(&db, vault, &set) {
+    let (vectors, embedder_name) = viewer::eval::embed_set(vault, &set);
+    let report = match viewer::eval::run_eval_with_vectors(&db, &set, &vectors, embedder_name) {
         Ok(report) => report,
         Err(e) => {
             eprintln!("eval: {e}");
@@ -302,7 +303,7 @@ pub fn run_eval(vault_arg: Option<&str>) -> i32 {
         }
     };
     print!("{}", viewer::eval::render_table(&report));
-    match viewer::eval::fusion_comparison(&db, vault, &set) {
+    match viewer::eval::fusion_comparison(&db, &set, &vectors) {
         Ok(rows) => print!("\n{}", viewer::eval::render_fusion_table(&rows)),
         Err(e) => eprintln!("eval: fusion comparison failed: {e}"),
     }
@@ -420,8 +421,8 @@ pub fn run() {
             // Installed memory prompt / skill (Settings → MCP & Clients):
             // after an app update their version is behind — bring every
             // switched-on target up to date, off the main thread.
-            let install_settings = app_state.config.snapshot().client_install;
-            std::thread::spawn(move || mcp::install::refresh_on_startup(&install_settings));
+            let install_state = app_state.clone();
+            std::thread::spawn(move || mcp::install::refresh_on_startup(&install_state.config));
 
             // Idle eviction for the ~2.2 GB bge-m3 model: started once per
             // process (setup runs once), not per mount. Every 60 s, drop the

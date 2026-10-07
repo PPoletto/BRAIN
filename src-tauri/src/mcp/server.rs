@@ -1504,7 +1504,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "brain_dream",
             title: "Dream (consolidate the wiki)",
-            description: "Consolidation ('dreaming') — only when the user asks for it ('träum mal', 'tidy up the wiki'). action 'queue': BRAIN's prioritised work list {generated_at, items: [{priority 1..3, kind, pages, reason, suggested_action}], omitted}, served from 00_meta/dream-queue.md when under an hour old (`refresh: true` recomputes). action 'log' (once, at the end of the session): `entry` — one line saying what you changed and why — plus `items`, every queue item you looked at with its outcome (done / skipped with a one-line reason / deferred); appended to 00_meta/dream-log.md. Items skipped or deferred before carry `skipped_before` in later queues. action 'stats': what the dream log says so far {sessions, items_total, per_kind: [{kind, done, skipped, deferred}], most_skipped: [{kind, pages, count}] (skips since the item was last done, top 10)} — e.g. to tell the user which items keep being skipped. Work the queue with the `dream` prompt: at most 10 changes, never delete linked pages, supersede instead of overwrite. Not for a lint cleanup — use brain_lint_report.",
+            description: "Consolidation ('dreaming') — only when the user asks for it ('träum mal', 'tidy up the wiki'). action 'queue': BRAIN's prioritised work list {generated_at, items: [{priority 1..3, kind, pages, reason, suggested_action}], omitted}, served from 00_meta/dream-queue.md when under an hour old (`refresh: true` recomputes). action 'log' (once, at the end of the session): `entry` — one line saying what you changed and why — plus `items`, every queue item you looked at with its outcome (done / skipped with a one-line reason / deferred); appended to 00_meta/dream-log.md. Items skipped or deferred before carry `skipped_before` in later queues. action 'stats': what the dream log says so far (read from the last 500 KB of 00_meta/dream-log.md) {sessions, items_total, per_kind: [{kind, done, skipped, deferred}], most_skipped: [{kind, pages, count}] (skips since the item was last done, top 10)} — e.g. to tell the user which items keep being skipped. Work the queue with the `dream` prompt: at most 10 changes, never delete linked pages, supersede instead of overwrite. Not for a lint cleanup — use brain_lint_report.",
             input: json!({
                 "type": "object",
                 "properties": {
@@ -8257,8 +8257,11 @@ Body.
             ("brain_dream", json!({ "action": "queue" })),
             (
                 "brain_dream",
-                json!({ "action": "log", "entry": "nothing" }),
+                json!({ "action": "log", "entry": "nothing", "items": [
+                    { "kind": "orphan", "pages": ["entities/bob"], "outcome": "skipped", "note": "later" }
+                ] }),
             ),
+            ("brain_dream", json!({ "action": "stats" })),
         ];
         let specs = tool_specs();
         let mut mismatches: Vec<String> = Vec::new();

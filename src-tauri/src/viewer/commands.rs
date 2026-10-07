@@ -91,13 +91,21 @@ pub fn get_graph(
 /// Most rows the viewer's query list / table shows.
 const VIEWER_QUERY_CAP: usize = 200;
 
+/// The answer of `query_pages`: at most [`VIEWER_QUERY_CAP`] hits and the
+/// true number of matches.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QueryPagesResult {
+    pub total: usize,
+    pub hits: Vec<super::query::executor::QueryHit>,
+}
+
 /// Runs a Dataview-style query (e.g. `type:source AND tag:customer AND updated:>2026-04-01`)
 /// against the SQLite index. Returns matching pages sorted by updated_at DESC.
 #[tauri::command]
 pub fn query_pages(
     state: State<Arc<crate::state::AppState>>,
     query: String,
-) -> BrainResult<Vec<super::query::executor::QueryHit>> {
+) -> BrainResult<QueryPagesResult> {
     let db = state
         .db()
         .ok_or_else(|| BrainError::Internal("no SQLite index is open".into()))?;
@@ -112,8 +120,9 @@ pub fn query_pages(
         .map_err(|err| BrainError::Internal(err.to_string()))?;
     // The viewer's list and table show at most this many rows (the query
     // itself is uncapped since 0.3.6 — brain_query pages through it).
+    let total = hits.len();
     hits.truncate(VIEWER_QUERY_CAP);
-    Ok(hits)
+    Ok(QueryPagesResult { total, hits })
 }
 
 /// B1: run the retrieval eval of the mounted vault (Settings → "Search

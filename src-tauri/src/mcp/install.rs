@@ -476,8 +476,35 @@ pub fn remove_skill(skills_dir: &Path) -> io::Result<bool> {
 
 // ---- status and switching -------------------------------------------------
 
+/// The numeric parts of a `x.y.z` version (pre-release / build suffixes
+/// of a part are ignored); `None` when a part has no leading digits.
+fn version_parts(version: &str) -> Option<Vec<u64>> {
+    version
+        .split('.')
+        .map(|part| {
+            let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().ok()
+        })
+        .collect()
+}
+
+/// `installed` is an older version than `current` (both parse).
+pub fn is_older_version(installed: &str, current: &str) -> bool {
+    match (version_parts(installed), version_parts(current)) {
+        (Some(a), Some(b)) => a < b,
+        _ => false,
+    }
+}
+
+/// Installed in the current version, or in a newer one (written by a
+/// newer BRAIN on the same machine — never downgraded); anything else is
+/// outdated.
 fn versioned(found: String, current: &str) -> InstallStatus {
-    if found == current {
+    let newer = matches!(
+        (version_parts(&found), version_parts(current)),
+        (Some(a), Some(b)) if a > b
+    );
+    if found == current || newer {
         InstallStatus::Installed { version: found }
     } else {
         InstallStatus::Outdated { version: found }
@@ -627,32 +654,42 @@ pub fn set_enabled(
     Ok(status(paths, target, version))
 }
 
-/// Re-install every switched-on target whose installed version differs
-/// from `version` (after an app update). Targets that are switched off,
-/// missing, foreign or not installed (removed by hand) are left alone.
+/// Re-install every switched-on target whose installed version is OLDER
+/// than `version` (after an app update; never a downgrade). `enabled` is
+/// asked again right before each write, so a switch turned off in the
+/// meantime is respected. Targets that are switched off, missing,
+/// foreign, damaged or not installed (removed by hand) are left alone.
 pub fn refresh_outdated(
     paths: &ClientPaths,
-    settings: &ClientInstallSettings,
+    enabled: &dyn Fn(Target) -> bool,
     version: &str,
 ) -> Vec<(Target, Result<InstallStatus, InstallError>)> {
-    Target::ALL
-        .into_iter()
-        .filter(|t| settings.enabled(*t))
-        .filter(|t| matches!(status(paths, *t, version), InstallStatus::Outdated { .. }))
-        .map(|t| {
-            let result = write_target(paths, t, version).map(|_| status(paths, t, version));
-            (t, result)
-        })
-        .collect()
+    let mut out = Vec::new();
+    for t in Target::ALL {
+        if !enabled(t) {
+            continue;
+        }
+        let InstallStatus::Outdated { version: installed } = status(paths, t, version) else {
+            continue;
+        };
+        if !is_older_version(&installed, version) || !enabled(t) {
+            continue;
+        }
+        let result = write_target(paths, t, version).map(|_| status(paths, t, version));
+        out.push((t, result));
+    }
+    out
 }
 
 /// App start: refresh outdated installs of the real user's clients and
-/// log what happened. Never fails the start.
-pub fn refresh_on_startup(settings: &ClientInstallSettings) {
+/// log what happened. The switches are read from `config` at the moment
+/// of each write. Never fails the start.
+pub fn refresh_on_startup(config: &crate::config::ConfigStore) {
     let Some(paths) = ClientPaths::resolve() else {
         return;
     };
-    for (target, result) in refresh_outdated(&paths, settings, INSTALL_VERSION) {
+    let enabled = |t: Target| config.snapshot().client_install.enabled(t);
+    for (target, result) in refresh_outdated(&paths, &enabled, INSTALL_VERSION) {
         match result {
             Ok(_) => tracing::info!(
                 ?target,
@@ -1111,7 +1148,7 @@ mod tests {
             "0.3.6",
         )
         .unwrap();
-        refresh_outdated(&paths, &settings, "0.3.7");
+        refresh_outdated(&paths, &|t| settings.enabled(t), "0.3.7");
         assert_eq!(
             status(&paths, Target::ClaudeCodeSkill, "0.3.7"),
             InstallStatus::Installed {
@@ -1126,11 +1163,62 @@ mod tests {
         with_clients(&paths);
         let file = paths.prompt_file(Target::ClaudeCodePrompt).unwrap();
         upsert_marked_block(&file, MEMORY_BLOCK_ID, "0.3.6", "x").unwrap();
-        refresh_outdated(&paths, &ClientInstallSettings::default(), "0.3.7");
+        refresh_outdated(&paths, &|_| false, "0.3.7");
         assert_eq!(
             block_version(&read(&file), MEMORY_BLOCK_ID),
             Some("0.3.6".into())
         );
+    }
+
+    #[test]
+    fn refreshing_never_downgrades_a_block_written_by_a_newer_brain() {
+        let (_tmp, paths) = home();
+        with_clients(&paths);
+        let file = paths.prompt_file(Target::ClaudeCodePrompt).unwrap();
+        upsert_marked_block(&file, MEMORY_BLOCK_ID, "0.3.10", "x").unwrap();
+        refresh_outdated(&paths, &|_| true, "0.3.9");
+        assert_eq!(
+            block_version(&read(&file), MEMORY_BLOCK_ID),
+            Some("0.3.10".into())
+        );
+    }
+
+    #[test]
+    fn a_block_written_by_a_newer_brain_counts_as_installed() {
+        let (_tmp, paths) = home();
+        with_clients(&paths);
+        let file = paths.prompt_file(Target::CodexPrompt).unwrap();
+        upsert_marked_block(&file, MEMORY_BLOCK_ID, "0.4.0", "x").unwrap();
+        assert_eq!(
+            status(&paths, Target::CodexPrompt, "0.3.6"),
+            InstallStatus::Installed {
+                version: "0.4.0".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_switch_turned_off_during_the_refresh_is_respected() {
+        let (_tmp, paths) = home();
+        with_clients(&paths);
+        let file = paths.prompt_file(Target::ClaudeCodePrompt).unwrap();
+        upsert_marked_block(&file, MEMORY_BLOCK_ID, "0.3.5", "x").unwrap();
+        // On for the first look, off by the time the write would happen.
+        let asked = std::cell::Cell::new(0);
+        let enabled = |t: Target| {
+            asked.set(asked.get() + 1);
+            t == Target::ClaudeCodePrompt && asked.get() == 1
+        };
+        refresh_outdated(&paths, &enabled, "0.3.6");
+        assert_eq!(
+            block_version(&read(&file), MEMORY_BLOCK_ID),
+            Some("0.3.5".into())
+        );
+    }
+
+    #[test]
+    fn version_ten_is_newer_than_version_nine() {
+        assert!(is_older_version("0.3.9", "0.3.10"));
     }
 
     #[test]

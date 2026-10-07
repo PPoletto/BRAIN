@@ -178,9 +178,11 @@ export const commands = {
     invoke<void>("open_page_in_external_editor", { id }),
   rebuildIndex: () => invoke<number>("rebuild_index"),
   runRetrievalEval: () => invoke<EvalReport>("run_retrieval_eval"),
+  /** At most 200 hits; `total` is the true number of matches. */
   queryPages: (query: string) =>
-    invoke<
-      Array<{
+    invoke<{
+      total: number;
+      hits: Array<{
         id: string;
         type: string;
         path: string;
@@ -197,8 +199,8 @@ export const commands = {
         /** Indexed tags (sorted) and summary, present only when set. */
         tags?: string[];
         summary?: string;
-      }>
-    >("query_pages", { query }),
+      }>;
+    }>("query_pages", { query }),
 
   trayStatus: () => invoke<TrayStatus>("tray_status"),
   ejectBrain: (force: boolean) => invoke<void>("eject_brain", { force }),

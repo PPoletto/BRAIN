@@ -414,18 +414,35 @@ pub fn run_eval_on_conn(
 /// runs in its own `db.with`, so searches and index batches can run
 /// between them — the lock is never held across the whole set.
 pub fn run_eval(db: &DbHandle, vault: &Path, set: &[EvalQuery]) -> DbResult<EvalReport> {
+    let (vectors, embedder_name) = embed_set(vault, set);
+    run_eval_with_vectors(db, set, &vectors, embedder_name)
+}
+
+/// The query vectors of `set`, embedded once with `vault`'s cached
+/// embedder, and that embedder's name.
+pub fn embed_set(vault: &Path, set: &[EvalQuery]) -> (Vec<Vec<f32>>, &'static str) {
     let embedder = crate::embedding::cached_for_vault(vault);
-    let vectors = embed_queries(embedder.as_ref(), set);
+    (embed_queries(embedder.as_ref(), set), embedder.name())
+}
+
+/// [`run_eval`] with query vectors already computed ([`embed_set`]), so
+/// the CLI can reuse them for the fusion comparison.
+pub fn run_eval_with_vectors(
+    db: &DbHandle,
+    set: &[EvalQuery],
+    vectors: &[Vec<f32>],
+    query_embedder: &str,
+) -> DbResult<EvalReport> {
     let facts = db.with(index_facts)?;
     let mut results = Vec::with_capacity(set.len());
-    for (entry, vector) in set.iter().zip(&vectors) {
+    for (entry, vector) in set.iter().zip(vectors) {
         results.push(if entry.expected.is_empty() {
             None
         } else {
             Some(db.with(|conn| eval_query_on_conn(conn, entry, vector))?)
         });
     }
-    Ok(assemble_report(set, results, &facts, embedder.name()))
+    Ok(assemble_report(set, results, &facts, query_embedder))
 }
 
 /// Mean hybrid metrics of every [`Fusion`] variant over the entries of
@@ -456,16 +473,14 @@ pub fn fusion_comparison_on_conn(
         .collect())
 }
 
-/// [`fusion_comparison_on_conn`] on a CLI handle with the vault's
-/// process-cached embedder (queries embedded with no lock held).
+/// [`fusion_comparison_on_conn`] on a CLI handle, with the query vectors
+/// the main eval already computed ([`embed_set`]).
 pub fn fusion_comparison(
     db: &DbHandle,
-    vault: &Path,
     set: &[EvalQuery],
+    vectors: &[Vec<f32>],
 ) -> DbResult<Vec<(Fusion, Metrics)>> {
-    let embedder = crate::embedding::cached_for_vault(vault);
-    let vectors = embed_queries(embedder.as_ref(), set);
-    db.with(|conn| fusion_comparison_on_conn(conn, set, &vectors))
+    db.with(|conn| fusion_comparison_on_conn(conn, set, vectors))
 }
 
 /// The fusion comparison as a plain-text table; the default fusion is

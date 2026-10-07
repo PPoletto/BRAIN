@@ -37,7 +37,7 @@ Solange ein Brain gemountet ist, prüft der Client das Wiki kurz nach dem Mount 
 
 ### Konsolidierung („Träumen")
 
-Der Brain hat kein eigenes LLM (C-08). Konsolidierung ist deshalb geteilt: der Client erzeugt mit dem Audit eine **priorisierte Arbeitsliste** (Traumqueue) — Dubletten-Kandidaten und gebrochene Links/Quellen zuerst, dann veraltete oder fehlende Kurzbeschreibungen auf viel verlinkten Pages, dann Pages, die niemand liest oder verlinkt. Jede Page erscheint höchstens in einem Eintrag; die Liste ist begrenzt. Der Client schlägt nie Löschen vor, sondern „archivieren oder ersetzen".
+Der Brain hat kein eigenes LLM (ADR-001). Konsolidierung ist deshalb geteilt: der Client erzeugt mit dem Audit eine **priorisierte Arbeitsliste** (Traumqueue) — Dubletten-Kandidaten und gebrochene Links/Quellen zuerst, dann veraltete oder fehlende Kurzbeschreibungen auf viel verlinkten Pages, dann Pages, die niemand liest oder verlinkt. Jede Page erscheint höchstens in einem Eintrag; die Liste ist begrenzt. Der Client schlägt nie Löschen vor, sondern „archivieren oder ersetzen".
 
 Ein Agent arbeitet die Liste **nur auf Auslösung durch den User** ab; der Client plant keine Traumsitzung. Am Ende protokolliert der Agent jeden betrachteten Eintrag mit Ergebnis (erledigt, übersprungen mit Grund, zurückgestellt). Übersprungene Einträge kommen mit einem Zähler zurück; ab dem dritten Überspringen sagt der Grund das, und niedrig priorisierte Einträge rücken ans Ende. Das Protokoll und die Liste bleiben lokal.
 

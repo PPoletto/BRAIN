@@ -46,5 +46,6 @@ Alle Schalter sind standardmäßig aus. Der Client verändert dabei ausschließl
 
 ## Offene Punkte für die Übernahme
 
+- Der Abschnitt „Routing-Policy für interne LLM-Calls" in S06 entfällt: der Brain hat kein eigenes LLM und ruft keines auf (ADR-001, 07.10.2026). Page-Summaries, Lint-Korrekturen und Synthesen erledigt der LLM-Client des Users über MCP.
 - S06 nennt noch HTTP mit Bearer-Authentifizierung und ChatGPT Desktop; beides ist seit 0.3.5 nicht mehr Verhalten des Clients. Die Spec sollte das ausdrücklich zurücknehmen.
 - Dass Codex Skills aus dem benutzerweiten `.agents/skills`-Ordner liest, ist bisher nur durch eine Drittanbieter-Dokumentation belegt.

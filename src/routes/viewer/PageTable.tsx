@@ -64,6 +64,7 @@ export function PageTable({
 }) {
   const [filter, setFilter] = useState(query || "*");
   const [rows, setRows] = useState<PageRow[]>([]);
+  const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sortKey, setSortKey] = useState<ColumnKey>("updated");
@@ -78,7 +79,9 @@ export function PageTable({
       setLoading(true);
       setError(null);
       try {
-        setRows(await commands.queryPages(q));
+        const result = await commands.queryPages(q);
+        setRows(result.hits);
+        setTotal(result.total);
         setRan(q);
         onQueryChange(q);
       } catch (e: unknown) {
@@ -229,8 +232,9 @@ export function PageTable({
           </label>
         ))}
         <span className="ml-auto text-neutral-500">
-          {rows.length} page{rows.length === 1 ? "" : "s"}
-          {rows.length >= 200 ? " (first 200 — narrow the filter)" : ""}
+          {total > rows.length
+            ? `${rows.length} of ${total} pages — narrow the filter to see the rest`
+            : `${rows.length} page${rows.length === 1 ? "" : "s"}`}
         </span>
       </div>
       {error && (

@@ -45,8 +45,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   file until the markers are fixed. An instruction file that is a
   symbolic link (stow, yadm, home-manager) stays a link: BRAIN writes
   into the file it points to. After an app update
-  BRAIN refreshes every switched-on install at start, so the prompt no
-  longer goes stale silently. Claude Desktop keeps its instructions in
+  BRAIN refreshes every switched-on install that is older than the app
+  at start (never downgrading one written by a newer BRAIN), so the
+  prompt no longer goes stale silently. Claude Desktop keeps its instructions in
   the cloud and stays copy-paste ("Copy system prompt" on the Memory
   mode tab). That Codex picks up skills from `~/.agents/skills/` is
   taken from third-party documentation and not yet confirmed by OpenAI.
@@ -90,7 +91,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   calendar ingestion, the master-index topic page of that ingestion wave
   counts as a source, and how to find it (the "Verwandt im Brain" link
   or `brain_query`). Use "Update vault templates" to pass it on.
-- **Leaner build.** Seven Rust dependencies that nothing used any more
+- **Leaner build.** Eight Rust dependencies that nothing used any more
   (an HTTP server stack from an MCP transport BRAIN never shipped, and
   others) are no longer compiled in.
 - **No LLM inside BRAIN — recorded.** BRAIN stays without a language
@@ -118,7 +119,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   them with `next_offset` while more remain, and the prefix filter sees
   every match. One call returns at most 500 hits (`limit` above that is
   clamped; default 100). The app's Query view and table still show the
-  first 200.
+  first 200 and now say how many pages matched ("200 of 340").
 - **Adding eval questions from two sessions at once works on Windows.**
   Two concurrent `brain_eval` `add` calls could fail with "access
   denied" while the other one released its lock; the second one now

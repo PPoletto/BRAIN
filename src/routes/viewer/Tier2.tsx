@@ -10,7 +10,7 @@ import { MarkdownRenderer } from "../../components/MarkdownRenderer";
 import { PageTable } from "./PageTable";
 
 type Hit = Awaited<ReturnType<typeof commands.searchPages>>[number];
-type QueryHit = Awaited<ReturnType<typeof commands.queryPages>>[number];
+type QueryHit = Awaited<ReturnType<typeof commands.queryPages>>["hits"][number];
 type Backlink = Awaited<ReturnType<typeof commands.getBacklinks>>[number];
 type PageView = Awaited<ReturnType<typeof commands.readPage>>;
 type Mode = "fts" | "query";
@@ -30,6 +30,7 @@ export function Tier2() {
   const [query, setQuery] = useState(params.get("q") ?? "");
   const [hits, setHits] = useState<Hit[]>([]);
   const [queryHits, setQueryHits] = useState<QueryHit[]>([]);
+  const [queryTotal, setQueryTotal] = useState(0);
   const [searched, setSearched] = useState(false);
   const [searching, setSearching] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
@@ -134,7 +135,8 @@ export function Tier2() {
         setQueryHits([]);
       } else {
         const results = await commands.queryPages(q);
-        setQueryHits(results);
+        setQueryHits(results.hits);
+        setQueryTotal(results.total);
         setHits([]);
       }
       const sp = new URLSearchParams(params);
@@ -302,6 +304,12 @@ export function Tier2() {
                   </li>
                 ))}
               </ul>
+            )}
+            {mode === "query" && queryTotal > queryHits.length && (
+              <p className="border-b border-neutral-800 px-3 py-2 text-xs text-amber-400">
+                Showing {queryHits.length} of {queryTotal} pages — narrow the query to see the
+                rest.
+              </p>
             )}
             {mode === "query" && (
               <ul className="divide-y divide-neutral-800">
