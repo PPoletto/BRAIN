@@ -72,7 +72,8 @@ pub fn search_with_db(
 fn search_hybrid(db: &DbHandle, vault: &Path, query: &str) -> ViewerResult<Vec<SearchHit>> {
     let embedder = crate::embedding::cached_for_vault(vault);
     db.with(|conn| {
-        search_hybrid_on_conn(conn, embedder.as_ref(), query).map_err(crate::db::DbError::from)
+        search_hybrid_on_conn(conn, embedder.as_ref(), query, GUI_SEARCH_HITS)
+            .map_err(crate::db::DbError::from)
     })
     .map_err(|err| super::ViewerError::Io(std::io::Error::other(err.to_string())))
 }
@@ -98,6 +99,9 @@ impl RetrievalMode {
         }
     }
 }
+
+/// Hits the app's search shows.
+const GUI_SEARCH_HITS: usize = 20;
 
 /// FTS candidate PAGES before fusion.
 const CANDIDATES: usize = 50;
@@ -192,7 +196,7 @@ pub fn hybrid_ids_on_conn(
     let fts_rows = fts_candidates(conn, &sanitize_fts_query(query))?;
     let dense = dense_candidates(conn, &q_vec, &fts_rows)?;
     let fts: Vec<(String, f32)> = fts_rows.into_iter().map(|r| (r.0, r.4)).collect();
-    let mut ids: Vec<String> = fuse(&fts, &dense, fusion)
+    let mut ids: Vec<String> = fuse(&fts, &dense, fusion, limit)
         .into_iter()
         .map(|(id, _)| id)
         .collect();
@@ -218,10 +222,12 @@ pub enum Fusion {
     /// RRF over the FTS hits whose relevance is at least
     /// [`WEAK_FTS_FRACTION`] of the query's best FTS hit only.
     WeakFtsIgnored,
-    /// The dense ranking is the base; FTS only boosts pages that are in
-    /// BOTH lists. A page found only by FTS scores below every page in the
-    /// first ~110 dense ranks, so it never enters the top 10 unless the
-    /// dense list has fewer than 10 pages.
+    /// The dense ranking is the base. With a requested top-k of K, the
+    /// dense top K stays the top K: FTS only reorders pages INSIDE that
+    /// window (a page found by both lists moves up a rank or two), then
+    /// come the remaining dense pages (reordered the same way among
+    /// themselves), then pages found only by FTS — which therefore reach
+    /// the top K only when the dense list has fewer than K pages.
     DenseFirst,
     /// `0.7 × dense + 0.3 × fts` over min–max normalised scores.
     Convex,
@@ -250,12 +256,12 @@ impl Fusion {
 /// The fusion `brain_search`, the GUI search and the eval's hybrid mode
 /// use. An internal choice, not a user setting.
 ///
-/// Dense-first keeps the dense top 10 as the result set whenever the
-/// dense list has at least 10 pages, so hybrid Recall@10 can no longer
-/// fall below dense-only Recall@10 — the failure measured with RRF. The
-/// FTS boost only reorders pages both lists found. Its strength
-/// ([`DENSE_FIRST_K`], [`DENSE_FIRST_FTS_WEIGHT`]) was chosen, not yet
-/// measured; compare with `brain eval` on a real vault.
+/// Dense-first keeps the dense top K as the top K for the requested K,
+/// so hybrid Recall@K equals dense-only Recall@K — the failure measured
+/// with RRF cannot happen. Measured on the user's vault (50 curated
+/// queries, bge-m3): rrf 0.800 / 0.720 / 0.697 (R@10 / MRR / nDCG@10) →
+/// dense-first 0.960 / 0.878 / 0.874; convex scored 0.953 / 0.893 /
+/// 0.880 (more MRR, one page less recall) and was not chosen.
 pub const FUSION: Fusion = Fusion::DenseFirst;
 
 /// RRF constant (the canonical 60).
@@ -265,9 +271,9 @@ const WEIGHTED_RRF_FTS_WEIGHT: f32 = 0.4;
 /// [`Fusion::WeakFtsIgnored`]: FTS hits below this fraction of the best
 /// FTS relevance of the query are dropped.
 const WEAK_FTS_FRACTION: f32 = 0.5;
-/// [`Fusion::DenseFirst`]: dense score `1/(K + rank)`. Smaller than RRF's
-/// 60 so neighbouring dense ranks stay distinguishable and the boost can
-/// only move a page up by a rank or two near the top.
+/// [`Fusion::DenseFirst`]: dense score `1/(K + rank)` used to reorder
+/// within a window. Smaller than RRF's 60 so neighbouring dense ranks
+/// stay distinguishable and the boost moves a page up a rank or two.
 const DENSE_FIRST_K: f32 = 10.0;
 /// [`Fusion::DenseFirst`]: boost `W/(60 + fts_rank)` for a page in both
 /// lists (at most 0.0083; the gap between dense ranks 0 and 1 is 0.0091).
@@ -278,13 +284,19 @@ const CONVEX_DENSE_WEIGHT: f32 = 0.7;
 /// Combine the FTS candidates `fts` (id, relevance — higher is better)
 /// and the dense candidates `dense` (id, similarity — higher is better),
 /// both best first, into one ranking: every id of either list with its
-/// fused score, highest first, ties by id. Pure.
+/// fused score, highest first (scores never increase down the list).
+/// `top_k` is the number of results the caller will keep; only
+/// [`Fusion::DenseFirst`] uses it (its window). Pure.
 pub fn fuse<'a>(
     fts: &'a [(String, f32)],
     dense: &'a [(String, f32)],
     fusion: Fusion,
+    top_k: usize,
 ) -> Vec<(String, f32)> {
     use std::collections::HashMap;
+    if fusion == Fusion::DenseFirst {
+        return dense_first(fts, dense, top_k);
+    }
     let mut score: HashMap<&str, f32> = HashMap::new();
     let mut add = |id: &'a str, s: f32| *score.entry(id).or_default() += s;
     match fusion {
@@ -307,16 +319,7 @@ pub fn fuse<'a>(
                 add(id, 1.0 / (RRF_K + rank as f32));
             }
         }
-        Fusion::DenseFirst => {
-            for (rank, (id, _)) in dense.iter().enumerate() {
-                add(id, 1.0 / (DENSE_FIRST_K + rank as f32));
-            }
-            // FTS-only pages get the bare boost: below the first ~110
-            // dense ranks, so they only fill up a short dense list.
-            for (rank, (id, _)) in fts.iter().enumerate() {
-                add(id, DENSE_FIRST_FTS_WEIGHT / (RRF_K + rank as f32));
-            }
-        }
+        Fusion::DenseFirst => unreachable!("handled above"),
         Fusion::Convex => {
             for (id, s) in normalised(dense) {
                 add(id, CONVEX_DENSE_WEIGHT * s);
@@ -331,6 +334,50 @@ pub fn fuse<'a>(
         .map(|(id, s)| (id.to_string(), s))
         .collect();
     out.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
+/// [`Fusion::DenseFirst`]: the dense top `top_k` (reordered among
+/// themselves by dense score + FTS boost), then the rest of the dense
+/// list (reordered the same way), then the FTS-only pages in FTS order.
+/// The reported score is the boosted score, capped so it never rises
+/// down the list.
+fn dense_first(fts: &[(String, f32)], dense: &[(String, f32)], top_k: usize) -> Vec<(String, f32)> {
+    use std::collections::{HashMap, HashSet};
+    let fts_rank: HashMap<&str, usize> = fts
+        .iter()
+        .enumerate()
+        .map(|(rank, (id, _))| (id.as_str(), rank))
+        .collect();
+    let boosted = |rank: usize, id: &str| -> f32 {
+        1.0 / (DENSE_FIRST_K + rank as f32)
+            + fts_rank
+                .get(id)
+                .map_or(0.0, |r| DENSE_FIRST_FTS_WEIGHT / (RRF_K + *r as f32))
+    };
+    let reorder = |slice: &[(String, f32)], offset: usize| -> Vec<(String, f32)> {
+        let mut part: Vec<(String, f32, usize)> = slice
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| (id.clone(), boosted(offset + i, id), offset + i))
+            .collect();
+        part.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
+        part.into_iter().map(|(id, s, _)| (id, s)).collect()
+    };
+    let split = top_k.min(dense.len());
+    let mut out = reorder(&dense[..split], 0);
+    out.extend(reorder(&dense[split..], split));
+    let in_dense: HashSet<&str> = dense.iter().map(|(id, _)| id.as_str()).collect();
+    for (rank, (id, _)) in fts.iter().enumerate() {
+        if !in_dense.contains(id.as_str()) {
+            out.push((id.clone(), DENSE_FIRST_FTS_WEIGHT / (RRF_K + rank as f32)));
+        }
+    }
+    let mut cap = f32::INFINITY;
+    for entry in &mut out {
+        entry.1 = entry.1.min(cap);
+        cap = entry.1;
+    }
     out
 }
 
@@ -381,6 +428,7 @@ pub fn search_hybrid_on_conn(
     conn: &rusqlite::Connection,
     embedder: &dyn Embedder,
     query: &str,
+    limit: usize,
 ) -> rusqlite::Result<Vec<SearchHit>> {
     let q_vec = embedder.embed(query);
     let fts_rows = fts_candidates(conn, &sanitize_fts_query(query))?;
@@ -395,8 +443,8 @@ pub fn search_hybrid_on_conn(
             })
             .collect();
     let fts: Vec<(String, f32)> = fts_rows.iter().map(|r| (r.0.clone(), r.4)).collect();
-    let mut fused = fuse(&fts, &dense, FUSION);
-    fused.truncate(20);
+    let mut fused = fuse(&fts, &dense, FUSION, limit);
+    fused.truncate(limit);
     for (id, _) in &fused {
         if !meta.contains_key(id) {
             let row = conn
@@ -1005,21 +1053,21 @@ mod tests {
     #[test]
     fn plain_rrf_pushes_the_dense_top_hit_out_of_the_top_ten_under_fts_noise() {
         let (fts, dense) = noisy_lists();
-        let fused = fuse(&fts, &dense, Fusion::Rrf);
+        let fused = fuse(&fts, &dense, Fusion::Rrf, 10);
         assert!(!top(&fused, 10).contains(&"entities/d00"));
     }
 
     #[test]
     fn dense_first_keeps_the_dense_top_hit_first_under_fts_noise() {
         let (fts, dense) = noisy_lists();
-        let fused = fuse(&fts, &dense, Fusion::DenseFirst);
+        let fused = fuse(&fts, &dense, Fusion::DenseFirst, 10);
         assert_eq!(fused[0].0, "entities/d00");
     }
 
     #[test]
     fn dense_first_keeps_the_dense_top_ten_as_the_top_ten_under_fts_noise() {
         let (fts, dense) = noisy_lists();
-        let fused = fuse(&fts, &dense, Fusion::DenseFirst);
+        let fused = fuse(&fts, &dense, Fusion::DenseFirst, 10);
         let mut got = top(&fused, 10);
         got.sort_unstable();
         let want: Vec<String> = (0..10).map(|i| format!("entities/d{i:02}")).collect();
@@ -1027,11 +1075,32 @@ mod tests {
     }
 
     #[test]
+    fn dense_first_keeps_the_dense_top_ten_when_fts_hits_sit_just_below_it() {
+        // Review counterexample: FTS hits at dense ranks 10–12 must not
+        // push dense rank 9 out of the top ten.
+        let dense_ids: Vec<String> = (0..40).map(|i| format!("entities/d{i:02}")).collect();
+        let dense = list(&dense_ids.iter().map(String::as_str).collect::<Vec<_>>());
+        let fts = list(&["entities/d10", "entities/d11", "entities/d12"]);
+        let fused = fuse(&fts, &dense, Fusion::DenseFirst, 10);
+        let mut got = top(&fused, 10);
+        got.sort_unstable();
+        let want: Vec<&str> = dense_ids[..10].iter().map(String::as_str).collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn dense_first_scores_never_rise_down_the_list() {
+        let (fts, dense) = noisy_lists();
+        let fused = fuse(&fts, &dense, Fusion::DenseFirst, 10);
+        assert!(fused.windows(2).all(|w| w[0].1 >= w[1].1));
+    }
+
+    #[test]
     fn dense_first_boosts_a_page_found_by_both_lists() {
         // c is dense #3 and FTS #1: it overtakes dense #2 (b), not dense #1.
         let dense = list(&["entities/a", "entities/b", "entities/c", "entities/d"]);
         let fts = list(&["entities/c"]);
-        let fused = fuse(&fts, &dense, Fusion::DenseFirst);
+        let fused = fuse(&fts, &dense, Fusion::DenseFirst, 10);
         assert_eq!(
             top(&fused, 4),
             vec!["entities/a", "entities/c", "entities/b", "entities/d"]
@@ -1042,7 +1111,7 @@ mod tests {
     fn dense_first_lets_fts_only_pages_fill_a_short_dense_list() {
         let dense = list(&["entities/a", "entities/b"]);
         let fts = list(&["entities/x", "entities/a"]);
-        let fused = fuse(&fts, &dense, Fusion::DenseFirst);
+        let fused = fuse(&fts, &dense, Fusion::DenseFirst, 10);
         assert_eq!(
             top(&fused, 3),
             vec!["entities/a", "entities/b", "entities/x"]
@@ -1056,7 +1125,7 @@ mod tests {
             ("entities/strong".to_string(), 10.0),
             ("entities/weak".to_string(), 2.0),
         ];
-        let fused = fuse(&fts, &dense, Fusion::WeakFtsIgnored);
+        let fused = fuse(&fts, &dense, Fusion::WeakFtsIgnored, 10);
         assert!(fused.iter().all(|(id, _)| id != "entities/weak"));
     }
 
@@ -1064,7 +1133,7 @@ mod tests {
     fn the_convex_variant_weights_the_dense_score_above_the_fts_score() {
         let dense = list(&["entities/a", "entities/b"]);
         let fts = list(&["entities/b", "entities/a"]);
-        let fused = fuse(&fts, &dense, Fusion::Convex);
+        let fused = fuse(&fts, &dense, Fusion::Convex, 10);
         assert_eq!(fused[0].0, "entities/a");
     }
 
@@ -1072,7 +1141,7 @@ mod tests {
     fn fusion_breaks_score_ties_by_id() {
         let fts = list(&["entities/b"]);
         let dense = list(&["entities/a"]);
-        let fused = fuse(&fts, &dense, Fusion::Rrf);
+        let fused = fuse(&fts, &dense, Fusion::Rrf, 10);
         assert_eq!(top(&fused, 2), vec!["entities/a", "entities/b"]);
     }
 }

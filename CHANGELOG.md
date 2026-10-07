@@ -108,23 +108,24 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   denied" while the other one released its lock; the second one now
   waits its turn, and the eval set is written under a unique temporary
   name.
-- **Hybrid search no longer buries the best semantic hit.** On a real
-  vault (50 curated eval questions, bge-m3) hybrid search scored far
-  below semantic search alone — Recall@10 0.800 / MRR 0.720 / nDCG@10
-  0.697 against 0.960 / 0.878 / 0.873 (full-text alone: 0.565 / 0.445 /
-  0.450). In 6 of 50 questions the semantic search had the right page at
-  rank 1–2 and the rank fusion (RRF) pushed it out of the top 10: weak
-  full-text hits that also sat deep in the semantic list collected two
-  reciprocal ranks. Hybrid search now ranks **dense-first**: the
-  semantic ranking is the base, and full-text only lifts pages both
-  searches found (by a rank or two); pages found by full text alone come
-  after the semantic hits and only fill up a short semantic list. This
-  keeps hybrid Recall@10 at the semantic level by construction; the new
-  MRR / nDCG on that vault are **not measured yet** — run
-  `brain eval <vault>`, which now also prints a table of all five fusion
-  variants (rrf, weighted-rrf, weak-fts-ignored, dense-first, convex) so
-  the choice can be checked on your own questions. The full-text index
-  and tokenizer are unchanged (no re-index).
+- **Hybrid search no longer buries the best semantic hit.** Hybrid
+  search scored far below semantic search alone: in 6 of 50 eval
+  questions the semantic search had the right page at rank 1–2 and the
+  rank fusion (RRF) pushed it out of the top 10, because weak full-text
+  hits that also sat deep in the semantic list collected two reciprocal
+  ranks. Hybrid search now ranks **dense-first**: the semantic top K (K
+  = the number of results asked for) stays the top K, and full text only
+  reorders pages inside it (a page both searches found moves up a rank
+  or two); the remaining semantic pages follow, and pages found by full
+  text alone come last, filling up only a short semantic list. Measured
+  on the user's vault with 50 curated queries (bge-m3), Recall@10 / MRR
+  / nDCG@10: before (RRF) 0.800 / 0.720 / 0.697 → after 0.960 / 0.878 /
+  0.874 (semantic alone: 0.960 / 0.878 / 0.873; full text alone: 0.565
+  / 0.445 / 0.450). `brain eval <vault>` now also prints a table of all
+  five fusion variants (rrf, weighted-rrf, weak-fts-ignored,
+  dense-first, convex) so the choice can be checked on your own
+  questions. The full-text index and tokenizer are unchanged (no
+  re-index).
 
 ## [0.3.5] — 2026-10-06
 

@@ -2090,7 +2090,7 @@ fn call_tool(
             let embedder = crate::embedding::cached_for_vault(vault);
             let query_owned = q.to_string();
             let hybrid = db_op(db, vault, "brain_search", move |conn| {
-                search::search_hybrid_on_conn(conn, embedder.as_ref(), &query_owned)
+                search::search_hybrid_on_conn(conn, embedder.as_ref(), &query_owned, limit)
                     .map_err(crate::db::DbError::from)
             });
             let mut hits = match hybrid {
