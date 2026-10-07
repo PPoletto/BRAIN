@@ -372,7 +372,8 @@ pub fn remove_marked_block(
         before = &before[..before.len() - nl.len()];
     }
     let new_text = format!("{before}{after}");
-    if new_text.trim().is_empty() && delete_if_blank {
+    // A link (dotfile manager) is never deleted — only emptied.
+    if new_text.trim().is_empty() && delete_if_blank && !crate::fsutil::is_symlink(file) {
         std::fs::remove_file(file)?;
         return Ok(RemoveOutcome::FileDeleted);
     }

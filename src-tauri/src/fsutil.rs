@@ -39,21 +39,68 @@ fn unique_temp_path(target: &Path) -> PathBuf {
     target.with_file_name(format!("{name}.{}-{n}.tmp", std::process::id()))
 }
 
+/// The path a write to `target` must go to: `target` itself, or — when
+/// `target` is a symbolic link (dotfile managers such as stow, yadm or
+/// home-manager link `~/.claude/CLAUDE.md` into a repository) — the file
+/// the link points to, so the link survives the write. A link whose
+/// target cannot be resolved is an error: BRAIN does not replace a link
+/// with a regular file.
+pub fn write_destination(target: &Path) -> io::Result<PathBuf> {
+    match std::fs::symlink_metadata(target) {
+        Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(target).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "{} is a symbolic link whose target cannot be resolved ({err}) — BRAIN does \
+                     not replace the link with a file",
+                    target.display()
+                ),
+            )
+        }),
+        _ => Ok(target.to_path_buf()),
+    }
+}
+
+/// True when `path` itself is a symbolic link.
+pub fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+/// Write `data` into a new file `tmp`, flushed to disk, with the
+/// permissions of `like` when that exists (Unix mode bits).
+fn write_temp(tmp: &Path, data: &[u8], like: &Path) -> io::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::File::create(tmp)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    if let Ok(meta) = std::fs::metadata(like) {
+        std::fs::set_permissions(tmp, meta.permissions())?;
+    }
+    #[cfg(not(unix))]
+    let _ = like;
+    Ok(())
+}
+
 /// Write `data` to `target` so that a reader sees either the old or the
 /// new content, never a half-written file: write a uniquely named temp
-/// file next to it, then rename it over `target`. A rename refused with a
-/// transient Windows lock error is retried with back-off; if it still
-/// fails, the temp file is removed and the error returned.
+/// file next to the destination (flushed to disk, Unix mode of the old
+/// file kept), then rename it over the destination. When `target` is a
+/// symbolic link the destination is the file it points to (see
+/// [`write_destination`]), so the link stays a link. A rename refused
+/// with a transient Windows lock error is retried with back-off; if it
+/// still fails, the temp file is removed and the error returned.
 pub fn atomic_write(target: &Path, data: &[u8]) -> io::Result<()> {
-    let tmp = unique_temp_path(target);
-    if let Err(err) = std::fs::write(&tmp, data) {
+    let dest = write_destination(target)?;
+    let tmp = unique_temp_path(&dest);
+    if let Err(err) = write_temp(&tmp, data, &dest) {
         let _ = std::fs::remove_file(&tmp);
         return Err(err);
     }
     let mut backoff = RENAME_FIRST_BACKOFF;
     let mut attempt = 1;
     loop {
-        match std::fs::rename(&tmp, target) {
+        match std::fs::rename(&tmp, &dest) {
             Ok(()) => return Ok(()),
             Err(err) if is_transient_lock_error(&err) && attempt < RENAME_ATTEMPTS => {
                 std::thread::sleep(backoff);
@@ -98,6 +145,66 @@ mod tests {
             .filter_map(|e| e.ok()?.file_name().into_string().ok())
             .collect();
         assert_eq!(names, vec!["a.txt".to_string()]);
+    }
+
+    /// Create `link` → `original`; false when the platform refuses (a
+    /// Windows account without the symlink privilege) — the test then
+    /// has nothing to check.
+    fn try_symlink(original: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(original, link);
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(original, link);
+        made.is_ok()
+    }
+
+    #[test]
+    fn a_symlinked_target_stays_a_symlink_after_a_write() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real.md");
+        std::fs::write(&real, b"old").unwrap();
+        let link = tmp.path().join("link.md");
+        if !try_symlink(&real, &link) {
+            return;
+        }
+        atomic_write(&link, b"new").unwrap();
+        assert!(is_symlink(&link));
+    }
+
+    #[test]
+    fn a_write_through_a_symlink_lands_in_the_linked_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real.md");
+        std::fs::write(&real, b"old").unwrap();
+        let link = tmp.path().join("link.md");
+        if !try_symlink(&real, &link) {
+            return;
+        }
+        atomic_write(&link, b"new").unwrap();
+        assert_eq!(std::fs::read(&real).unwrap(), b"new");
+    }
+
+    #[test]
+    fn a_dangling_symlink_is_not_replaced() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let link = tmp.path().join("link.md");
+        if !try_symlink(&tmp.path().join("gone.md"), &link) {
+            return;
+        }
+        assert!(atomic_write(&link, b"new").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_keeps_the_unix_mode_of_the_old_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("a.txt");
+        std::fs::write(&target, b"old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        atomic_write(&target, b"new").unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

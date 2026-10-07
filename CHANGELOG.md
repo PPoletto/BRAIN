@@ -36,7 +36,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a line of their own; if they are broken (a start without an end, an
   end without a start, or two blocks — e.g. after editing the file by
   hand), the card shows "Damaged" and BRAIN changes nothing in that
-  file until the markers are fixed. After an app update
+  file until the markers are fixed. An instruction file that is a
+  symbolic link (stow, yadm, home-manager) stays a link: BRAIN writes
+  into the file it points to. After an app update
   BRAIN refreshes every switched-on install at start, so the prompt no
   longer goes stale silently. Claude Desktop keeps its instructions in
   the cloud and stays copy-paste ("Copy system prompt" on the Memory
