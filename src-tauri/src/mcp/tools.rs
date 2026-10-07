@@ -56,7 +56,7 @@ pub const ACTION_TOOLS: &[ActionTool] = &[
     },
     ActionTool {
         tool: "brain_dream",
-        actions: &["queue", "log"],
+        actions: &["queue", "log", "stats"],
         default: None,
     },
 ];

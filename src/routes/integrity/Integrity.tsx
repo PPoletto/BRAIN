@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 
+import { commands, type DreamStats } from "../../lib/commands";
 import type { LintIssue, LintReport } from "../../lib/events";
 
 type CheckResult =
@@ -153,6 +154,8 @@ export function Integrity() {
 
           {report.hygiene && <HygieneSection report={report.hygiene} />}
 
+          <DreamingSection />
+
           {report.suggestions.length > 0 && (
             <section className="mb-6">
               <h2 className="text-lg font-medium mb-2">Recovery actions</h2>
@@ -248,6 +251,82 @@ function HygieneSection({ report }: { report: LintReport }) {
             </li>
           ))}
         </ul>
+      )}
+    </section>
+  );
+}
+
+/// What the dream log (00_meta/dream-log.md) says about past dream
+/// sessions — the numbers of `brain_dream` action `stats`.
+function DreamingSection() {
+  const [stats, setStats] = useState<DreamStats | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    commands
+      .dreamStats()
+      .then((s) => {
+        if (!cancelled) setStats(s);
+      })
+      .catch(() => {
+        if (!cancelled) setStats(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  if (!stats) return null;
+  return (
+    <section className="mb-6">
+      <h2 className="text-lg font-medium mb-2">Dreaming</h2>
+      {stats.sessions === 0 && stats.items_total === 0 ? (
+        <p className="text-sm text-neutral-500">
+          No dream session logged yet. Ask your agent to "dream" (the{" "}
+          <code className="font-mono">dream</code> prompt) to start one.
+        </p>
+      ) : (
+        <div className="space-y-3 text-sm">
+          <p className="text-neutral-400">
+            {stats.sessions} session{stats.sessions === 1 ? "" : "s"},{" "}
+            {stats.items_total} queue item{stats.items_total === 1 ? "" : "s"} looked at.
+          </p>
+          <table className="w-full text-left text-xs text-neutral-300">
+            <thead className="text-neutral-500">
+              <tr>
+                <th className="py-1 font-normal">Kind</th>
+                <th className="py-1 font-normal">Done</th>
+                <th className="py-1 font-normal">Skipped</th>
+                <th className="py-1 font-normal">Deferred</th>
+              </tr>
+            </thead>
+            <tbody>
+              {stats.per_kind.map((k) => (
+                <tr key={k.kind} className="border-t border-neutral-800">
+                  <td className="py-1">{LINT_KIND_LABELS[k.kind] ?? k.kind}</td>
+                  <td className="py-1">{k.done}</td>
+                  <td className="py-1">{k.skipped}</td>
+                  <td className="py-1">{k.deferred}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {stats.most_skipped.length > 0 && (
+            <details className="rounded-md border border-neutral-800 bg-neutral-900 p-3">
+              <summary className="cursor-pointer font-medium">
+                Skipped most often ({stats.most_skipped.length})
+              </summary>
+              <ul className="mt-2 space-y-1 text-xs text-neutral-400">
+                {stats.most_skipped.map((s) => (
+                  <li key={`${s.kind}-${s.pages.join(",")}`}>
+                    <span className="text-neutral-300">{s.count}×</span> {s.kind} —{" "}
+                    {s.pages.join(", ")}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
+        </div>
       )}
     </section>
   );

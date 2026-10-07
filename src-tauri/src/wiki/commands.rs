@@ -18,6 +18,18 @@ fn current_wiki_dir(state: &crate::state::AppState) -> BrainResult<std::path::Pa
         .ok_or_else(|| BrainError::Internal("no vault is currently mounted".into()))
 }
 
+/// What the dream log says about past dream sessions (Integrity page;
+/// the same numbers as `brain_dream` action `stats`).
+#[tauri::command]
+pub fn dream_stats(
+    state: State<Arc<crate::state::AppState>>,
+) -> BrainResult<super::dream::DreamStats> {
+    let vault = state
+        .vault_path()
+        .ok_or_else(|| BrainError::Internal("no vault is currently mounted".into()))?;
+    Ok(super::dream::dream_stats(&vault))
+}
+
 /// Remote-sync configuration snapshot for the Settings UI.
 #[derive(Debug, Clone, Serialize)]
 pub struct RemoteStatus {

@@ -39,6 +39,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   mode tab). That Codex picks up skills from `~/.agents/skills/` is
   taken from third-party documentation and not yet confirmed by OpenAI.
 
+- **How the dreaming goes.** `brain_dream` has a third action, `stats`:
+  the number of dream sessions and queue items looked at, done /
+  skipped / deferred per item kind, and the ten items skipped most often
+  since they were last done (read from the newest 500 KB of
+  `00_meta/dream-log.md`). The Integrity page shows the same numbers in
+  a new "Dreaming" section. Use "Update vault templates" to tell your
+  agent about it.
+
 ### Changed
 
 - **Clearer error for a summary with a colon.** A `summary` or `title`

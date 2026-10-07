@@ -652,27 +652,128 @@ pub fn append_dream_log(
 /// [`LOG_TAIL_BYTES`]; a missing or unreadable log counts nothing, and
 /// lines that are not item bullets of the expected shape are ignored.
 pub fn skip_counts(vault: &Path) -> HashMap<SkipKey, u32> {
+    read_log_tail(vault).map_or_else(HashMap::new, |text| count_skips(&text))
+}
+
+/// The newest [`LOG_TAIL_BYTES`] of the dream log, starting at a whole
+/// line; `None` when the log is missing or unreadable.
+fn read_log_tail(vault: &Path) -> Option<String> {
     use std::io::{Read as _, Seek as _};
-    let Ok(mut file) = std::fs::File::open(dream_log_path(vault)) else {
-        return HashMap::new();
-    };
+    let mut file = std::fs::File::open(dream_log_path(vault)).ok()?;
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
     let start = len.saturating_sub(LOG_TAIL_BYTES);
-    if file.seek(std::io::SeekFrom::Start(start)).is_err() {
-        return HashMap::new();
-    }
+    file.seek(std::io::SeekFrom::Start(start)).ok()?;
     let mut bytes = Vec::new();
-    if file.read_to_end(&mut bytes).is_err() {
-        return HashMap::new();
-    }
-    let text = String::from_utf8_lossy(&bytes);
+    file.read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
     // A cut into the middle of the file starts with a partial line.
-    let text = if start > 0 {
-        text.split_once('\n').map_or("", |(_, rest)| rest)
+    if start > 0 {
+        Some(
+            text.split_once('\n')
+                .map_or("", |(_, rest)| rest)
+                .to_string(),
+        )
     } else {
-        &text
-    };
-    count_skips(text)
+        Some(text)
+    }
+}
+
+/// Most entries in [`DreamStats::most_skipped`].
+pub const MOST_SKIPPED_MAX: usize = 10;
+
+/// What the dream log says about past dream sessions (`brain_dream`
+/// action `stats`, Integrity page).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct DreamStats {
+    /// Session lines (`- YYYY-MM-DD HH:MM …`).
+    pub sessions: usize,
+    /// Item bullets of any outcome.
+    pub items_total: usize,
+    /// Outcomes per item kind, most items first.
+    pub per_kind: Vec<KindStats>,
+    /// Items skipped or deferred since they were last logged done, most
+    /// often first (at most [`MOST_SKIPPED_MAX`]).
+    pub most_skipped: Vec<SkippedItem>,
+}
+
+/// Outcome counts of one item kind in the dream log.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct KindStats {
+    pub kind: String,
+    pub done: usize,
+    pub skipped: usize,
+    pub deferred: usize,
+}
+
+/// One queue item (kind + pages) with its skip count since the last
+/// `done` (see [`count_skips`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SkippedItem {
+    pub kind: String,
+    pub pages: Vec<String>,
+    pub count: u32,
+}
+
+/// [`stats_from_log`] of the vault's dream log (its newest
+/// [`LOG_TAIL_BYTES`]); all zero without a log.
+pub fn dream_stats(vault: &Path) -> DreamStats {
+    read_log_tail(vault).map_or_else(DreamStats::default, |text| stats_from_log(&text))
+}
+
+/// Count sessions, item outcomes per kind and the most skipped items of
+/// a dream-log text. Pure.
+pub fn stats_from_log(text: &str) -> DreamStats {
+    let sessions = text.lines().filter(|l| is_session_line(l)).count();
+    let mut per_kind: Vec<KindStats> = Vec::new();
+    let mut items_total = 0;
+    for (outcome, (kind, _pages)) in text.lines().filter_map(parse_item_line) {
+        items_total += 1;
+        let pos = match per_kind.iter().position(|k| k.kind == kind) {
+            Some(pos) => pos,
+            None => {
+                per_kind.push(KindStats {
+                    kind,
+                    ..KindStats::default()
+                });
+                per_kind.len() - 1
+            }
+        };
+        let entry = &mut per_kind[pos];
+        match outcome {
+            LogOutcome::Done => entry.done += 1,
+            LogOutcome::Skipped => entry.skipped += 1,
+            LogOutcome::Deferred => entry.deferred += 1,
+        }
+    }
+    per_kind.sort_by(|a, b| {
+        let total = |k: &KindStats| k.done + k.skipped + k.deferred;
+        total(b).cmp(&total(a)).then_with(|| a.kind.cmp(&b.kind))
+    });
+    let mut most_skipped: Vec<SkippedItem> = count_skips(text)
+        .into_iter()
+        .map(|((kind, pages), count)| SkippedItem { kind, pages, count })
+        .collect();
+    most_skipped.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.kind.cmp(&b.kind))
+            .then_with(|| a.pages.cmp(&b.pages))
+    });
+    most_skipped.truncate(MOST_SKIPPED_MAX);
+    DreamStats {
+        sessions,
+        items_total,
+        per_kind,
+        most_skipped,
+    }
+}
+
+/// A session line of the log: `- YYYY-MM-DD HH:MM <entry>` at the start
+/// of the line.
+fn is_session_line(line: &str) -> bool {
+    line.strip_prefix("- ")
+        .and_then(|rest| rest.get(..16))
+        .is_some_and(|stamp| chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M").is_ok())
 }
 
 /// The counting behind [`skip_counts`], on the log text, oldest line
@@ -803,6 +904,98 @@ mod tests {
             .filter(|i| i.pages.iter().any(|p| p == id))
             .map(|i| i.kind.clone())
             .collect()
+    }
+
+    // ---- stats -------------------------------------------------------------
+
+    /// Three sessions; orphan `entities/x` skipped twice, then done, then
+    /// skipped again; decay `entities/y` deferred twice; one merge done.
+    const STATS_LOG: &str = "# Dream log
+
+One block per dream session (brain_dream action log): the session line, then one bullet per queue item looked at. Local file - not synced.
+
+- 2026-10-05 21:10 first session
+  - skipped orphan `entities/x` — unsure
+  - deferred decay-candidate `entities/y`
+  - done duplicate-candidate `entities/a`, `entities/b` — merged b into a
+- 2026-10-06 21:15 second session
+  - skipped orphan `entities/x` — still unsure
+  - deferred decay-candidate `entities/y`
+- 2026-10-07 09:00 third session
+  - done orphan `entities/x` — linked from the hub
+  - skipped orphan `entities/x` — came back
+  - not an item bullet
+";
+
+    #[test]
+    fn stats_count_every_session_line() {
+        assert_eq!(stats_from_log(STATS_LOG).sessions, 3);
+    }
+
+    #[test]
+    fn stats_count_every_item_bullet() {
+        assert_eq!(stats_from_log(STATS_LOG).items_total, 7);
+    }
+
+    #[test]
+    fn stats_count_the_outcomes_per_kind_most_items_first() {
+        let per_kind: Vec<(String, usize, usize, usize)> = stats_from_log(STATS_LOG)
+            .per_kind
+            .into_iter()
+            .map(|k| (k.kind, k.done, k.skipped, k.deferred))
+            .collect();
+        assert_eq!(
+            per_kind,
+            vec![
+                ("orphan".to_string(), 1, 3, 0),
+                ("decay-candidate".to_string(), 0, 0, 2),
+                ("duplicate-candidate".to_string(), 1, 0, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_most_skipped_items_count_skips_since_the_last_done() {
+        let most: Vec<(String, Vec<String>, u32)> = stats_from_log(STATS_LOG)
+            .most_skipped
+            .into_iter()
+            .map(|s| (s.kind, s.pages, s.count))
+            .collect();
+        assert_eq!(
+            most,
+            vec![
+                (
+                    "decay-candidate".to_string(),
+                    vec!["entities/y".to_string()],
+                    2
+                ),
+                ("orphan".to_string(), vec!["entities/x".to_string()], 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_most_skipped_list_keeps_at_most_ten_items() {
+        let mut log = String::from("- 2026-10-07 09:00 s\n");
+        for i in 0..12 {
+            log.push_str(&format!("  - skipped orphan `entities/p{i:02}` — later\n"));
+        }
+        assert_eq!(stats_from_log(&log).most_skipped.len(), MOST_SKIPPED_MAX);
+    }
+
+    #[test]
+    fn a_vault_without_a_dream_log_has_empty_stats() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(dream_stats(tmp.path()), DreamStats::default());
+    }
+
+    #[test]
+    fn dream_stats_read_the_vaults_dream_log() {
+        let tmp = TempDir::new().unwrap();
+        let path = dream_log_path(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, STATS_LOG).unwrap();
+        assert_eq!(dream_stats(tmp.path()).sessions, 3);
     }
 
     #[test]

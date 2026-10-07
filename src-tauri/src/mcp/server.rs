@@ -1504,11 +1504,11 @@ fn tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "brain_dream",
             title: "Dream (consolidate the wiki)",
-            description: "Consolidation ('dreaming') — only when the user asks for it ('träum mal', 'tidy up the wiki'). action 'queue': BRAIN's prioritised work list {generated_at, items: [{priority 1..3, kind, pages, reason, suggested_action}], omitted}, served from 00_meta/dream-queue.md when under an hour old (`refresh: true` recomputes). action 'log' (once, at the end of the session): `entry` — one line saying what you changed and why — plus `items`, every queue item you looked at with its outcome (done / skipped with a one-line reason / deferred); appended to 00_meta/dream-log.md. Items skipped or deferred before carry `skipped_before` in later queues. Work the queue with the `dream` prompt: at most 10 changes, never delete linked pages, supersede instead of overwrite. Not for a lint cleanup — use brain_lint_report.",
+            description: "Consolidation ('dreaming') — only when the user asks for it ('träum mal', 'tidy up the wiki'). action 'queue': BRAIN's prioritised work list {generated_at, items: [{priority 1..3, kind, pages, reason, suggested_action}], omitted}, served from 00_meta/dream-queue.md when under an hour old (`refresh: true` recomputes). action 'log' (once, at the end of the session): `entry` — one line saying what you changed and why — plus `items`, every queue item you looked at with its outcome (done / skipped with a one-line reason / deferred); appended to 00_meta/dream-log.md. Items skipped or deferred before carry `skipped_before` in later queues. action 'stats': what the dream log says so far {sessions, items_total, per_kind: [{kind, done, skipped, deferred}], most_skipped: [{kind, pages, count}] (skips since the item was last done, top 10)} — e.g. to tell the user which items keep being skipped. Work the queue with the `dream` prompt: at most 10 changes, never delete linked pages, supersede instead of overwrite. Not for a lint cleanup — use brain_lint_report.",
             input: json!({
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["queue", "log"], "description": "'queue' to read the work list, 'log' to record the session (needs entry)" },
+                    "action": { "type": "string", "enum": ["queue", "log", "stats"], "description": "'queue' to read the work list, 'log' to record the session (needs entry), 'stats' for the dream-log summary" },
                     "refresh": { "type": "boolean", "default": false, "description": "queue: recompute even if the stored queue is fresh" },
                     "entry": { "type": "string", "description": "log: one line for the session, e.g. 'merged entities/acme-inc into entities/acme; summaries for 3 hubs'" },
                     "items": {
@@ -1534,7 +1534,32 @@ fn tool_specs() -> Vec<ToolSpec> {
                 "omitted": { "type": "integer" },
                 "notes": { "type": "array" },
                 "logged": { "type": "string" },
-                "items_logged": { "type": "integer" }
+                "items_logged": { "type": "integer" },
+                "sessions": { "type": "integer" },
+                "items_total": { "type": "integer" },
+                "per_kind": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "type": "string" },
+                            "done": { "type": "integer" },
+                            "skipped": { "type": "integer" },
+                            "deferred": { "type": "integer" }
+                        }
+                    }
+                },
+                "most_skipped": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "type": "string" },
+                            "pages": { "type": "array", "items": { "type": "string" } },
+                            "count": { "type": "integer" }
+                        }
+                    }
+                }
             })),
             hints: write(false, false),
         },
@@ -2495,6 +2520,10 @@ fn call_tool(
                 };
                 let queue = dream_queue(vault, db, refresh)?;
                 Ok(serde_json::to_string_pretty(&queue).unwrap_or_default())
+            }
+            Some("stats") => {
+                let stats = crate::wiki::dream::dream_stats(vault);
+                Ok(serde_json::to_string_pretty(&stats).unwrap_or_default())
             }
             _ => {
                 let entry = required_str(&args, "entry")?;
@@ -7925,6 +7954,41 @@ mod slice_d_tests {
             json!({ "query": "zebrafish" }),
         );
         assert_eq!(out["hits"][0]["snippet"], json!("A zebrafish study."));
+    }
+
+    #[test]
+    fn brain_dream_stats_reports_the_outcomes_of_the_logged_items() {
+        let tmp = vault();
+        put(tmp.path(), "entities/old", "", "Old.");
+        put(tmp.path(), "entities/alice", "", "Alice.");
+        call(
+            tmp.path(),
+            &mut None,
+            "brain_dream",
+            json!({ "action": "log", "entry": "s1", "items": [
+                { "kind": "orphan", "pages": ["entities/old"], "outcome": "skipped", "note": "unsure" },
+                { "kind": "orphan", "pages": ["entities/old"], "outcome": "skipped", "note": "still unsure" },
+                { "kind": "summary-stale", "pages": ["entities/alice"], "outcome": "done" }
+            ] }),
+        );
+        let stats = call_json(
+            tmp.path(),
+            &mut None,
+            "brain_dream",
+            json!({ "action": "stats" }),
+        );
+        assert_eq!(
+            stats,
+            json!({
+                "sessions": 1,
+                "items_total": 3,
+                "per_kind": [
+                    { "kind": "orphan", "done": 0, "skipped": 2, "deferred": 0 },
+                    { "kind": "summary-stale", "done": 1, "skipped": 0, "deferred": 0 }
+                ],
+                "most_skipped": [ { "kind": "orphan", "pages": ["entities/old"], "count": 2 } ]
+            })
+        );
     }
 
     #[test]

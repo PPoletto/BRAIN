@@ -88,6 +88,14 @@ export type ClientInstallRow = {
   path: string;
 };
 
+/** Rust `wiki::dream::DreamStats` (also `brain_dream` action `stats`). */
+export type DreamStats = {
+  sessions: number;
+  items_total: number;
+  per_kind: Array<{ kind: string; done: number; skipped: number; deferred: number }>;
+  most_skipped: Array<{ kind: string; pages: string[]; count: number }>;
+};
+
 export type RemoteStatus = {
   encrypted: boolean;
   remote_url: string | null;
@@ -155,6 +163,7 @@ export const commands = {
     invoke<RegistrationReport | null>("last_mcp_registration_report"),
   brainMemorySystemPrompt: () => invoke<string>("brain_memory_system_prompt"),
   clientInstallStatus: () => invoke<ClientInstallRow[]>("client_install_status"),
+  dreamStats: () => invoke<DreamStats>("dream_stats"),
   setClientInstall: (target: ClientInstallTarget, enabled: boolean) =>
     invoke<ClientInstallRow[]>("set_client_install", { target, enabled }),
   openPageInExternalEditor: (id: string) =>

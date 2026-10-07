@@ -435,6 +435,11 @@ stays, set `keep: true` on it with a detailed read + rewrite (see
 The queue lists each page at most once; what you leave undone (or what
 your changes uncover) shows up in the next queue.
 
+`brain_dream` with `action: "stats"` sums up the dream log: sessions,
+done / skipped / deferred per item kind, and the items skipped most
+often since they were last done — use it when the user asks how the
+dreaming goes or what keeps being put off.
+
 ## Search Quality
 
 `00_meta/eval-queries.yaml` holds test questions with the pages a good

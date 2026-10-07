@@ -489,6 +489,7 @@ pub fn run() {
             wiki::commands::wiki_commit_detail,
             wiki::commands::wiki_restore_page,
             wiki::commands::wiki_hard_reset,
+            wiki::commands::dream_stats,
             // Sync (S11 phase 6)
             wiki::commands::git_remote_status,
             wiki::commands::set_git_remote,
