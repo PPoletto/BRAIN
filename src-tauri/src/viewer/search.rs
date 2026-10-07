@@ -64,10 +64,8 @@ pub fn search_with_db(
 /// chunks (folded into dense page ranks); otherwise we fall back to brute-force cosine over the BLOB
 /// column on chunks of the FTS candidates.
 ///
-/// Score fusion uses Reciprocal Rank Fusion (RRF): for each result that
-/// appears in either ranked list, `score = 1/(k+rank_fts) + 1/(k+rank_vec)`
-/// with `k=60` per the canonical RRF paper. RRF is robust against
-/// score-scale mismatches between BM25 and cosine.
+/// The two candidate lists are combined by [`fuse`] with the variant
+/// [`FUSION`] (dense-first since 0.3.6; see there for why not plain RRF).
 ///
 /// The embedder comes from the process-wide cache, so the bge-m3 weights
 /// are loaded once (first search or mount warm-up), not per query.
@@ -117,8 +115,9 @@ const KNN_CHUNKS: usize = 200;
 /// are starting values, to be tuned with `brain eval` on real vaults.
 const FTS_RANK: &str = "bm25(pages_fts, 0.0, 3.0, 1.0, 5.0)";
 
-/// One FTS candidate: id, title, path, snippet.
-type FtsRow = (String, Option<String>, Option<String>, String);
+/// One FTS candidate: id, title, path, snippet, relevance (`-bm25`,
+/// higher is better).
+type FtsRow = (String, Option<String>, Option<String>, String, f32);
 
 /// The FTS5 candidates for an already sanitised MATCH query, best first
 /// (ties by id, so the order is deterministic). The snippet comes from
@@ -126,7 +125,8 @@ type FtsRow = (String, Option<String>, Option<String>, String);
 /// summary is highlighted too.
 fn fts_candidates(conn: &rusqlite::Connection, match_query: &str) -> rusqlite::Result<Vec<FtsRow>> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT pf.id, p.title, p.path, snippet(pages_fts, -1, '«', '»', ' … ', 24) \
+        "SELECT pf.id, p.title, p.path, snippet(pages_fts, -1, '«', '»', ' … ', 24), \
+                -{FTS_RANK} \
          FROM pages_fts pf \
          LEFT JOIN pages p ON p.id = pf.id \
          WHERE pages_fts MATCH ?1 \
@@ -140,6 +140,7 @@ fn fts_candidates(conn: &rusqlite::Connection, match_query: &str) -> rusqlite::R
                 row.get::<_, Option<String>>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, String>(3).unwrap_or_default(),
+                row.get::<_, f64>(4).unwrap_or(0.0) as f32,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -164,22 +165,205 @@ pub fn ranked_ids_on_conn(
             .collect(),
         RetrievalMode::DenseOnly => {
             let q_vec = embedder.embed(query);
-            let ranks = if migrations::chunk_vectors_available(conn) {
+            let ranked = if migrations::chunk_vectors_available(conn) {
                 knn_top_pages(conn, &q_vec, KNN_CHUNKS)?
             } else {
                 bruteforce_top_pages(conn, &q_vec, None)?
             };
-            let mut ranked: Vec<(String, usize)> = ranks.into_iter().collect();
-            ranked.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
             ranked.into_iter().map(|(id, _)| id).collect()
         }
-        RetrievalMode::Hybrid => search_hybrid_on_conn(conn, embedder, query)?
-            .into_iter()
-            .map(|hit| hit.id)
-            .collect(),
+        RetrievalMode::Hybrid => hybrid_ids_on_conn(conn, embedder, query, FUSION, limit)?,
     };
     ids.truncate(limit);
     Ok(ids)
+}
+
+/// Hybrid page ids for `query` fused with `fusion`, best first, at most
+/// `limit` — the eval's way to compare fusion variants on the same
+/// candidates (`brain eval` prints all of them).
+pub fn hybrid_ids_on_conn(
+    conn: &rusqlite::Connection,
+    embedder: &dyn Embedder,
+    query: &str,
+    fusion: Fusion,
+    limit: usize,
+) -> rusqlite::Result<Vec<String>> {
+    let q_vec = embedder.embed(query);
+    let fts_rows = fts_candidates(conn, &sanitize_fts_query(query))?;
+    let dense = dense_candidates(conn, &q_vec, &fts_rows)?;
+    let fts: Vec<(String, f32)> = fts_rows.into_iter().map(|r| (r.0, r.4)).collect();
+    let mut ids: Vec<String> = fuse(&fts, &dense, fusion)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    ids.truncate(limit);
+    Ok(ids)
+}
+
+/// How the FTS and the dense candidate lists are combined.
+///
+/// Measured on a real vault (50 curated queries, bge-m3) plain RRF made
+/// hybrid search clearly WORSE than dense search alone (Recall@10 0.80
+/// vs 0.96): unrelated FTS hits that also sit deep in the dense list
+/// collect two reciprocal ranks and push the dense top hit out of the top
+/// 10. The variants below are the candidates of the 0.3.6 fusion tuning;
+/// `brain eval` prints the metrics of every variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fusion {
+    /// `1/(k+rank_fts) + 1/(k+rank_dense)`, k = 60 (until 0.3.5).
+    Rrf,
+    /// RRF with the FTS contribution weighted down
+    /// ([`WEIGHTED_RRF_FTS_WEIGHT`]).
+    WeightedRrf,
+    /// RRF over the FTS hits whose relevance is at least
+    /// [`WEAK_FTS_FRACTION`] of the query's best FTS hit only.
+    WeakFtsIgnored,
+    /// The dense ranking is the base; FTS only boosts pages that are in
+    /// BOTH lists. A page found only by FTS scores below every page in the
+    /// first ~110 dense ranks, so it never enters the top 10 unless the
+    /// dense list has fewer than 10 pages.
+    DenseFirst,
+    /// `0.7 × dense + 0.3 × fts` over min–max normalised scores.
+    Convex,
+}
+
+impl Fusion {
+    pub const ALL: [Fusion; 5] = [
+        Self::Rrf,
+        Self::WeightedRrf,
+        Self::WeakFtsIgnored,
+        Self::DenseFirst,
+        Self::Convex,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rrf => "rrf",
+            Self::WeightedRrf => "weighted-rrf",
+            Self::WeakFtsIgnored => "weak-fts-ignored",
+            Self::DenseFirst => "dense-first",
+            Self::Convex => "convex",
+        }
+    }
+}
+
+/// The fusion `brain_search`, the GUI search and the eval's hybrid mode
+/// use. An internal choice, not a user setting.
+///
+/// Dense-first keeps the dense top 10 as the result set whenever the
+/// dense list has at least 10 pages, so hybrid Recall@10 can no longer
+/// fall below dense-only Recall@10 — the failure measured with RRF. The
+/// FTS boost only reorders pages both lists found. Its strength
+/// ([`DENSE_FIRST_K`], [`DENSE_FIRST_FTS_WEIGHT`]) was chosen, not yet
+/// measured; compare with `brain eval` on a real vault.
+pub const FUSION: Fusion = Fusion::DenseFirst;
+
+/// RRF constant (the canonical 60).
+const RRF_K: f32 = 60.0;
+/// FTS weight of [`Fusion::WeightedRrf`] (dense weighs 1.0).
+const WEIGHTED_RRF_FTS_WEIGHT: f32 = 0.4;
+/// [`Fusion::WeakFtsIgnored`]: FTS hits below this fraction of the best
+/// FTS relevance of the query are dropped.
+const WEAK_FTS_FRACTION: f32 = 0.5;
+/// [`Fusion::DenseFirst`]: dense score `1/(K + rank)`. Smaller than RRF's
+/// 60 so neighbouring dense ranks stay distinguishable and the boost can
+/// only move a page up by a rank or two near the top.
+const DENSE_FIRST_K: f32 = 10.0;
+/// [`Fusion::DenseFirst`]: boost `W/(60 + fts_rank)` for a page in both
+/// lists (at most 0.0083; the gap between dense ranks 0 and 1 is 0.0091).
+const DENSE_FIRST_FTS_WEIGHT: f32 = 0.5;
+/// [`Fusion::Convex`]: weight of the normalised dense score.
+const CONVEX_DENSE_WEIGHT: f32 = 0.7;
+
+/// Combine the FTS candidates `fts` (id, relevance — higher is better)
+/// and the dense candidates `dense` (id, similarity — higher is better),
+/// both best first, into one ranking: every id of either list with its
+/// fused score, highest first, ties by id. Pure.
+pub fn fuse<'a>(
+    fts: &'a [(String, f32)],
+    dense: &'a [(String, f32)],
+    fusion: Fusion,
+) -> Vec<(String, f32)> {
+    use std::collections::HashMap;
+    let mut score: HashMap<&str, f32> = HashMap::new();
+    let mut add = |id: &'a str, s: f32| *score.entry(id).or_default() += s;
+    match fusion {
+        Fusion::Rrf | Fusion::WeightedRrf | Fusion::WeakFtsIgnored => {
+            let fts_weight = if fusion == Fusion::WeightedRrf {
+                WEIGHTED_RRF_FTS_WEIGHT
+            } else {
+                1.0
+            };
+            let best = fts.first().map_or(0.0, |r| r.1);
+            let mut rank = 0usize;
+            for (id, relevance) in fts {
+                if fusion == Fusion::WeakFtsIgnored && *relevance < WEAK_FTS_FRACTION * best {
+                    continue;
+                }
+                add(id, fts_weight / (RRF_K + rank as f32));
+                rank += 1;
+            }
+            for (rank, (id, _)) in dense.iter().enumerate() {
+                add(id, 1.0 / (RRF_K + rank as f32));
+            }
+        }
+        Fusion::DenseFirst => {
+            for (rank, (id, _)) in dense.iter().enumerate() {
+                add(id, 1.0 / (DENSE_FIRST_K + rank as f32));
+            }
+            // FTS-only pages get the bare boost: below the first ~110
+            // dense ranks, so they only fill up a short dense list.
+            for (rank, (id, _)) in fts.iter().enumerate() {
+                add(id, DENSE_FIRST_FTS_WEIGHT / (RRF_K + rank as f32));
+            }
+        }
+        Fusion::Convex => {
+            for (id, s) in normalised(dense) {
+                add(id, CONVEX_DENSE_WEIGHT * s);
+            }
+            for (id, s) in normalised(fts) {
+                add(id, (1.0 - CONVEX_DENSE_WEIGHT) * s);
+            }
+        }
+    }
+    let mut out: Vec<(String, f32)> = score
+        .into_iter()
+        .map(|(id, s)| (id.to_string(), s))
+        .collect();
+    out.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
+/// Min–max normalised scores (1.0 for every entry when all are equal).
+fn normalised(list: &[(String, f32)]) -> Vec<(&str, f32)> {
+    let max = list.iter().map(|r| r.1).fold(f32::NEG_INFINITY, f32::max);
+    let min = list.iter().map(|r| r.1).fold(f32::INFINITY, f32::min);
+    list.iter()
+        .map(|(id, s)| {
+            let n = if max > min {
+                (s - min) / (max - min)
+            } else {
+                1.0
+            };
+            (id.as_str(), n)
+        })
+        .collect()
+}
+
+/// Dense candidate pages, best first, with a similarity (higher is
+/// closer): KNN over `chunk_vectors` when present, else brute force over
+/// the FTS candidates' chunk vectors.
+fn dense_candidates(
+    conn: &rusqlite::Connection,
+    q_vec: &[f32],
+    fts_rows: &[FtsRow],
+) -> rusqlite::Result<Vec<(String, f32)>> {
+    if migrations::chunk_vectors_available(conn) {
+        knn_top_pages(conn, q_vec, KNN_CHUNKS)
+    } else {
+        let candidates: Vec<&str> = fts_rows.iter().map(|r| r.0.as_str()).collect();
+        bruteforce_top_pages(conn, q_vec, Some(&candidates))
+    }
 }
 
 /// The connection-only core of hybrid search. Split out from
@@ -199,104 +383,65 @@ pub fn search_hybrid_on_conn(
     query: &str,
 ) -> rusqlite::Result<Vec<SearchHit>> {
     let q_vec = embedder.embed(query);
-    let q = sanitize_fts_query(query);
+    let fts_rows = fts_candidates(conn, &sanitize_fts_query(query))?;
+    let dense = dense_candidates(conn, &q_vec, &fts_rows)?;
 
-    {
-        // FTS5 candidates.
-        let fts_rows = fts_candidates(conn, &q)?;
-
-        // Per-page metadata cache so vector-only hits get a title and path.
-        let mut meta: std::collections::HashMap<String, (Option<String>, Option<String>, String)> =
-            fts_rows
-                .iter()
-                .map(|(id, title, path, snippet)| {
-                    (id.clone(), (title.clone(), path.clone(), snippet.clone()))
-                })
-                .collect();
-
-        // Vec candidates — KNN over chunk_vectors when present, else
-        // brute-force over the FTS candidates' embedding BLOBs.
-        let vec_rank: std::collections::HashMap<String, usize> =
-            if migrations::chunk_vectors_available(conn) {
-                knn_top_pages(conn, &q_vec, KNN_CHUNKS)?
-            } else {
-                let candidates: Vec<&str> = fts_rows.iter().map(|r| r.0.as_str()).collect();
-                bruteforce_top_pages(conn, &q_vec, Some(&candidates))?
-            };
-
-        // Pull metadata for any vector-only page that didn't appear in the
-        // FTS list, so the result row has a real title/path.
-        for id in vec_rank.keys() {
-            if !meta.contains_key(id) {
-                let row = conn
-                    .query_row("SELECT title, path FROM pages WHERE id = ?1", [id], |row| {
-                        Ok((
-                            row.get::<_, Option<String>>(0)?,
-                            row.get::<_, Option<String>>(1)?,
-                        ))
-                    })
-                    .ok();
-                if let Some((title, path)) = row {
-                    meta.insert(id.clone(), (title, path, String::new()));
-                }
-            }
-        }
-
-        // RRF score fusion.
-        const K: f32 = 60.0;
-        let mut score: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
-        for (rank, (id, _, _, _)) in fts_rows.iter().enumerate() {
-            *score.entry(id.clone()).or_default() += 1.0 / (K + rank as f32);
-        }
-        for (id, rank) in &vec_rank {
-            *score.entry(id.clone()).or_default() += 1.0 / (K + *rank as f32);
-        }
-
-        let mut hits: Vec<SearchHit> = score
-            .into_iter()
-            .map(|(id, s)| {
-                let (title, path, snippet) =
-                    meta.get(&id)
-                        .cloned()
-                        .unwrap_or((None, None, String::new()));
-                // Post-process FTS5's snippet markers so a query token
-                // that recurs many times in a single page (e.g. the
-                // user's own name on their entity page) gets
-                // highlighted only on its first occurrence per snippet,
-                // and at most MAX_DISTINCT_MARKER_TOKENS distinct
-                // tokens are highlighted at all. Pre-0.2.17 every
-                // match was wrapped, which made shared-token snippets
-                // visually noisy.
-                let snippet = limit_snippet_markers(&snippet, MAX_DISTINCT_MARKER_TOKENS);
-                SearchHit {
-                    title: title.unwrap_or_else(|| id.clone()),
-                    path: path.unwrap_or_default(),
-                    id,
-                    snippet,
-                    score: s,
-                }
+    // Per-page metadata so dense-only hits get a title and path too.
+    let mut meta: std::collections::HashMap<String, (Option<String>, Option<String>, String)> =
+        fts_rows
+            .iter()
+            .map(|(id, title, path, snippet, _)| {
+                (id.clone(), (title.clone(), path.clone(), snippet.clone()))
             })
             .collect();
-        // Ties by id: the fused scores come out of a HashMap, so without
-        // a tie-break equal scores would come back in random order (and
-        // the eval would not be deterministic).
-        hits.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        hits.truncate(20);
-        Ok(hits)
+    let fts: Vec<(String, f32)> = fts_rows.iter().map(|r| (r.0.clone(), r.4)).collect();
+    let mut fused = fuse(&fts, &dense, FUSION);
+    fused.truncate(20);
+    for (id, _) in &fused {
+        if !meta.contains_key(id) {
+            let row = conn
+                .query_row("SELECT title, path FROM pages WHERE id = ?1", [id], |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                })
+                .ok();
+            if let Some((title, path)) = row {
+                meta.insert(id.clone(), (title, path, String::new()));
+            }
+        }
     }
+    Ok(fused
+        .into_iter()
+        .map(|(id, score)| {
+            let (title, path, snippet) =
+                meta.get(&id)
+                    .cloned()
+                    .unwrap_or((None, None, String::new()));
+            // Post-process FTS5's snippet markers so a query token that
+            // recurs many times in a single page gets highlighted only on
+            // its first occurrence per snippet, and at most
+            // MAX_DISTINCT_MARKER_TOKENS distinct tokens at all.
+            let snippet = limit_snippet_markers(&snippet, MAX_DISTINCT_MARKER_TOKENS);
+            SearchHit {
+                title: title.unwrap_or_else(|| id.clone()),
+                path: path.unwrap_or_default(),
+                id,
+                snippet,
+                score,
+            }
+        })
+        .collect())
 }
 
-/// KNN top-K via sqlite-vec. Aggregates chunks → pages by best chunk rank.
+/// KNN top-K via sqlite-vec. Aggregates chunks → pages by best chunk,
+/// best first, with similarity `-distance`.
 fn knn_top_pages(
     conn: &rusqlite::Connection,
     q_vec: &[f32],
     k: usize,
-) -> Result<std::collections::HashMap<String, usize>, rusqlite::Error> {
+) -> Result<Vec<(String, f32)>, rusqlite::Error> {
     let blob = vec_to_bytes(q_vec);
     // sqlite-vec requires the KNN limit to sit on the vec0 sub-query
     // itself, not on an outer JOIN — otherwise the planner can't push it
@@ -312,7 +457,7 @@ fn knn_top_pages(
     // on the left of a join is never flattened by SQLite, so the KNN
     // limit stays on the vec0 scan.
     let sql = format!(
-        "SELECT c.page_id FROM ( \
+        "SELECT c.page_id, v.distance FROM ( \
             SELECT rowid, distance FROM chunk_vectors \
             WHERE embedding MATCH ?1 \
             ORDER BY distance \
@@ -322,31 +467,34 @@ fn knn_top_pages(
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
-        .query_map(rusqlite::params![&blob], |row| row.get::<_, String>(0))?
+        .query_map(rusqlite::params![&blob], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })?
         .collect::<Result<Vec<_>, _>>()?;
-    let mut out: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for page_id in rows {
-        // Dense PAGE ranks (0, 1, 2, … with no gaps), by each page's best
-        // chunk: the FTS list ranks pages, so RRF must see page ranks here
-        // too — a page's other chunks must not push the next page down.
-        if !out.contains_key(&page_id) {
-            let rank = out.len();
-            out.insert(page_id, rank);
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<(String, f32)> = Vec::new();
+    for (page_id, distance) in rows {
+        // PAGES by their best chunk (the first one in distance order): the
+        // FTS list ranks pages, so fusion must see page ranks here too — a
+        // page's other chunks must not push the next page down.
+        if seen.insert(page_id.clone()) {
+            out.push((page_id, -(distance as f32)));
         }
     }
     Ok(out)
 }
 
-/// Brute-force fallback when sqlite-vec isn't loaded. Scans `chunks` for
+/// Brute-force fallback when sqlite-vec isn't loaded (pages best first,
+/// with their best chunk's cosine). Scans `chunks` for
 /// the supplied page ids only — bounded by the FTS candidate count — or,
 /// with `None` (the eval's dense-only mode), every chunk.
 fn bruteforce_top_pages(
     conn: &rusqlite::Connection,
     q_vec: &[f32],
     candidate_ids: Option<&[&str]>,
-) -> Result<std::collections::HashMap<String, usize>, rusqlite::Error> {
+) -> Result<Vec<(String, f32)>, rusqlite::Error> {
     let (sql, ids): (String, &[&str]) = match candidate_ids {
-        Some([]) => return Ok(std::collections::HashMap::new()),
+        Some([]) => return Ok(Vec::new()),
         Some(ids) => (
             format!(
                 "SELECT page_id, embedding FROM chunks \
@@ -385,11 +533,7 @@ fn bruteforce_top_pages(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.0.cmp(&b.0))
     });
-    Ok(sorted
-        .into_iter()
-        .enumerate()
-        .map(|(rank, (id, _))| (id, rank))
-        .collect())
+    Ok(sorted)
 }
 
 /// FTS5's MATCH grammar treats `:` and other punctuation specially. For the
@@ -816,7 +960,7 @@ mod tests {
         write_page(tmp.path(), "entities", "b", "B", "far words");
         let db = crate::db::DbHandle::open(tmp.path()).unwrap();
         crate::db::pages_index::rebuild_with(&db, tmp.path(), &AxisEmbedder).unwrap();
-        let ranks = db
+        let ranked = db
             .with(|conn| {
                 let q = AxisEmbedder.embed("near");
                 Ok(if migrations::chunk_vectors_available(conn) {
@@ -826,11 +970,109 @@ mod tests {
                 })
             })
             .unwrap();
-        let mut sorted: Vec<(String, usize)> = ranks.into_iter().collect();
-        sorted.sort();
+        let ids: Vec<String> = ranked.into_iter().map(|(id, _)| id).collect();
         assert_eq!(
-            sorted,
-            vec![("entities/a".to_string(), 0), ("entities/b".to_string(), 1)]
+            ids,
+            vec!["entities/a".to_string(), "entities/b".to_string()]
         );
+    }
+
+    // ---- fusion ---------------------------------------------------------
+
+    fn list(ids: &[&str]) -> Vec<(String, f32)> {
+        // Scores descending with the rank, as the real candidate lists.
+        ids.iter()
+            .enumerate()
+            .map(|(i, id)| (id.to_string(), 10.0 - i as f32 * 0.1))
+            .collect()
+    }
+
+    fn top(fused: &[(String, f32)], n: usize) -> Vec<&str> {
+        fused.iter().take(n).map(|(id, _)| id.as_str()).collect()
+    }
+
+    /// The measured failure: the right page is dense #1; ten FTS hits that
+    /// are unrelated also sit deep in the dense list (ranks 20–29).
+    type Candidates = Vec<(String, f32)>;
+
+    fn noisy_lists() -> (Candidates, Candidates) {
+        let dense_ids: Vec<String> = (0..40).map(|i| format!("entities/d{i:02}")).collect();
+        let dense: Vec<&str> = dense_ids.iter().map(String::as_str).collect();
+        let fts: Vec<&str> = dense[20..30].to_vec();
+        (list(&fts), list(&dense))
+    }
+
+    #[test]
+    fn plain_rrf_pushes_the_dense_top_hit_out_of_the_top_ten_under_fts_noise() {
+        let (fts, dense) = noisy_lists();
+        let fused = fuse(&fts, &dense, Fusion::Rrf);
+        assert!(!top(&fused, 10).contains(&"entities/d00"));
+    }
+
+    #[test]
+    fn dense_first_keeps_the_dense_top_hit_first_under_fts_noise() {
+        let (fts, dense) = noisy_lists();
+        let fused = fuse(&fts, &dense, Fusion::DenseFirst);
+        assert_eq!(fused[0].0, "entities/d00");
+    }
+
+    #[test]
+    fn dense_first_keeps_the_dense_top_ten_as_the_top_ten_under_fts_noise() {
+        let (fts, dense) = noisy_lists();
+        let fused = fuse(&fts, &dense, Fusion::DenseFirst);
+        let mut got = top(&fused, 10);
+        got.sort_unstable();
+        let want: Vec<String> = (0..10).map(|i| format!("entities/d{i:02}")).collect();
+        assert_eq!(got, want.iter().map(String::as_str).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn dense_first_boosts_a_page_found_by_both_lists() {
+        // c is dense #3 and FTS #1: it overtakes dense #2 (b), not dense #1.
+        let dense = list(&["entities/a", "entities/b", "entities/c", "entities/d"]);
+        let fts = list(&["entities/c"]);
+        let fused = fuse(&fts, &dense, Fusion::DenseFirst);
+        assert_eq!(
+            top(&fused, 4),
+            vec!["entities/a", "entities/c", "entities/b", "entities/d"]
+        );
+    }
+
+    #[test]
+    fn dense_first_lets_fts_only_pages_fill_a_short_dense_list() {
+        let dense = list(&["entities/a", "entities/b"]);
+        let fts = list(&["entities/x", "entities/a"]);
+        let fused = fuse(&fts, &dense, Fusion::DenseFirst);
+        assert_eq!(
+            top(&fused, 3),
+            vec!["entities/a", "entities/b", "entities/x"]
+        );
+    }
+
+    #[test]
+    fn weak_fts_hits_are_ignored_by_the_weak_fts_variant() {
+        let dense = list(&["entities/a"]);
+        let fts = vec![
+            ("entities/strong".to_string(), 10.0),
+            ("entities/weak".to_string(), 2.0),
+        ];
+        let fused = fuse(&fts, &dense, Fusion::WeakFtsIgnored);
+        assert!(fused.iter().all(|(id, _)| id != "entities/weak"));
+    }
+
+    #[test]
+    fn the_convex_variant_weights_the_dense_score_above_the_fts_score() {
+        let dense = list(&["entities/a", "entities/b"]);
+        let fts = list(&["entities/b", "entities/a"]);
+        let fused = fuse(&fts, &dense, Fusion::Convex);
+        assert_eq!(fused[0].0, "entities/a");
+    }
+
+    #[test]
+    fn fusion_breaks_score_ties_by_id() {
+        let fts = list(&["entities/b"]);
+        let dense = list(&["entities/a"]);
+        let fused = fuse(&fts, &dense, Fusion::Rrf);
+        assert_eq!(top(&fused, 2), vec!["entities/a", "entities/b"]);
     }
 }

@@ -39,7 +39,7 @@ use crate::db::{DbHandle, DbResult};
 use crate::embedding::Embedder;
 use crate::vault::layout::meta_dir;
 
-use super::search::{RetrievalMode, ranked_ids_on_conn};
+use super::search::{Fusion, RetrievalMode, hybrid_ids_on_conn, ranked_ids_on_conn};
 
 /// File name of the eval set inside `00_meta/` (synced).
 pub const EVAL_SET_FILENAME: &str = "eval-queries.yaml";
@@ -426,6 +426,74 @@ pub fn run_eval(db: &DbHandle, vault: &Path, set: &[EvalQuery]) -> DbResult<Eval
         });
     }
     Ok(assemble_report(set, results, &facts, embedder.name()))
+}
+
+/// Mean hybrid metrics of every [`Fusion`] variant over the entries of
+/// `set` that list expected pages, on one connection. `query_vectors[i]`
+/// is the embedding of `set[i].query`. The CLI prints it under the main
+/// table so a real vault shows which fusion wins; the eval history and
+/// the Settings card keep reporting the default fusion only.
+pub fn fusion_comparison_on_conn(
+    conn: &rusqlite::Connection,
+    set: &[EvalQuery],
+    query_vectors: &[Vec<f32>],
+) -> DbResult<Vec<(Fusion, Metrics)>> {
+    let mut per_variant: Vec<Vec<Metrics>> = vec![Vec::new(); Fusion::ALL.len()];
+    for (entry, vector) in set.iter().zip(query_vectors) {
+        if entry.expected.is_empty() {
+            continue;
+        }
+        let embedder = FixedVector(vector);
+        for (i, fusion) in Fusion::ALL.into_iter().enumerate() {
+            let ranked = hybrid_ids_on_conn(conn, &embedder, &entry.query, fusion, EVAL_K)?;
+            per_variant[i].push(query_metrics(&ranked, &entry.expected));
+        }
+    }
+    Ok(Fusion::ALL
+        .into_iter()
+        .zip(per_variant)
+        .map(|(fusion, metrics)| (fusion, mean_metrics(&metrics)))
+        .collect())
+}
+
+/// [`fusion_comparison_on_conn`] on a CLI handle with the vault's
+/// process-cached embedder (queries embedded with no lock held).
+pub fn fusion_comparison(
+    db: &DbHandle,
+    vault: &Path,
+    set: &[EvalQuery],
+) -> DbResult<Vec<(Fusion, Metrics)>> {
+    let embedder = crate::embedding::cached_for_vault(vault);
+    let vectors = embed_queries(embedder.as_ref(), set);
+    db.with(|conn| fusion_comparison_on_conn(conn, set, &vectors))
+}
+
+/// The fusion comparison as a plain-text table; the default fusion is
+/// marked.
+pub fn render_fusion_table(rows: &[(Fusion, Metrics)]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "Hybrid fusion variants (* = default):");
+    let _ = writeln!(
+        out,
+        "{:<20}{:>11}{:>9}{:>10}",
+        "fusion", "Recall@10", "MRR", "nDCG@10"
+    );
+    for (fusion, m) in rows {
+        let marker = if *fusion == super::search::FUSION {
+            "*"
+        } else {
+            " "
+        };
+        let _ = writeln!(
+            out,
+            "{marker}{:<19}{:>11.3}{:>9.3}{:>10.3}",
+            fusion.label(),
+            m.recall_at_10,
+            m.mrr,
+            m.ndcg_at_10
+        );
+    }
+    out
 }
 
 /// The report as a plain-text table (CLI output).
@@ -895,6 +963,39 @@ mod tests {
         let vectors = embed_queries(&embedder, set);
         db.with(|conn| run_eval_on_conn(conn, set, &vectors, embedder.name()))
             .unwrap()
+    }
+
+    #[test]
+    fn the_fusion_comparison_lists_every_variant() {
+        let (_tmp, db) = fixture_vault();
+        let set = fixture_set();
+        let vectors = embed_queries(&crate::embedding::hashed::HashedEmbedder::new(), &set);
+        let rows = db
+            .with(|conn| fusion_comparison_on_conn(conn, &set, &vectors))
+            .unwrap();
+        assert_eq!(rows.len(), Fusion::ALL.len());
+    }
+
+    #[test]
+    fn the_default_fusion_row_equals_the_hybrid_mode_of_the_report() {
+        let (_tmp, db) = fixture_vault();
+        let set = fixture_set();
+        let vectors = embed_queries(&crate::embedding::hashed::HashedEmbedder::new(), &set);
+        let rows = db
+            .with(|conn| fusion_comparison_on_conn(conn, &set, &vectors))
+            .unwrap();
+        let default_row = rows
+            .iter()
+            .find(|(f, _)| *f == super::super::search::FUSION)
+            .unwrap()
+            .1;
+        let hybrid = run(&db, &set)
+            .modes
+            .iter()
+            .find(|m| m.mode == RetrievalMode::Hybrid)
+            .unwrap()
+            .metrics;
+        assert_eq!(default_row, hybrid);
     }
 
     #[test]

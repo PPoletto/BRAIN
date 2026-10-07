@@ -302,6 +302,10 @@ pub fn run_eval(vault_arg: Option<&str>) -> i32 {
         }
     };
     print!("{}", viewer::eval::render_table(&report));
+    match viewer::eval::fusion_comparison(&db, vault, &set) {
+        Ok(rows) => print!("\n{}", viewer::eval::render_fusion_table(&rows)),
+        Err(e) => eprintln!("eval: fusion comparison failed: {e}"),
+    }
     match viewer::eval::append_history(vault, &report, chrono::Local::now()) {
         Ok(path) => println!("\nAppended to {}", path.display()),
         Err(e) => eprintln!("eval: could not append to the history: {e}"),
